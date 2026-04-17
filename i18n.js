@@ -14,7 +14,7 @@
 
       "menu.status":    "В сети",
       "menu.logout":    "Выйти",
-      "menu.heading":   "Пляжный Волейбол",
+      "menu.heading":   "Онлайн Волейбол",
       "menu.hint":      "Стрелками / WAD двигайтесь и прыгайте. Не давайте мячу коснуться земли на вашей стороне.",
       "menu.points":    "До скольки очков",
       "menu.play":      "ИГРАТЬ",
@@ -66,7 +66,7 @@
 
       "menu.status":    "Online",
       "menu.logout":    "Log out",
-      "menu.heading":   "Beach Volleyball",
+      "menu.heading":   "Online Volleyball",
       "menu.hint":      "Use arrows / WAD to move and jump. Don't let the ball touch the ground on your side.",
       "menu.points":    "Points to win",
       "menu.play":      "PLAY",

@@ -2,7 +2,7 @@
   "name": "discord-volley",
   "version": "1.0.0",
   "private": true,
-  "description": "Discord-themed 2D beach volleyball mini-game with Discord OAuth2",
+  "description": "Discord-themed 2D online volleyball mini-game with Discord OAuth2",
   "engines": {
     "node": ">=18"
   },
