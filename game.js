@@ -410,6 +410,26 @@ function resizeCanvas(){
 window.addEventListener("resize", resizeCanvas);
 window.addEventListener("orientationchange", resizeCanvas);
 
+/* Жёсткий landscape-gate на тач-устройствах. Если повернули в портрет во
+   время игры — ставим на паузу, чтобы мяч не катался за кадром, пока
+   пользователь переворачивает телефон обратно. */
+const portraitMQ = (typeof window.matchMedia === "function")
+  ? window.matchMedia("(orientation: portrait) and (hover: none) and (pointer: coarse)")
+  : null;
+function onOrientationGate(){
+  if(!portraitMQ || !portraitMQ.matches) return;
+  if(state.inGame && !state.paused && !state.matchOver){
+    Game.pause();
+  }
+}
+if(portraitMQ){
+  if(typeof portraitMQ.addEventListener === "function"){
+    portraitMQ.addEventListener("change", onOrientationGate);
+  } else if(typeof portraitMQ.addListener === "function"){
+    portraitMQ.addListener(onOrientationGate);
+  }
+}
+
 /* ---------------- Input ----------------
    We check BOTH e.code (physical key, layout-independent) and e.key
    (logical char) so WAD works on Cyrillic/other layouts where e.key
@@ -1898,5 +1918,47 @@ function makeAI(difficulty, rand){
 /* ---------------- Boot ---------------- */
 resizeCanvas();
 boot();
+
+/* ---------------- Auto-reload on new deploy ----------------
+   Сервер отдаёт `window.__BUILD__` и эндпоинт `/api/version`. Раз в минуту
+   сверяем: если build поменялся — значит на Railway выехал новый деплой,
+   и тихо релоадим страницу, чтобы пользователь не держал в голове Ctrl+
+   Shift+R. Прерывать активную игру грубо — ждём, пока вернётся в меню/
+   overlay/логин; фоновые вкладки не релоадим — дожидаемся фокуса. */
+(function autoReload(){
+  const initial = window.__BUILD__;
+  if(!initial) return; // локальный запуск без серверного штампа — молчим
+  let armed = false;
+
+  function isActivelyPlaying(){
+    const gs = document.getElementById("screen-game");
+    const ov = document.getElementById("overlay");
+    if(!gs || gs.classList.contains("hidden")) return false;
+    // overlay скрыт = идёт розыгрыш. overlay показан = пауза / конец матча.
+    return !ov || ov.classList.contains("hidden");
+  }
+
+  function maybeReload(){
+    if(!armed) return;
+    if(document.hidden) return;
+    if(isActivelyPlaying()) return;
+    location.reload();
+  }
+
+  async function probe(){
+    try{
+      const r = await fetch("/api/version", { cache: "no-store" });
+      if(!r.ok) return;
+      const j = await r.json();
+      if(j && j.build && j.build !== initial){ armed = true; maybeReload(); }
+    }catch(_){ /* сеть отвалилась — попробуем в след. раз */ }
+  }
+
+  setInterval(probe, 60000);
+  document.addEventListener("visibilitychange", ()=>{ if(!document.hidden) maybeReload(); });
+  // На выходе в меню overlay скрывается / screen-game прячется — пробуем.
+  document.addEventListener("click",   maybeReload, true);
+  document.addEventListener("keydown", maybeReload, true);
+})();
 
 })();

@@ -26,6 +26,7 @@ const express      = require("express");
 const cookieParser = require("cookie-parser");
 const crypto       = require("crypto");
 const path         = require("path");
+const fs           = require("fs");
 
 const {
   DISCORD_CLIENT_ID,
@@ -50,6 +51,27 @@ must("SESSION_SECRET",        SESSION_SECRET);
 const APP_URL      = (PUBLIC_URL || `http://localhost:${PORT}`).replace(/\/+$/, "");
 const REDIRECT_URI = `${APP_URL}/auth/callback`;
 const IS_HTTPS     = APP_URL.startsWith("https://");
+
+// Build-ID для cache-busting статики. Railway сам подставляет git SHA
+// деплоя в RAILWAY_GIT_COMMIT_SHA; локально — случайный короткий хэш
+// на каждый запуск (перезапустил node — новый билд, браузер подхватит).
+const BUILD_ID =
+  process.env.RAILWAY_GIT_COMMIT_SHA ||
+  process.env.RAILWAY_DEPLOYMENT_ID ||
+  crypto.randomBytes(6).toString("hex");
+
+// Читаем index.html один раз, проставляем ?v=<build> на локальные ассеты и
+// инлайним build-id в window.__BUILD__, чтобы фронт знал «свою» версию.
+const INDEX_HTML = (function(){
+  let html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
+  html = html.replace(
+    /(href|src)="(styles\.css|auth\.js|game\.js|i18n\.js)"/g,
+    (_m, attr, file) => `${attr}="${file}?v=${BUILD_ID}"`
+  );
+  const tag = `<script>window.__BUILD__=${JSON.stringify(BUILD_ID)};</script>`;
+  html = html.replace("</head>", `  ${tag}\n</head>`);
+  return html;
+})();
 
 const SESSION_COOKIE   = "dv_session";
 const STATE_COOKIE     = "dv_state";
@@ -169,17 +191,32 @@ app.post("/auth/logout", (req, res) => {
   res.json({ ok: true });
 });
 
+/* ---------- Build version (cache-busting / auto-reload) ---------- */
+
+app.get("/api/version", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ build: BUILD_ID });
+});
+
 /* ---------- Static frontend ---------- */
 
+function sendIndex(res){
+  res.setHeader("Cache-Control", "no-cache, no-store, must-revalidate");
+  res.type("html").send(INDEX_HTML);
+}
+
+app.get(["/", "/index.html"], (req, res) => sendIndex(res));
+
 app.use(express.static(path.join(__dirname), {
-  index: "index.html",
+  index: false,  // index.html отдаём сами — с проставленным build-id
   setHeaders: (res, p) => {
     if (/\.(webp|png|jpg|jpeg|svg|woff2|ico)$/i.test(p)) {
       res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
-    } else if (p.endsWith("index.html")) {
-      res.setHeader("Cache-Control", "no-cache");
     } else if (/\.(js|css)$/i.test(p)) {
-      res.setHeader("Cache-Control", "no-cache");
+      // У версионированных URL (?v=...) ключ кеша меняется на каждом деплое,
+      // поэтому можно кешировать агрессивно. Без ?v= всё равно релоад подтянет
+      // свежее за счёт INDEX_HTML, где ссылки уже со свежим build-id.
+      res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
     }
   }
 }));
@@ -187,7 +224,7 @@ app.use(express.static(path.join(__dirname), {
 // SPA fallback: любой неизвестный GET → index.html (для будущих клиент-роутов).
 app.get("*", (req, res, next) => {
   if (req.path.startsWith("/api/") || req.path.startsWith("/auth/")) return next();
-  res.sendFile(path.join(__dirname, "index.html"));
+  sendIndex(res);
 });
 
 app.listen(Number(PORT), () => {
