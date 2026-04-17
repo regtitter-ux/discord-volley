@@ -36,6 +36,10 @@ const state = {
   targetScore: 10,
   inGame: false,
   matchOver: false,
+  // Защёлка: match_win уходит на сервер не больше одного раза за матч.
+  // Разные пути победы (endMatch/endMatchAsSnapshot/onPeerLeft) могут
+  // сработать в пересекающихся сценариях — без флага рейтинг дублируется.
+  winReported: false,
   // Сессия матча. matchId — идентификатор раунда, с которым в онлайне
   // клиент будет слать события на сервер (award-запросы, инпуты); seq —
   // монотонный счётчик сообщений, чтобы сервер мог отбрасывать ретраи/
@@ -565,6 +569,14 @@ function onPeerPayload(p){
   }
 }
 
+function reportMatchWin(){
+  if(state.winReported) return;
+  state.winReported = true;
+  try {
+    state.ws && state.ws.readyState === 1 && state.ws.send(JSON.stringify({ type: "match_win" }));
+  } catch(_){}
+}
+
 function onPeerLeft(reason){
   if(state.mode === "bot") return;
   // Если матч идёт — засчитываем форфейт: оставшийся игрок получает победу
@@ -572,10 +584,9 @@ function onPeerLeft(reason){
   // mode переключаем в "bot" — чтобы кнопка «В меню» на оверлее не пыталась
   // слать peer-сообщения обратно серверу.
   if(state.inGame && !state.matchOver){
-    // Репортим свою форфейт-победу в лидерборд.
-    try {
-      state.ws && state.ws.readyState === 1 && state.ws.send(JSON.stringify({ type: "match_win" }));
-    } catch(_){}
+    // Репортим свою форфейт-победу в лидерборд (endByForfeit внутри выставит
+    // matchOver; reportMatchWin защищён флагом winReported от дублей).
+    reportMatchWin();
     Game.endByForfeit();
     // Сокет НЕ закрываем: держим его постоянно открытым от меню до logout,
     // чтобы онлайн-счётчик и пуши кошелька работали между матчами.
@@ -1127,6 +1138,7 @@ const Game = (function(){
   function resetMatch(){
     score1 = 0; score2 = 0;
     state.matchOver = false;
+    state.winReported = false;
     lastWinnerSide = 0;
     servingSide = 1;
     roundOver = false;
@@ -1213,9 +1225,7 @@ const Game = (function(){
       // ставит endMatchAsSnapshot после зеркалирования.
       if(state.mode === "bot" || state.mode === "host"){
         Wallet.award("match.win", 50);
-        try {
-          state.ws && state.ws.readyState === 1 && state.ws.send(JSON.stringify({ type: "match_win" }));
-        } catch(_){}
+        reportMatchWin();
       }
     }else{
       sfx.lose();
@@ -1483,9 +1493,7 @@ const Game = (function(){
       // В зеркалке гостя side 1 — это его «я», так что матч-приз его.
       Wallet.award("match.win", 50);
       // Гость репортит в лидерборд только свои победы.
-      try {
-        state.ws && state.ws.readyState === 1 && state.ws.send(JSON.stringify({ type: "match_win" }));
-      } catch(_){}
+      reportMatchWin();
     }else{
       sfx.lose();
     }
@@ -1505,9 +1513,6 @@ const Game = (function(){
     keys.left = keys.right = keys.jump = false;
     sfx.win();
     Wallet.award("match.win", 50);
-    try {
-      state.ws && state.ws.readyState === 1 && state.ws.send(JSON.stringify({ type: "match_win" }));
-    } catch(_){}
   }
 
   function applyInput(p, left, right, jump){
