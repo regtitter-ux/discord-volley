@@ -1,0 +1,145 @@
+/* Tiny i18n layer. Strings live here so markup stays clean.
+   Usage: data-i18n="key" → textContent, data-i18n-title="key" → title,
+   data-i18n-aria="key" → aria-label. Dynamic strings: I18n.t(key). */
+(function(global){
+  const KEY = "dv_lang_v1";
+
+  const DICT = {
+    ru: {
+      "app.title": "Discord Volley",
+
+      "login.subtitle": "Войдите, чтобы играть под своим аватаром",
+      "login.button":   "Войти через Discord",
+      "login.hint":     "Это локальный тестовый режим — аватар генерируется для демонстрации. В продакшне здесь будет OAuth через Discord-бота.",
+
+      "menu.status":    "В сети",
+      "menu.logout":    "Выйти",
+      "menu.heading":   "Пляжный Волейбол",
+      "menu.hint":      "Стрелками / WAD двигайтесь и прыгайте. Не давайте мячу коснуться земли на вашей стороне.",
+      "menu.difficulty":"Сложность",
+      "menu.points":    "До скольки очков",
+      "menu.play":      "ИГРАТЬ",
+
+      "diff.easy":      "Лёгкая",
+      "diff.medium":    "Средняя",
+      "diff.hard":      "Тяжёлая",
+
+      "game.home":      "В меню",
+      "game.pause":     "Пауза",
+      "game.resume":    "Продолжить",
+      "game.replay":    "Играть заново",
+      "game.quit":      "В меню",
+      "game.victory":   "Победа!",
+      "game.defeat":    "Поражение",
+      "game.serve_you": "ПОДАЧА",
+      "game.serve_opp": "ПОДАЧА СОПЕРНИКА",
+      "game.point":     "ОЧКО!",
+      "game.miss":      "ПРОПУСК",
+
+      "wallet.label":   "Монеты",
+
+      "rotate.title":   "Поверните телефон",
+      "rotate.sub":     "Игра удобнее в горизонтальной ориентации",
+
+      "bot.prefix":     "Бот"
+    },
+    en: {
+      "app.title": "Discord Volley",
+
+      "login.subtitle": "Sign in to play under your avatar",
+      "login.button":   "Sign in with Discord",
+      "login.hint":     "This is a local test mode — the avatar is generated for demo purposes. In production this will be Discord OAuth via a bot.",
+
+      "menu.status":    "Online",
+      "menu.logout":    "Log out",
+      "menu.heading":   "Beach Volleyball",
+      "menu.hint":      "Use arrows / WAD to move and jump. Don't let the ball touch the ground on your side.",
+      "menu.difficulty":"Difficulty",
+      "menu.points":    "Points to win",
+      "menu.play":      "PLAY",
+
+      "diff.easy":      "Easy",
+      "diff.medium":    "Medium",
+      "diff.hard":      "Hard",
+
+      "game.home":      "Back to menu",
+      "game.pause":     "Pause",
+      "game.resume":    "Resume",
+      "game.replay":    "Play again",
+      "game.quit":      "Menu",
+      "game.victory":   "Victory!",
+      "game.defeat":    "Defeat",
+      "game.serve_you": "YOUR SERVE",
+      "game.serve_opp": "OPPONENT SERVE",
+      "game.point":     "POINT!",
+      "game.miss":      "MISS",
+
+      "wallet.label":   "Coins",
+
+      "rotate.title":   "Rotate your phone",
+      "rotate.sub":     "The game is easier in landscape orientation",
+
+      "bot.prefix":     "Bot"
+    }
+  };
+
+  function detect(){
+    try{
+      const saved = localStorage.getItem(KEY);
+      if(saved === "ru" || saved === "en") return saved;
+    }catch(_){}
+    // Для новых пользователей — английский по умолчанию, независимо от
+    // локали браузера. Русский выбирается только явным кликом по RU в UI.
+    return "en";
+  }
+
+  let lang = detect();
+  const listeners = [];
+  // Держим html[lang] в синхроне с выбранным языком до первого apply(),
+  // чтобы login-экран не объявлялся скринридерами чужим языком.
+  try{ document.documentElement.lang = lang; }catch(_){}
+
+  // Чтобы не спамить лог одним и тем же ключом, помним уже сообщённые промахи.
+  const _missWarned = new Set();
+  function t(key){
+    const cur = DICT[lang] && DICT[lang][key];
+    if(cur != null) return cur;
+    if(!_missWarned.has(lang + ":" + key)){
+      _missWarned.add(lang + ":" + key);
+      // Возвращаем сам ключ (не чужой язык), чтобы промахи были видимы.
+      // console.warn без throw — сборка не рушится на отсутствующих строках.
+      if(typeof console !== "undefined") console.warn("[i18n] missing key:", lang, key);
+    }
+    // На этапе разработки всё-таки полезнее увидеть RU, чем голый ключ;
+    // но и о промахе знаем из warn. Если RU тоже пусто — отдаём ключ.
+    return (DICT.ru && DICT.ru[key]) || key;
+  }
+
+  function apply(root){
+    const r = root || document;
+    // Один проход вместо трёх querySelectorAll: элемент может иметь любую
+    // комбинацию data-i18n / data-i18n-title / data-i18n-aria одновременно.
+    const sel = "[data-i18n],[data-i18n-title],[data-i18n-aria]";
+    r.querySelectorAll(sel).forEach(el => {
+      const ds = el.dataset;
+      if(ds.i18n)      el.textContent = t(ds.i18n);
+      if(ds.i18nTitle) el.title = t(ds.i18nTitle);
+      if(ds.i18nAria)  el.setAttribute("aria-label", t(ds.i18nAria));
+    });
+    document.documentElement.lang = lang;
+  }
+
+  function setLang(next){
+    if(next !== "ru" && next !== "en") return;
+    if(next === lang) return;
+    lang = next;
+    try{ localStorage.setItem(KEY, lang); }catch(_){}
+    apply();
+    for(const fn of listeners) { try{ fn(lang); }catch(_){} }
+  }
+
+  function getLang(){ return lang; }
+  function onChange(fn){ if(typeof fn === "function") listeners.push(fn); }
+
+  global.I18n = { t, apply, setLang, getLang, onChange };
+})(window);
