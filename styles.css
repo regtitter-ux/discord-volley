@@ -141,7 +141,30 @@ h1,h2,h3{font-weight:700}
   body.is-touch .reactions::-webkit-scrollbar{height:0;width:0}
   body.is-touch .react-btn{width:38px;height:38px}
   body.is-touch .react-btn img{width:26px;height:26px}
+  /* Баланс монет и кнопка «домой» в портрете — под строкой счёта, чтобы
+     они не делили ту же горизонталь с именами/очками и не отжимали поле. */
+  body.is-touch .wallet-hud{top:calc(58px + var(--safe-top))}
+  body.is-touch .icon-btn-home{top:calc(58px + var(--safe-top))}
 }
+
+/* Тач-устройства: backdrop-filter с blur — один из самых дорогих CSS-
+   эффектов на мобильном GPU (особенно Android Chrome). Во время матча
+   полупрозрачные пилюли HUD/home-кнопки постоянно перерисовываются над
+   анимированным canvas, и блюр пересчитывается каждый кадр. Отключаем
+   blur, чуть повышаем непрозрачность, чтобы читалось. */
+body.is-touch .wallet-hud,
+body.is-touch .hud,
+body.is-touch .icon-btn,
+body.is-touch .react-btn,
+body.is-touch .overlay{
+  backdrop-filter:none;
+  -webkit-backdrop-filter:none;
+}
+body.is-touch .wallet-hud,
+body.is-touch .hud,
+body.is-touch .icon-btn,
+body.is-touch .react-btn{background:rgba(30,31,34,.92)}
+body.is-touch .overlay{background:rgba(0,0,0,.72)}
 .user-meta{min-width:0}
 .user-name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
 .user-status{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
@@ -166,7 +189,10 @@ h1,h2,h3{font-weight:700}
 
 /* ---------- Game ---------- */
 #screen-game{padding:0;background:#1e1f22}
-#cv{display:block;width:100%;height:100%;image-rendering:-webkit-optimize-contrast;image-rendering:pixelated;touch-action:none}
+/* Без image-rendering:pixelated — на мобильных с высоким DPR оно заставляет
+   GPU-композитор делать nearest-sampling по огромной поверхности и
+   заметно режет fps; бил был бы небольшим выигрышем на десктопе. */
+#cv{display:block;width:100%;height:100%;touch-action:none}
 
 .hud{position:absolute;top:calc(10px + var(--safe-top));left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:14px;background:rgba(30,31,34,.78);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);padding:8px 14px;border-radius:999px;max-width:calc(100% - 16px);border:1px solid rgba(255,255,255,.06)}
 .hud-side{display:flex;align-items:center;gap:10px;min-width:0}

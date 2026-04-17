@@ -567,11 +567,15 @@ let scale = 1, offsetX = 0, offsetY = 0;
 
 // Кап DPR: на 3x-Retina (iPhone) честный рендер в 3× увеличивает площадь
 // пикселей в 9 раз по сравнению с 1× — это ощутимо бьёт по мобильным
-// iGPU. 2× — компромисс: картинка остаётся чёткой (браузер даунскейлит
-// с 2× → 3× без заметного блура), а загрузка GPU стабильна.
-const DPR_CAP = 2;
+// iGPU. На десктопе допускаем 2×, на тач-устройствах жёстче — 1.25×,
+// т.к. мобильный GPU под радиальными градиентами/частицами захлёбывается
+// при честных 1080×2400 пикселях на физтик.
+const DPR_CAP_DESKTOP = 2;
+const DPR_CAP_TOUCH   = 1.25;
 function resizeCanvas(){
-  const dpr = Math.min(window.devicePixelRatio || 1, DPR_CAP);
+  const cap = (document.body && document.body.classList.contains("is-touch"))
+    ? DPR_CAP_TOUCH : DPR_CAP_DESKTOP;
+  const dpr = Math.min(window.devicePixelRatio || 1, cap);
   const w = Math.max(1, window.innerWidth);
   const h = Math.max(1, window.innerHeight);
   canvas.width  = Math.floor(w * dpr);
@@ -823,6 +827,8 @@ const Game = (function(){
   let sparkles = null;                   // faint twinkling dots
   let matchTime = 0;                     // total in-game seconds (for cloud drift)
   let rallyHits = 0;                     // consecutive hits for combo feedback
+  let lastHitSide = 0;                   // side (1/2) последнего касания — для гостевых наград
+  let prevSnapRallyHits = 0;             // на клиенте-госте: последний отрисованный счётчик касаний
 
   // Seedable RNG (mulberry32). Math.random десинкнет P2P/rollback-сценарии
   // в будущем, т.к. разные клиенты будут эволюционировать разные «случайные»
@@ -997,6 +1003,8 @@ const Game = (function(){
     jumpBufferT = 0;
     stuckT = 0;
     rallyHits = 0;
+    lastHitSide = 0;
+    prevSnapRallyHits = 0;
     hitFlash = 0;
     matchTime = 0;
     particles.length = 0;
@@ -1070,8 +1078,9 @@ const Game = (function(){
     keys.left = keys.right = keys.jump = false;
     if(winnerSide === 1){
       sfx.win();
-      // Кошелёк — только в SP-режиме; онлайновые награды будут серверные.
-      if(state.mode === "bot") Wallet.award("match.win", 50);
+      // Приз за матч: в bot/host — своему игроку (p1), в guest матч-монеты
+      // ставит endMatchAsSnapshot после зеркалирования.
+      if(state.mode === "bot" || state.mode === "host") Wallet.award("match.win", 50);
     }else{
       sfx.lose();
     }
@@ -1251,7 +1260,8 @@ const Game = (function(){
           w:  lastWinnerSide,
           ss: servingSide,
           ro: roundOver ? 1 : 0,
-          rh: rallyHits
+          rh: rallyHits,
+          lh: lastHitSide
         }
       }));
     } catch(_){}
@@ -1269,7 +1279,20 @@ const Game = (function(){
     ball.vx = -s.b.vx; ball.vy = s.b.vy; ball.angle = -s.b.a;
     servingSide = s.ss === 1 ? 2 : 1;
     roundOver = !!s.ro;
-    rallyHits = s.rh || 0;
+    const incomingRh = s.rh || 0;
+    // Гостевые награды за касания мяча. В мировых координатах хоста
+    // гость — p2 (lh===2). Счётчик rh у хоста только растёт в пределах
+    // раунда и сбрасывается в 0 на очко; зеркалим это, смотрим прирост.
+    if(incomingRh > prevSnapRallyHits && s.lh === 2){
+      const deltaHits = incomingRh - prevSnapRallyHits;
+      for(let i = 0; i < deltaHits; i++){
+        Wallet.award("rally.hit", 1);
+        const combo = prevSnapRallyHits + i + 1;
+        if(combo > 0 && combo % 5 === 0) Wallet.award("rally.combo", combo);
+      }
+    }
+    prevSnapRallyHits = incomingRh;
+    rallyHits = incomingRh;
     const newS1 = s.s2, newS2 = s.s1;
     if(newS1 !== score1 || newS2 !== score2){
       const wasP1 = score1, wasP2 = score2;
@@ -1282,6 +1305,8 @@ const Game = (function(){
         void pulseEl.offsetWidth;
         pulseEl.classList.add("pulse");
       }
+      // Очко гостя = рост score1 (его собственной половины в зеркалке).
+      if(score1 > wasP1) Wallet.award("round.win", 5);
     }
     if(s.mo && !state.matchOver){
       // winnerSide тоже зеркалим: если хост выиграл (s.w===1),
@@ -1301,7 +1326,13 @@ const Game = (function(){
     $("btn-replay").style.display = "none";
     overlay.classList.remove("hidden");
     keys.left = keys.right = keys.jump = false;
-    if(winnerSide === 1) sfx.win(); else sfx.lose();
+    if(winnerSide === 1){
+      sfx.win();
+      // В зеркалке гостя side 1 — это его «я», так что матч-приз его.
+      Wallet.award("match.win", 50);
+    }else{
+      sfx.lose();
+    }
   }
 
   function applyInput(p, left, right, jump){
@@ -1455,15 +1486,15 @@ const Game = (function(){
     squash.ball = Math.max(squash.ball, isSpike ? 0.16 : 0.11);
     if(isSpike) sfx.spike(); else sfx.hit();
     rallyHits++;
-    // Монеты — только за касания игрока (p.side === 1). Касания бота
-    // не начисляют ничего. Комбо-бонус тоже идёт, только если отметка
-    // кратная 5 пришлась на удар игрока. В онлайне (host/guest) кошелёк
-    // выключен — награды уйдут на сервер позже.
-    const isPlayerHit = (p.side === 1) && state.mode === "bot";
-    if(isPlayerHit) Wallet.award("rally.hit", 1);
+    lastHitSide = p.side;
+    // Монеты за касания своего игрока. В bot/host свой игрок — p.side===1;
+    // у гостя физика не крутится локально, поэтому его награда приезжает
+    // через applySnapshot (lastHitSide=2 у хоста — это как раз гость).
+    const isOwnHit = (p.side === 1) && (state.mode === "bot" || state.mode === "host");
+    if(isOwnHit) Wallet.award("rally.hit", 1);
     if(rallyHits > 0 && rallyHits % 5 === 0){
       showBig("x" + rallyHits, "#ffd34a", 0.6, 52);
-      if(isPlayerHit) Wallet.award("rally.combo", rallyHits);
+      if(isOwnHit) Wallet.award("rally.combo", rallyHits);
     }
     // 4-touch rule
     if(p.side === 1){ ball.touches.left++;  ball.touches.right = 0; }
@@ -1489,8 +1520,10 @@ const Game = (function(){
     spawnParticles(ball.x, GROUND_Y - 2, 22, side === 1 ? "rgba(35,165,90,1)" : "rgba(242,63,66,1)", 260);
     if(side === 1){ showBig(I18n.t("game.point"), "#23a55a", 0.9, 96); sfx.point(); }
     else          { showBig(I18n.t("game.miss"),  "#f23f42", 0.9, 80); sfx.lose(); }
-    // Монеты: +5 за выигранное очко (только для игрока в SP-режиме).
-    if(side === 1 && state.mode === "bot") Wallet.award("round.win", 5);
+    // Монеты: +5 за выигранное очко. Bot/host — когда side===1 (свой игрок).
+    // Гостю начисляется в applySnapshot, когда его «свой» счёт (mirror s.s2)
+    // вырос между снапшотами.
+    if(side === 1 && (state.mode === "bot" || state.mode === "host")) Wallet.award("round.win", 5);
     const t = state.targetScore;
     if((score1 >= t || score2 >= t) && Math.abs(score1 - score2) >= 2){
       endMatch(score1 > score2 ? 1 : 2);
