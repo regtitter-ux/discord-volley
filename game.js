@@ -423,7 +423,7 @@ const lobbyOverlay   = $("lobby-overlay");
 const lobbyCountdown = $("lobby-countdown");
 const lobbyTitle     = $("lobby-title");
 const lobbySub       = $("lobby-sub");
-const QUEUE_COUNTDOWN_MS = 3000;
+const QUEUE_COUNTDOWN_MS = 30000;
 
 let lobbyTickTimer = 0;
 let lobbyCountdownStart = 0;

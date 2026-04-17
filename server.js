@@ -424,7 +424,7 @@ function authUserFromCookie(req){
 }
 
 let waiting = null;        // WebSocket или null
-const QUEUE_TIMEOUT_MS = 3000;
+const QUEUE_TIMEOUT_MS = 30000;
 
 // Счётчик активных авторизованных соединений. Использует внутреннее
 // состояние wss.clients, но мы фильтруем по ws.user (анон сюда не доходит
