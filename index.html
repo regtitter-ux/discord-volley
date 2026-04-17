@@ -73,15 +73,6 @@
       <p class="muted" data-i18n="menu.hint">Стрелками / WAD двигайтесь и прыгайте. Не давайте мячу коснуться земли на вашей стороне.</p>
 
       <div class="card">
-        <label class="card-label" data-i18n="menu.difficulty">Сложность</label>
-        <div class="segmented" role="tablist" id="difficulty">
-          <button data-val="easy"   data-i18n="diff.easy">Лёгкая</button>
-          <button data-val="medium" class="active" data-i18n="diff.medium">Средняя</button>
-          <button data-val="hard"   data-i18n="diff.hard">Тяжёлая</button>
-        </div>
-      </div>
-
-      <div class="card">
         <label class="card-label" data-i18n="menu.points">До скольки очков</label>
         <div class="segmented" id="target-score">
           <button data-val="5">5</button>
@@ -161,6 +152,22 @@
       </div>
     </div>
   </section>
+
+  <!-- Lobby overlay: shown over the menu while searching for an opponent.
+       Если за 3 секунды никто не подключился, переходим в матч с ботом. -->
+  <div class="overlay hidden" id="lobby-overlay" role="dialog" aria-modal="true">
+    <div class="overlay-box lobby-box">
+      <div class="lobby-spinner" aria-hidden="true">
+        <div class="spinner-ring"></div>
+        <div class="lobby-countdown" id="lobby-countdown">3</div>
+      </div>
+      <h3 id="lobby-title" data-i18n="lobby.searching">Поиск соперника…</h3>
+      <p id="lobby-sub" class="muted" data-i18n="lobby.fallback_hint">Если никого не найдём за 3 секунды — начнём матч с ботом.</p>
+      <div class="overlay-buttons">
+        <button class="btn btn-ghost" id="btn-lobby-cancel" data-i18n="lobby.cancel">Отмена</button>
+      </div>
+    </div>
+  </div>
 
   <!-- Rotate hint — shown when phone is held in very narrow portrait.
        Чистый CSS-трюк: скрыт по умолчанию, показывается только на тач-

@@ -27,7 +27,12 @@ const Clock = {
 const state = {
   user: null,
   bot: null,
-  difficulty: "medium",
+  opponent: null,
+  // mode: 'bot' (SP vs AI) | 'host' (authoritative online left player)
+  //     | 'guest' (online right player, driven by host snapshots)
+  mode: "bot",
+  ws: null,
+  peerKeys: { left:false, right:false, jump:false },
   targetScore: 10,
   inGame: false,
   paused: false,
@@ -265,12 +270,29 @@ function botDisplayName(bot){
   return shortenName(I18n.t("bot.prefix") + " " + (bot.global_name || bot.username || ""));
 }
 
-// Динамические строки, которые не переключаются через data-i18n
+// В каких ролях на поле показаны игроки. В bot/host локальный пользователь —
+// слева (p1), в guest он справа (p2); оппонент всегда по другую сторону.
+function playerUser(side){
+  if(state.mode === "guest") return side === 1 ? state.opponent : state.user;
+  if(state.mode === "host")  return side === 1 ? state.user     : state.opponent;
+  return side === 1 ? state.user : state.bot; // bot
+}
+
+// Динамические строки, которые не переключаются через data-i18n, плюс
+// HUD-аватары/имена, которые зависят от текущего режима матча.
 function refreshLocalizedDynamicUI(){
-  if(state.bot){
-    $("hud-name-p2").textContent = botDisplayName(state.bot);
+  const left = playerUser(1), right = playerUser(2);
+  if(left){
+    Auth.renderAvatarInto($("hud-avatar-p1"), left);
+    $("hud-name-p1").textContent = userDisplayName(left);
   }
-  $("hud-diff").textContent = diffLabel(state.difficulty);
+  if(right){
+    Auth.renderAvatarInto($("hud-avatar-p2"), right);
+    $("hud-name-p2").textContent = state.mode === "bot"
+      ? botDisplayName(right)
+      : userDisplayName(right);
+  }
+  $("hud-diff").textContent = I18n.t(state.mode === "bot" ? "hud.bot" : "hud.online");
   if(window.Game && typeof Game.refreshOverlay === "function") Game.refreshOverlay();
 }
 
@@ -354,25 +376,192 @@ function wireSegmented(rootId, onChange){
     onChange(b.dataset.val);
   });
 }
-wireSegmented("difficulty", v => state.difficulty = v);
 wireSegmented("target-score", v => state.targetScore = parseInt(v,10));
 
-/* ---------------- Start game ---------------- */
-$("btn-play").addEventListener("click", () => {
+/* ---------------- Matchmaking ----------------
+   Клик по «ИГРАТЬ» запускает поиск: открываем WebSocket, встаём в очередь,
+   показываем лобби с обратным отсчётом. Если в течение QUEUE_TIMEOUT_MS
+   никто не подключился — сервер пришлёт queue_timeout, и мы откатимся в
+   матч против бота. По кнопке «Отмена» — закрываем сокет и уходим обратно
+   в меню (в отличие от таймаута). */
+
+const lobbyOverlay   = $("lobby-overlay");
+const lobbyCountdown = $("lobby-countdown");
+const lobbyTitle     = $("lobby-title");
+const lobbySub       = $("lobby-sub");
+const QUEUE_COUNTDOWN_MS = 3000;
+
+let lobbyTickTimer = 0;
+let lobbyCountdownStart = 0;
+function startLobbyCountdown(){
+  lobbyCountdownStart = performance.now();
+  updateLobbyCountdown();
+  if(lobbyTickTimer) clearInterval(lobbyTickTimer);
+  lobbyTickTimer = setInterval(updateLobbyCountdown, 100);
+}
+function stopLobbyCountdown(){
+  if(lobbyTickTimer){ clearInterval(lobbyTickTimer); lobbyTickTimer = 0; }
+}
+function updateLobbyCountdown(){
+  const elapsed = performance.now() - lobbyCountdownStart;
+  const left = Math.max(0, QUEUE_COUNTDOWN_MS - elapsed);
+  lobbyCountdown.textContent = String(Math.ceil(left / 1000));
+}
+
+function showLobby(){
+  lobbyTitle.textContent = I18n.t("lobby.searching");
+  lobbySub.textContent   = I18n.t("lobby.fallback_hint");
+  lobbyOverlay.classList.remove("hidden");
+  startLobbyCountdown();
+}
+function hideLobby(){
+  lobbyOverlay.classList.add("hidden");
+  stopLobbyCountdown();
+}
+
+function openSocket(){
+  return new Promise((resolve) => {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    let ws;
+    try { ws = new WebSocket(proto + "//" + location.host + "/ws"); }
+    catch(_){ resolve(null); return; }
+    let settled = false;
+    const done = (val) => { if(!settled){ settled = true; resolve(val); } };
+    ws.addEventListener("open",  ()=> done(ws));
+    ws.addEventListener("error", ()=> done(null));
+    // Подстраховка: если open не стрельнул за пару секунд — считаем,
+    // что коннекта нет, и откатываемся к боту.
+    setTimeout(()=> done(null), 2500);
+  });
+}
+
+function attachSocketHandlers(ws){
+  ws.addEventListener("message", (ev)=>{
+    let msg;
+    try { msg = JSON.parse(ev.data); } catch { return; }
+    if(!msg || typeof msg.type !== "string") return;
+    onServerMessage(msg);
+  });
+  ws.addEventListener("close", ()=>{
+    // Если мы уже в матче — считаем это как уход соперника.
+    if(state.inGame && state.mode !== "bot"){
+      onPeerLeft("disconnect");
+    }else{
+      hideLobby();
+    }
+    if(state.ws === ws) state.ws = null;
+  });
+}
+
+function onServerMessage(msg){
+  switch(msg.type){
+    case "hello":
+      break;
+    case "matched":
+      startOnlineMatch(msg.role, msg.opponent);
+      break;
+    case "queue_timeout":
+      hideLobby();
+      startBotMatch();
+      break;
+    case "peer":
+      onPeerPayload(msg.payload);
+      break;
+    case "peer_left":
+      onPeerLeft(msg.reason || "disconnect");
+      break;
+  }
+}
+
+function onPeerPayload(p){
+  if(!p || typeof p.kind !== "string") return;
+  if(p.kind === "input" && state.mode === "host"){
+    state.peerKeys.left  = !!p.left;
+    state.peerKeys.right = !!p.right;
+    state.peerKeys.jump  = !!p.jump;
+  }else if(p.kind === "state" && state.mode === "guest"){
+    Game.applySnapshot(p);
+  }else if(p.kind === "emote"){
+    // Эмоция приходит из «локальной системы координат» оппонента.
+    // У хоста оппонент = p2, у гостя = p1.
+    const side = state.mode === "host" ? 2 : 1;
+    Game.triggerEmote(side, p.id);
+  }
+}
+
+function onPeerLeft(reason){
+  if(state.mode === "bot") return;
+  // Закрываем сокет, возвращаем в меню с уведомлением.
+  closeSocket();
+  Game.stop();
+  state.mode = "bot";
+  state.opponent = null;
+  show("menu");
+  // Лёгкое уведомление поверх меню через тот же лобби-оверлей.
+  lobbyTitle.textContent = I18n.t("lobby.disconnected");
+  lobbySub.textContent   = "";
+  lobbyCountdown.textContent = "×";
+  lobbyOverlay.classList.remove("hidden");
+  setTimeout(()=> lobbyOverlay.classList.add("hidden"), 1500);
+}
+
+function closeSocket(){
+  const ws = state.ws;
+  state.ws = null;
+  if(!ws) return;
+  try { ws.close(); } catch(_){}
+}
+
+function startBotMatch(){
+  state.mode = "bot";
+  state.opponent = null;
   state.bot = Auth.makeBot();
-  Auth.renderAvatarInto($("hud-avatar-p1"), state.user);
-  Auth.renderAvatarInto($("hud-avatar-p2"), state.bot);
-  $("hud-name-p1").textContent = userDisplayName(state.user);
-  $("hud-name-p2").textContent = botDisplayName(state.bot);
-  $("hud-diff").textContent = diffLabel(state.difficulty);
   $("hud-score-p1").textContent = "0";
   $("hud-score-p2").textContent = "0";
+  refreshLocalizedDynamicUI();
   show("game");
   resizeCanvas();
   Game.start();
-});
+}
 
-function diffLabel(d){ return I18n.t("diff." + (d || "medium")); }
+function startOnlineMatch(role, opponent){
+  hideLobby();
+  state.mode = role; // 'host' | 'guest'
+  // Нормализуем пришедшего с сервера пользователя — добиваем color по id,
+  // чтобы fallback-круг оппонента был стабильно окрашен, а не серо-дефолтным.
+  state.opponent = Auth.normalize(opponent) || opponent;
+  state.bot = null;
+  state.peerKeys.left = state.peerKeys.right = state.peerKeys.jump = false;
+  $("hud-score-p1").textContent = "0";
+  $("hud-score-p2").textContent = "0";
+  refreshLocalizedDynamicUI();
+  show("game");
+  resizeCanvas();
+  Game.start();
+}
+
+async function startMatchmaking(){
+  showLobby();
+  const ws = await openSocket();
+  if(!ws){
+    hideLobby();
+    startBotMatch();
+    return;
+  }
+  state.ws = ws;
+  attachSocketHandlers(ws);
+  ws.send(JSON.stringify({ type: "queue" }));
+}
+
+$("btn-play").addEventListener("click", startMatchmaking);
+
+$("btn-lobby-cancel").addEventListener("click", ()=>{
+  hideLobby();
+  if(state.ws){
+    try { state.ws.send(JSON.stringify({ type: "cancel" })); } catch(_){}
+  }
+  closeSocket();
+});
 
 /* ---------------- Canvas sizing ---------------- */
 const WORLD_W = 1000, WORLD_H = 500;
@@ -468,6 +657,25 @@ document.querySelectorAll(".tbtn").forEach(btn=>{
   document.addEventListener(ev, e=>e.preventDefault(), {passive:false});
 });
 
+// Гость шлёт своё состояние клавиш хосту. Делаем это поллингом на 30 Гц и
+// только при реальных изменениях — иначе каждое keydown/touch пришлось бы
+// обвешивать отдельным хуком. Сетевые пакеты уходят только когда маска
+// (left|right|jump) поменялась, так что при статичном нажатии трафик нулевой.
+let _relayLastMask = -1;
+setInterval(()=>{
+  if(state.mode !== "guest") return;
+  if(!state.ws || state.ws.readyState !== 1) return;
+  const mask = (keys.left?1:0) | (keys.right?2:0) | (keys.jump?4:0);
+  if(mask === _relayLastMask) return;
+  _relayLastMask = mask;
+  try {
+    state.ws.send(JSON.stringify({
+      type: "relay",
+      payload: { kind:"input", left: keys.left, right: keys.right, jump: keys.jump }
+    }));
+  } catch(_){}
+}, 33);
+
 /* ---------------- Pause & overlay ---------------- */
 const overlay = $("overlay");
 const overlayTitle = $("overlay-title");
@@ -475,14 +683,20 @@ const overlaySub = $("overlay-sub");
 $("btn-pause").addEventListener("click", ()=> Game.pause());
 $("btn-resume").addEventListener("click", ()=> Game.resume());
 $("btn-replay").addEventListener("click", ()=> Game.start());
-$("btn-quit").addEventListener("click", ()=>{
+function quitToMenu(){
+  // Если мы в онлайне — сначала корректно уведомим сервер и закроем сокет,
+  // чтобы соперник увидел peer_left сразу, а не по таймауту.
+  if(state.mode !== "bot" && state.ws){
+    try { state.ws.send(JSON.stringify({ type: "leave" })); } catch(_){}
+    closeSocket();
+  }
+  state.mode = "bot";
+  state.opponent = null;
   Game.stop();
   show("menu");
-});
-$("btn-home").addEventListener("click", ()=>{
-  Game.stop();
-  show("menu");
-});
+}
+$("btn-quit").addEventListener("click", quitToMenu);
+$("btn-home").addEventListener("click", quitToMenu);
 
 // Реакции: 26 стикеров Durak Online. Прелодим и строим UI один раз.
 // Кэш Image доступен и UI-слою, и рендеру в canvas (через EMOTE_IMAGES).
@@ -528,7 +742,15 @@ document.getElementById("reactions").addEventListener("click", (ev)=>{
   const last = +btn.dataset.last || 0;
   if(now - last < REACT_COOLDOWN) return;
   btn.dataset.last = now;
-  Game.triggerEmote(1, btn.dataset.emoteId);
+  // Локальная сторона пользователя: 2 — если мы гость (справа), иначе 1.
+  const localSide = state.mode === "guest" ? 2 : 1;
+  Game.triggerEmote(localSide, btn.dataset.emoteId);
+  // Онлайн: пробрасываем эмоцию сопернику через relay.
+  if(state.ws && state.ws.readyState === 1 && state.mode !== "bot"){
+    try {
+      state.ws.send(JSON.stringify({ type:"relay", payload:{ kind:"emote", id: btn.dataset.emoteId } }));
+    } catch(_){}
+  }
   // Снимаем фокус: иначе при клике мышью фокус остаётся на кнопке, и
   // следующие нажатия клавиш (пробел/Enter) ре-триггерят её, а браузер
   // рисует белое кольцо focus-ring поверх пилюли.
@@ -576,6 +798,10 @@ const Game = (function(){
   let roundTimer = 0;
   let lastWinnerSide = 0;         // выставляется в endMatch — для перерисовки overlay
   let ai;
+  // Аккумулятор для 30 Гц-снапшота хоста. Раздельно от физического acc,
+  // чтобы сеть не зависела от частоты рендера.
+  let snapAcc = 0;
+  const SNAP_STEP = 1/30;
   let hitFlash = 0;
   let prevJump1 = false;
   let jumpBufferT = 0;
@@ -807,8 +1033,12 @@ const Game = (function(){
     overlay.classList.add("hidden");
     // Clear any stuck input from the menu
     keys.left = keys.right = keys.jump = false;
+    state.peerKeys.left = state.peerKeys.right = state.peerKeys.jump = false;
     resetMatch();
-    ai = makeAI(state.difficulty, rng);
+    // AI только в режиме против бота — в онлайне p2 ведёт либо хост по
+    // локальному вводу соперника, либо сервер-авторитет через снапшоты.
+    ai = state.mode === "bot" ? makeAI("medium", rng) : null;
+    snapAcc = 0;
     last = Clock.now();
     acc = 0;
     cancelAnimationFrame(rafId);
@@ -857,16 +1087,20 @@ const Game = (function(){
     const name = winnerSide===1 ? ($("hud-name-p1").textContent) : ($("hud-name-p2").textContent);
     overlaySub.textContent = name + " — " + score1 + " : " + score2;
     $("btn-resume").style.display = "none";
-    $("btn-replay").style.display = "";
+    // В онлайне повтор без пары невозможен — скрываем «Играть заново».
+    $("btn-replay").style.display = state.mode === "bot" ? "" : "none";
     overlay.classList.remove("hidden");
     // Drop any keys the user was still holding so players don't keep accelerating.
     keys.left = keys.right = keys.jump = false;
     if(winnerSide === 1){
       sfx.win();
-      Wallet.award("match.win", 50);
+      // Кошелёк — только в SP-режиме; онлайновые награды будут серверные.
+      if(state.mode === "bot") Wallet.award("match.win", 50);
     }else{
       sfx.lose();
     }
+    // Хост отправляет финальный снапшот, чтобы гость корректно закрыл матч.
+    if(state.mode === "host") broadcastSnapshot();
   }
 
   /* ------------- Physics ------------- */
@@ -912,11 +1146,24 @@ const Game = (function(){
       }
     }
 
+    // В роли гостя физика авторитетна у хоста — мы получаем её снапшотами
+    // и рендерим; локально только визуальные тиков (частицы/эмоции) выше.
+    if(state.mode === "guest"){
+      // post-snapshot: обновляем serve-индикатор-флаг через rallyHits,
+      // остальное уже набиралось визуально.
+      return;
+    }
+
     // Controls — disabled after the match ends; both slimes coast on inertia.
     if(!state.matchOver){
       applyHumanInput(p1, dt);
-      const aIn = ai.decide(p2, ball, dt);
-      applyInput(p2, aIn.left, aIn.right, aIn.jump);
+      if(state.mode === "host"){
+        // Ввод правого игрока приходит по WS от гостя.
+        applyInput(p2, state.peerKeys.left, state.peerKeys.right, state.peerKeys.jump);
+      }else{
+        const aIn = ai.decide(p2, ball, dt);
+        applyInput(p2, aIn.left, aIn.right, aIn.jump);
+      }
     }
 
     // Players
@@ -1000,6 +1247,78 @@ const Game = (function(){
     }else{
       stuckT = 0;
     }
+
+    // Хост рассылает снапшот на 30 Гц. Физика у нас STEP=1/120, так что
+    // в среднем один снапшот на 4 физтика, но считаем в аккумуляторе.
+    if(state.mode === "host"){
+      snapAcc += dt;
+      if(snapAcc >= SNAP_STEP){
+        snapAcc = 0;
+        broadcastSnapshot();
+      }
+    }
+  }
+
+  function broadcastSnapshot(){
+    const ws = state.ws;
+    if(!ws || ws.readyState !== 1) return;
+    try {
+      ws.send(JSON.stringify({
+        type: "relay",
+        payload: {
+          kind: "state",
+          p1: { x:p1.x, y:p1.y, vx:p1.vx, vy:p1.vy, g:p1.onGround?1:0 },
+          p2: { x:p2.x, y:p2.y, vx:p2.vx, vy:p2.vy, g:p2.onGround?1:0 },
+          b:  { x:ball.x, y:ball.y, vx:ball.vx, vy:ball.vy, a:ball.angle },
+          s1: score1, s2: score2,
+          mo: state.matchOver ? 1 : 0,
+          w:  lastWinnerSide,
+          ss: servingSide,
+          ro: roundOver ? 1 : 0,
+          rh: rallyHits
+        }
+      }));
+    } catch(_){}
+  }
+
+  function applySnapshot(s){
+    if(state.mode !== "guest" || !p1 || !p2 || !ball) return;
+    p1.x = s.p1.x; p1.y = s.p1.y; p1.vx = s.p1.vx; p1.vy = s.p1.vy; p1.onGround = !!s.p1.g;
+    p2.x = s.p2.x; p2.y = s.p2.y; p2.vx = s.p2.vx; p2.vy = s.p2.vy; p2.onGround = !!s.p2.g;
+    ball.x = s.b.x; ball.y = s.b.y; ball.vx = s.b.vx; ball.vy = s.b.vy; ball.angle = s.b.a;
+    servingSide = s.ss;
+    roundOver = !!s.ro;
+    rallyHits = s.rh || 0;
+    if(s.s1 !== score1 || s.s2 !== score2){
+      const wasP1 = score1, wasP2 = score2;
+      score1 = s.s1; score2 = s.s2;
+      const elA = $("hud-score-p1"), elB = $("hud-score-p2");
+      elA.textContent = String(score1); elB.textContent = String(score2);
+      const pulseEl = (score1 > wasP1) ? elA : (score2 > wasP2) ? elB : null;
+      if(pulseEl){
+        pulseEl.classList.remove("pulse");
+        void pulseEl.offsetWidth;
+        pulseEl.classList.add("pulse");
+      }
+    }
+    if(s.mo && !state.matchOver){
+      endMatchAsSnapshot(s.w);
+    }
+  }
+
+  function endMatchAsSnapshot(winnerSide){
+    state.matchOver = true;
+    lastWinnerSide = winnerSide;
+    // У гостя «моя сторона» — 2 (справа). У хоста — 1.
+    const mySide = state.mode === "guest" ? 2 : 1;
+    overlayTitle.textContent = I18n.t(winnerSide === mySide ? "game.victory" : "game.defeat");
+    const name = winnerSide === 1 ? ($("hud-name-p1").textContent) : ($("hud-name-p2").textContent);
+    overlaySub.textContent = name + " — " + score1 + " : " + score2;
+    $("btn-resume").style.display = "none";
+    // В онлайне «Играть заново» без пары бессмысленно — выходим в меню.
+    $("btn-replay").style.display = "none";
+    overlay.classList.remove("hidden");
+    keys.left = keys.right = keys.jump = false;
   }
 
   function applyInput(p, left, right, jump){
@@ -1155,8 +1474,9 @@ const Game = (function(){
     rallyHits++;
     // Монеты — только за касания игрока (p.side === 1). Касания бота
     // не начисляют ничего. Комбо-бонус тоже идёт, только если отметка
-    // кратная 5 пришлась на удар игрока.
-    const isPlayerHit = (p.side === 1);
+    // кратная 5 пришлась на удар игрока. В онлайне (host/guest) кошелёк
+    // выключен — награды уйдут на сервер позже.
+    const isPlayerHit = (p.side === 1) && state.mode === "bot";
     if(isPlayerHit) Wallet.award("rally.hit", 1);
     if(rallyHits > 0 && rallyHits % 5 === 0){
       showBig("x" + rallyHits, "#ffd34a", 0.6, 52);
@@ -1186,8 +1506,8 @@ const Game = (function(){
     spawnParticles(ball.x, GROUND_Y - 2, 22, side === 1 ? "rgba(35,165,90,1)" : "rgba(242,63,66,1)", 260);
     if(side === 1){ showBig(I18n.t("game.point"), "#23a55a", 0.9, 96); sfx.point(); }
     else          { showBig(I18n.t("game.miss"),  "#f23f42", 0.9, 80); sfx.lose(); }
-    // Монеты: +5 за выигранное очко (только для игрока).
-    if(side === 1) Wallet.award("round.win", 5);
+    // Монеты: +5 за выигранное очко (только для игрока в SP-режиме).
+    if(side === 1 && state.mode === "bot") Wallet.award("round.win", 5);
     const t = state.targetScore;
     if((score1 >= t || score2 >= t) && Math.abs(score1 - score2) >= 2){
       endMatch(score1 > score2 ? 1 : 2);
@@ -1232,8 +1552,8 @@ const Game = (function(){
 
     drawNet();
     drawTrail();
-    drawPlayer(p1, state.user);
-    drawPlayer(p2, state.bot);
+    drawPlayer(p1, playerUser(1));
+    drawPlayer(p2, playerUser(2));
     drawServeIndicator();
     drawBall();
     drawParticles();
@@ -1819,7 +2139,7 @@ const Game = (function(){
     }
   }
 
-  return { start, stop, pause, resume, refreshOverlay, triggerEmote };
+  return { start, stop, pause, resume, refreshOverlay, triggerEmote, applySnapshot };
 })();
 
 /* ========================================================================

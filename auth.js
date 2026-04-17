@@ -108,6 +108,7 @@
     login,
     logout,
     makeBot,
+    normalize,
     renderAvatarInto,
     sanitizeAvatarUrl
   };

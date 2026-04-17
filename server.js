@@ -27,6 +27,8 @@ const cookieParser = require("cookie-parser");
 const crypto       = require("crypto");
 const path         = require("path");
 const fs           = require("fs");
+const http         = require("http");
+const { WebSocketServer } = require("ws");
 
 const {
   DISCORD_CLIENT_ID,
@@ -227,7 +229,156 @@ app.get("*", (req, res, next) => {
   sendIndex(res);
 });
 
-app.listen(Number(PORT), () => {
+/* ---------- WebSocket matchmaking + relay ----------
+   Очень простая одноочерёдная матчмейкинг:
+     • клиент коннектится на /ws, проходит auth по session-cookie
+     • шлёт {type:"queue"} — если кто-то уже ждёт, матчим пару
+     • иначе встаёт в слот ожидания на 3 секунды; по таймауту клиент
+       сам решает пойти в игру с ботом ({type:"timeout"} → dequeue)
+     • после матча оба получают {type:"matched", role, opponent};
+       host = первый встал в очередь, guest = второй (пара хост/гость
+       важна, поскольку физика автортитарна на хосте)
+     • внутриигровые сообщения ретранслируются через {type:"relay", payload}
+       → пир получает {type:"peer", payload} */
+
+const httpServer = http.createServer(app);
+const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+
+// Разбор cookie + проверка HMAC-подписи тем же секретом, что и Express.
+const cookieLib       = require("cookie");
+const cookieSignature = require("cookie-signature");
+function authUserFromCookie(req){
+  const header = req.headers.cookie || "";
+  const parsed = cookieLib.parse(header);
+  const signed = parsed[SESSION_COOKIE];
+  if (!signed) return null;
+  const body = signed.startsWith("s:") ? signed.slice(2) : signed;
+  const raw = cookieSignature.unsign(body, SESSION_SECRET);
+  if (raw === false) return null;
+  try {
+    const u = JSON.parse(raw);
+    if (!u || !u.id) return null;
+    return u;
+  } catch { return null; }
+}
+
+let waiting = null;        // WebSocket или null
+const QUEUE_TIMEOUT_MS = 3000;
+
+function safeUser(u){
+  if (!u) return null;
+  return {
+    id:          u.id,
+    username:    u.username,
+    global_name: u.global_name || u.username,
+    avatar_url:  u.avatar_url || null
+  };
+}
+
+function send(ws, obj){
+  if (ws && ws.readyState === 1) {
+    try { ws.send(JSON.stringify(obj)); } catch {}
+  }
+}
+
+function clearQueue(ws){
+  if (waiting === ws) {
+    waiting = null;
+    if (ws._queueTimer) { clearTimeout(ws._queueTimer); ws._queueTimer = null; }
+  }
+}
+
+function pair(host, guest){
+  clearQueue(host);
+  clearQueue(guest);
+  const roomId = crypto.randomBytes(6).toString("hex");
+  host.peer  = guest; guest.peer = host;
+  host.role  = "host"; guest.role = "guest";
+  host.roomId = guest.roomId = roomId;
+  send(host,  { type: "matched", role: "host",  room: roomId, opponent: safeUser(guest.user) });
+  send(guest, { type: "matched", role: "guest", room: roomId, opponent: safeUser(host.user)  });
+  console.log(`[ws] matched host=${host.user.id} guest=${guest.user.id} room=${roomId}`);
+}
+
+function onQueue(ws){
+  if (ws.peer) return; // уже в матче — игнорируем повторный queue
+  if (waiting && waiting !== ws && waiting.readyState === 1) {
+    pair(waiting, ws);
+    return;
+  }
+  waiting = ws;
+  if (ws._queueTimer) clearTimeout(ws._queueTimer);
+  ws._queueTimer = setTimeout(() => {
+    if (waiting === ws) {
+      waiting = null;
+      send(ws, { type: "queue_timeout" });
+    }
+  }, QUEUE_TIMEOUT_MS);
+}
+
+function leaveRoom(ws, reason){
+  const peer = ws.peer;
+  if (peer) {
+    peer.peer = null;
+    send(peer, { type: "peer_left", reason: reason || "disconnect" });
+  }
+  ws.peer = null;
+  ws.roomId = null;
+}
+
+wss.on("connection", (ws, req) => {
+  const user = authUserFromCookie(req);
+  if (!user) {
+    try { ws.close(4401, "unauthorized"); } catch {}
+    return;
+  }
+  ws.user = user;
+  ws.peer = null;
+  ws.roomId = null;
+
+  send(ws, { type: "hello", user: safeUser(user) });
+
+  ws.on("message", (raw) => {
+    let msg;
+    try { msg = JSON.parse(raw); } catch { return; }
+    if (!msg || typeof msg.type !== "string") return;
+
+    switch (msg.type) {
+      case "queue":
+        onQueue(ws);
+        break;
+      case "cancel":
+        clearQueue(ws);
+        if (ws.peer) leaveRoom(ws, "cancel");
+        break;
+      case "leave":
+        leaveRoom(ws, "leave");
+        break;
+      case "relay":
+        // relay-payload прозрачно отдаём сопернику. Ограничение размера —
+        // 4KB на сообщение, чтобы не положить рилей флудом.
+        if (ws.peer && ws.peer.readyState === 1) {
+          const payload = msg.payload;
+          try {
+            const str = JSON.stringify(payload || {});
+            if (str.length < 4096) {
+              ws.peer.send(JSON.stringify({ type: "peer", payload }));
+            }
+          } catch {}
+        }
+        break;
+    }
+  });
+
+  ws.on("close", () => {
+    clearQueue(ws);
+    leaveRoom(ws, "disconnect");
+  });
+
+  ws.on("error", () => {});
+});
+
+httpServer.listen(Number(PORT), () => {
   console.log(`[discord-volley] listening on :${PORT}`);
   console.log(`[discord-volley] public: ${APP_URL}`);
   console.log(`[discord-volley] redirect_uri: ${REDIRECT_URI}`);
