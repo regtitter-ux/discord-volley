@@ -410,26 +410,6 @@ function resizeCanvas(){
 window.addEventListener("resize", resizeCanvas);
 window.addEventListener("orientationchange", resizeCanvas);
 
-/* Жёсткий landscape-gate на тач-устройствах. Если повернули в портрет во
-   время игры — ставим на паузу, чтобы мяч не катался за кадром, пока
-   пользователь переворачивает телефон обратно. */
-const portraitMQ = (typeof window.matchMedia === "function")
-  ? window.matchMedia("(orientation: portrait) and (hover: none) and (pointer: coarse)")
-  : null;
-function onOrientationGate(){
-  if(!portraitMQ || !portraitMQ.matches) return;
-  if(state.inGame && !state.paused && !state.matchOver){
-    Game.pause();
-  }
-}
-if(portraitMQ){
-  if(typeof portraitMQ.addEventListener === "function"){
-    portraitMQ.addEventListener("change", onOrientationGate);
-  } else if(typeof portraitMQ.addListener === "function"){
-    portraitMQ.addListener(onOrientationGate);
-  }
-}
-
 /* ---------------- Input ----------------
    We check BOTH e.code (physical key, layout-independent) and e.key
    (logical char) so WAD works on Cyrillic/other layouts where e.key

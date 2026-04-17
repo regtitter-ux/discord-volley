@@ -207,22 +207,7 @@ body.is-touch .touch-controls{display:flex}
 @keyframes overlay-in{from{opacity:0}to{opacity:1}}
 @keyframes overlay-box-in{from{opacity:0;transform:scale(.9) translateY(8px)}to{opacity:1;transform:none}}
 
-/* Rotate device gate — на тач-устройствах в портретной ориентации полностью
-   блокируем приложение: показываем только этот экран, всё остальное
-   прячем. Играть в вертикальной вёрстке неудобно и сцена вырождается,
-   лучше жёстко требовать поворот. */
-#rotate-hint{position:fixed;inset:0;z-index:9999;display:none;align-items:center;justify-content:center;background:var(--bg);padding:24px;color:var(--text)}
-.rotate-box{display:flex;flex-direction:column;align-items:center;gap:12px;text-align:center;max-width:320px}
-.rotate-box svg{color:var(--blurple);animation:rotate-phone 2.2s ease-in-out infinite}
-.rotate-title{font-size:18px;font-weight:700}
-.rotate-sub{font-size:13px;color:var(--muted)}
-@keyframes rotate-phone{
-  0%,40%   {transform:rotate(0deg)}
-  60%,100% {transform:rotate(-90deg)}
-}
-/* Триггер: портретная ориентация на тач-устройстве (исключаем десктопы
-   в узких окнах — там hover:hover, pointer:fine). */
-@media (orientation:portrait) and (hover:none) and (pointer:coarse){
-  body.is-touch #rotate-hint{display:flex}
-  body.is-touch #app > .screen{display:none !important}
-}
+/* Rotate-hint DOM оставлен в разметке, но без триггеров: в портрете
+   приложение продолжает работать (contain-fit + центрированные тач-
+   кнопки), принудительный поворот не требуем. */
+#rotate-hint{display:none}
