@@ -364,19 +364,6 @@ function enterMenu(){
   show("menu");
 }
 
-/* ---------------- Segmented selectors ---------------- */
-function wireSegmented(rootId, onChange){
-  const root = $(rootId);
-  root.addEventListener("click", (e)=>{
-    const b = e.target.closest("button[data-val]");
-    if(!b) return;
-    for(const c of root.children) c.classList.remove("active");
-    b.classList.add("active");
-    onChange(b.dataset.val);
-  });
-}
-wireSegmented("target-score", v => state.targetScore = parseInt(v,10));
-
 /* ---------------- Matchmaking ----------------
    Клик по «ИГРАТЬ» запускает поиск: открываем WebSocket, встаём в очередь,
    показываем лобби с обратным отсчётом. Если в течение QUEUE_TIMEOUT_MS
@@ -1118,6 +1105,16 @@ const Game = (function(){
     trail.unshift({ x: ball.x, y: ball.y });
     if(trail.length > TRAIL_LEN) trail.length = TRAIL_LEN;
 
+    // В роли гостя физика авторитетна у хоста — мы получаем её снапшотами
+    // и рендерим; локально только визуальные тики (частицы/эмоции/трейл) выше.
+    // Важно выйти ДО post-point countdown: иначе guest со своим roundTimer=0
+    // каждый кадр, пока хост показывает ro=1, вызывал spawnPlayers()/serveBall()
+    // и тем самым «телепортировал» фигурки обратно в спауны — визуально
+    // выглядело как «игрок не двигается».
+    if(state.mode === "guest"){
+      return;
+    }
+
     // Post-point countdown (ball still bouncing, players can still move).
     // Не запускаем новый раунд после окончания матча — мяч остаётся там,
     // где был забит последний гол, всё докатывается по инерции.
@@ -1129,14 +1126,6 @@ const Game = (function(){
         serveBall();
         return;
       }
-    }
-
-    // В роли гостя физика авторитетна у хоста — мы получаем её снапшотами
-    // и рендерим; локально только визуальные тиков (частицы/эмоции) выше.
-    if(state.mode === "guest"){
-      // post-snapshot: обновляем serve-индикатор-флаг через rallyHits,
-      // остальное уже набиралось визуально.
-      return;
     }
 
     // Controls — disabled after the match ends; both slimes coast on inertia.
