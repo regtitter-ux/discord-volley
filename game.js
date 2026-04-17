@@ -35,7 +35,6 @@ const state = {
   peerKeys: { left:false, right:false, jump:false },
   targetScore: 10,
   inGame: false,
-  paused: false,
   matchOver: false,
   // Сессия матча. matchId — идентификатор раунда, с которым в онлайне
   // клиент будет слать события на сервер (award-запросы, инпуты); seq —
@@ -270,10 +269,10 @@ function botDisplayName(bot){
   return shortenName(I18n.t("bot.prefix") + " " + (bot.global_name || bot.username || ""));
 }
 
-// В каких ролях на поле показаны игроки. В bot/host локальный пользователь —
-// слева (p1), в guest он справа (p2); оппонент всегда по другую сторону.
+// В каких ролях на поле показаны игроки. У каждого клиента свой «себя слева»:
+// host видит state.user как p1, guest тоже — за счёт зеркалирования снапшотов.
 function playerUser(side){
-  if(state.mode === "guest") return side === 1 ? state.opponent : state.user;
+  if(state.mode === "guest") return side === 1 ? state.user     : state.opponent;
   if(state.mode === "host")  return side === 1 ? state.user     : state.opponent;
   return side === 1 ? state.user : state.bot; // bot
 }
@@ -482,10 +481,9 @@ function onPeerPayload(p){
   }else if(p.kind === "state" && state.mode === "guest"){
     Game.applySnapshot(p);
   }else if(p.kind === "emote"){
-    // Эмоция приходит из «локальной системы координат» оппонента.
-    // У хоста оппонент = p2, у гостя = p1.
-    const side = state.mode === "host" ? 2 : 1;
-    Game.triggerEmote(side, p.id);
+    // Эмоция от оппонента. И у хоста, и у гостя оппонент стоит справа (p2)
+    // — гостевая сторона зеркалирует снапшот, так что своя половина всегда p1.
+    Game.triggerEmote(2, p.id);
   }
 }
 
@@ -669,9 +667,12 @@ setInterval(()=>{
   if(mask === _relayLastMask) return;
   _relayLastMask = mask;
   try {
+    // На гостe картинка зеркалирована: он видит себя слева, но в мировых
+    // координатах хоста он — правый игрок. Левая стрелка гостя = движение p2
+    // вправо у хоста, поэтому при отправке меняем left↔right.
     state.ws.send(JSON.stringify({
       type: "relay",
-      payload: { kind:"input", left: keys.left, right: keys.right, jump: keys.jump }
+      payload: { kind:"input", left: keys.right, right: keys.left, jump: keys.jump }
     }));
   } catch(_){}
 }, 33);
@@ -680,8 +681,6 @@ setInterval(()=>{
 const overlay = $("overlay");
 const overlayTitle = $("overlay-title");
 const overlaySub = $("overlay-sub");
-$("btn-pause").addEventListener("click", ()=> Game.pause());
-$("btn-resume").addEventListener("click", ()=> Game.resume());
 $("btn-replay").addEventListener("click", ()=> Game.start());
 function quitToMenu(){
   // Если мы в онлайне — сначала корректно уведомим сервер и закроем сокет,
@@ -742,9 +741,9 @@ document.getElementById("reactions").addEventListener("click", (ev)=>{
   const last = +btn.dataset.last || 0;
   if(now - last < REACT_COOLDOWN) return;
   btn.dataset.last = now;
-  // Локальная сторона пользователя: 2 — если мы гость (справа), иначе 1.
-  const localSide = state.mode === "guest" ? 2 : 1;
-  Game.triggerEmote(localSide, btn.dataset.emoteId);
+  // Локальный игрок всегда рисуется слева (сторона 1), неважно host это или
+  // guest — гостевой клиент зеркалит снапшот, чтобы «я» был p1.
+  Game.triggerEmote(1, btn.dataset.emoteId);
   // Онлайн: пробрасываем эмоцию сопернику через relay.
   if(state.ws && state.ws.readyState === 1 && state.mode !== "bot"){
     try {
@@ -757,9 +756,10 @@ document.getElementById("reactions").addEventListener("click", (ev)=>{
   btn.blur();
 });
 
-document.addEventListener("visibilitychange", ()=>{
-  if(document.hidden && state.inGame && !state.paused && !state.matchOver) Game.pause();
-});
+/* Пауза удалена целиком — автопауза по visibilitychange тоже отключена.
+   Причины: (1) в онлайне пауза одного клиента не может заморозить
+   авторитетного хоста и приводит к рассинхрону / «замиранию» соперника;
+   (2) в SP это лишний режим, удобнее просто выйти кнопкой «В меню». */
 
 /* ========================================================================
    GAME
@@ -1029,7 +1029,6 @@ const Game = (function(){
 
   function start(){
     state.inGame = true;
-    state.paused = false;
     overlay.classList.add("hidden");
     // Clear any stuck input from the menu
     keys.left = keys.right = keys.jump = false;
@@ -1049,33 +1048,11 @@ const Game = (function(){
 
   function stop(){
     state.inGame = false;
-    state.paused = false;
     state.matchOver = false;
     state.session = null;
     lastWinnerSide = 0;
     cancelAnimationFrame(rafId);
     overlay.classList.add("hidden");
-  }
-
-  function pause(){
-    if(!state.inGame || state.paused || state.matchOver) return;
-    state.paused = true;
-    // Сбрасываем удерживаемые клавиши: после авто-паузы по
-    // visibilitychange OS не пришлёт keyup, и игрок на resume
-    // неожиданно стартует в движении.
-    keys.left = keys.right = keys.jump = false;
-    overlayTitle.textContent = I18n.t("game.pause");
-    overlaySub.textContent = "";
-    $("btn-resume").style.display = "";
-    $("btn-replay").style.display = "none";
-    overlay.classList.remove("hidden");
-  }
-  function resume(){
-    if(!state.paused) return;
-    state.paused = false;
-    overlay.classList.add("hidden");
-    last = Clock.now();
-    acc = 0;
   }
 
   function endMatch(winnerSide){
@@ -1086,7 +1063,6 @@ const Game = (function(){
     overlayTitle.textContent = I18n.t(winnerSide===1 ? "game.victory" : "game.defeat");
     const name = winnerSide===1 ? ($("hud-name-p1").textContent) : ($("hud-name-p2").textContent);
     overlaySub.textContent = name + " — " + score1 + " : " + score2;
-    $("btn-resume").style.display = "none";
     // В онлайне повтор без пары невозможен — скрываем «Играть заново».
     $("btn-replay").style.display = state.mode === "bot" ? "" : "none";
     overlay.classList.remove("hidden");
@@ -1283,15 +1259,21 @@ const Game = (function(){
 
   function applySnapshot(s){
     if(state.mode !== "guest" || !p1 || !p2 || !ball) return;
-    p1.x = s.p1.x; p1.y = s.p1.y; p1.vx = s.p1.vx; p1.vy = s.p1.vy; p1.onGround = !!s.p1.g;
-    p2.x = s.p2.x; p2.y = s.p2.y; p2.vx = s.p2.vx; p2.vy = s.p2.vy; p2.onGround = !!s.p2.g;
-    ball.x = s.b.x; ball.y = s.b.y; ball.vx = s.b.vx; ball.vy = s.b.vy; ball.angle = s.b.a;
-    servingSide = s.ss;
+    // Зеркалим по X, чтобы гость видел себя слева. В мировых координатах
+    // хоста гость — p2 (справа), поэтому p1 у нас собираем из s.p2 с
+    // отражением x и vx, а p2 — из s.p1. Счёт и сторону подачи тоже
+    // меняем местами, иначе при первой подаче мяч уедет не туда.
+    p1.x = WORLD_W - s.p2.x; p1.y = s.p2.y; p1.vx = -s.p2.vx; p1.vy = s.p2.vy; p1.onGround = !!s.p2.g;
+    p2.x = WORLD_W - s.p1.x; p2.y = s.p1.y; p2.vx = -s.p1.vx; p2.vy = s.p1.vy; p2.onGround = !!s.p1.g;
+    ball.x = WORLD_W - s.b.x; ball.y = s.b.y;
+    ball.vx = -s.b.vx; ball.vy = s.b.vy; ball.angle = -s.b.a;
+    servingSide = s.ss === 1 ? 2 : 1;
     roundOver = !!s.ro;
     rallyHits = s.rh || 0;
-    if(s.s1 !== score1 || s.s2 !== score2){
+    const newS1 = s.s2, newS2 = s.s1;
+    if(newS1 !== score1 || newS2 !== score2){
       const wasP1 = score1, wasP2 = score2;
-      score1 = s.s1; score2 = s.s2;
+      score1 = newS1; score2 = newS2;
       const elA = $("hud-score-p1"), elB = $("hud-score-p2");
       elA.textContent = String(score1); elB.textContent = String(score2);
       const pulseEl = (score1 > wasP1) ? elA : (score2 > wasP2) ? elB : null;
@@ -1302,23 +1284,24 @@ const Game = (function(){
       }
     }
     if(s.mo && !state.matchOver){
-      endMatchAsSnapshot(s.w);
+      // winnerSide тоже зеркалим: если хост выиграл (s.w===1),
+      // у гостя это сторона 2 (справа, соперник).
+      endMatchAsSnapshot(s.w === 1 ? 2 : 1);
     }
   }
 
   function endMatchAsSnapshot(winnerSide){
     state.matchOver = true;
     lastWinnerSide = winnerSide;
-    // У гостя «моя сторона» — 2 (справа). У хоста — 1.
-    const mySide = state.mode === "guest" ? 2 : 1;
-    overlayTitle.textContent = I18n.t(winnerSide === mySide ? "game.victory" : "game.defeat");
+    // После зеркалирования снапшота гость тоже видит «себя» как сторону 1.
+    overlayTitle.textContent = I18n.t(winnerSide === 1 ? "game.victory" : "game.defeat");
     const name = winnerSide === 1 ? ($("hud-name-p1").textContent) : ($("hud-name-p2").textContent);
     overlaySub.textContent = name + " — " + score1 + " : " + score2;
-    $("btn-resume").style.display = "none";
     // В онлайне «Играть заново» без пары бессмысленно — выходим в меню.
     $("btn-replay").style.display = "none";
     overlay.classList.remove("hidden");
     keys.left = keys.right = keys.jump = false;
+    if(winnerSide === 1) sfx.win(); else sfx.lose();
   }
 
   function applyInput(p, left, right, jump){
@@ -2109,7 +2092,6 @@ const Game = (function(){
     // тикает в игре и rate-limits в кошельке, идёт от одного источника,
     // в который позже можно подмешать серверный offset.
     const now = Clock.now();
-    if(state.paused){ last = now; return; }
     let dt = (now - last) / 1000;
     last = now;
     if(dt > 0.25) dt = 0.25;
@@ -2134,12 +2116,10 @@ const Game = (function(){
         ? $("hud-name-p1").textContent
         : $("hud-name-p2").textContent;
       overlaySub.textContent = name + " — " + score1 + " : " + score2;
-    }else if(state.paused){
-      overlayTitle.textContent = I18n.t("game.pause");
     }
   }
 
-  return { start, stop, pause, resume, refreshOverlay, triggerEmote, applySnapshot };
+  return { start, stop, refreshOverlay, triggerEmote, applySnapshot };
 })();
 
 /* ========================================================================
