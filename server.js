@@ -180,11 +180,13 @@ app.get("/auth/callback", async (req, res) => {
 app.get("/api/me", (req, res) => {
   const u = getSession(req);
   if (!u) return res.status(401).json(null);
+  res.setHeader("Cache-Control", "no-store");
   res.json({
     id:          u.id,
     username:    u.username,
     global_name: u.global_name,
-    avatar_url:  u.avatar_url
+    avatar_url:  u.avatar_url,
+    coins:       userCoins(u.id)
   });
 });
 
@@ -206,7 +208,11 @@ app.get("/api/version", (req, res) => {
    Записи апдейтим на endMatch (type:"match_win") от хоста — он авторитетен
    по результату. Чтобы не потерять на рестарте, сохраняем debounced. */
 
-const DATA_DIR = path.join(__dirname, "data");
+// Путь к каталогу персистентных данных. На локалке — ./data (под .gitignore).
+// В проде на Railway FS эфемерна между деплоями — нужно смонтировать Volume
+// (например, в /data) и задать DATA_DIR=/data в Variables. Иначе топ и
+// балансы кошелька сбросятся на каждом редеплое.
+const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
 const LB_PATH  = path.join(DATA_DIR, "leaderboard.json");
 try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch(_) {}
 
@@ -230,18 +236,95 @@ function saveLeaderboardDebounced(){
   }, 500);
 }
 
+function ensureUser(user){
+  if (!user || !user.id) return null;
+  let u = LB.users[user.id];
+  if (!u){
+    u = {
+      id: user.id,
+      username: user.username || "",
+      global_name: user.global_name || user.username || "",
+      avatar_url: user.avatar_url || null,
+      wins: 0,
+      coins: 0,
+      updatedAt: Date.now()
+    };
+    LB.users[user.id] = u;
+  } else {
+    // Миграция старых записей без coins — выставляем 0, не теряя wins.
+    if (typeof u.coins !== "number") u.coins = 0;
+    // Освежаем профильные поля (юзер мог сменить ник/аватар).
+    if (user.username)    u.username    = user.username;
+    if (user.global_name) u.global_name = user.global_name;
+    if (user.avatar_url)  u.avatar_url  = user.avatar_url;
+  }
+  return u;
+}
+
 function recordWin(user){
-  if (!user || !user.id) return;
-  const prev = LB.users[user.id] || { wins: 0 };
-  LB.users[user.id] = {
-    id:          user.id,
-    username:    user.username || prev.username || "",
-    global_name: user.global_name || user.username || prev.global_name || "",
-    avatar_url:  user.avatar_url || prev.avatar_url || null,
-    wins:        (prev.wins || 0) + 1,
-    updatedAt:   Date.now()
-  };
+  const u = ensureUser(user);
+  if (!u) return;
+  u.wins = (u.wins || 0) + 1;
+  u.updatedAt = Date.now();
   saveLeaderboardDebounced();
+}
+
+/* ---------- Server-authoritative wallet ----------
+   Клиент шлёт {type:"award", kind, matchId, context}. Сервер — единственный
+   источник истины по балансу. Рейт-лимиты и размеры наград настроены тут,
+   а не на клиенте: правка клиентского кода ни на что не влияет.
+   Допустимые kind:
+     rally.hit   — касание мяча; +1, до 200 за матч, не чаще 1 раз в 250 мс.
+     rally.combo — серия касаний; +context.combo (клампим 1..200), до 40 за матч.
+     round.win   — выигран раунд; +5, до 100 за матч.
+     match.win   — выигран матч; +50, 1 раз за матч + 30 с кулдаун между
+                   любыми match.win одного юзера (против фермы ботов).
+   Лимиты «за матч» — по matchId (клиент генерит при старте). Новые matchId
+   ресетят счётчик kind, поэтому общая кросс-матч защита — global cooldown на
+   match.win и умеренные per-match лимиты для остальных событий. */
+const AWARDS = {
+  "rally.hit":   { amount: 1,  minGapMs: 250,  maxPerMatch: 200 },
+  "rally.combo": { amount: 0,  minGapMs: 400,  maxPerMatch: 40, fromContext: true },
+  "round.win":   { amount: 5,  minGapMs: 500,  maxPerMatch: 100 },
+  "match.win":   { amount: 50, minGapMs: 1000, maxPerMatch: 1,  globalGapMs: 30000 }
+};
+// userId → { kind → { lastAt, count, matchId } } + _lastMatchWinAt
+const userRates = new Map();
+
+function awardCoins(user, kind, matchId, context){
+  const cfg = AWARDS[kind];
+  if (!cfg) return null;
+  if (!matchId || typeof matchId !== "string" || matchId.length > 64) return null;
+  const u = ensureUser(user);
+  if (!u) return null;
+  const now = Date.now();
+  let rec = userRates.get(user.id);
+  if (!rec){ rec = { _lastMatchWinAt: 0 }; userRates.set(user.id, rec); }
+  // Global cooldown — защита от фарма ботом на коротких быстрых матчах.
+  if (cfg.globalGapMs && kind === "match.win"){
+    if (now - (rec._lastMatchWinAt || 0) < cfg.globalGapMs) return null;
+  }
+  let st = rec[kind];
+  if (!st || st.matchId !== matchId) st = rec[kind] = { lastAt: -Infinity, count: 0, matchId };
+  if (now - st.lastAt < cfg.minGapMs) return null;
+  if (st.count >= cfg.maxPerMatch)    return null;
+  let amount = cfg.amount;
+  if (cfg.fromContext && context && typeof context.combo === "number"){
+    amount = Math.max(1, Math.min(200, context.combo | 0));
+  }
+  st.lastAt = now;
+  st.count++;
+  if (kind === "match.win") rec._lastMatchWinAt = now;
+  u.coins = (u.coins || 0) + amount;
+  if (u.coins < 0) u.coins = 0;
+  u.updatedAt = now;
+  saveLeaderboardDebounced();
+  return { coins: u.coins, delta: amount };
+}
+
+function userCoins(id){
+  const u = LB.users[id];
+  return (u && typeof u.coins === "number") ? u.coins : 0;
 }
 
 function topLeaderboard(limit){
@@ -426,7 +509,7 @@ wss.on("connection", (ws, req) => {
   ws.peer = null;
   ws.roomId = null;
 
-  send(ws, { type: "hello", user: safeUser(user), online: onlineCount() });
+  send(ws, { type: "hello", user: safeUser(user), online: onlineCount(), coins: userCoins(user.id) });
   broadcastStats();
 
   ws.on("message", (raw) => {
@@ -445,13 +528,28 @@ wss.on("connection", (ws, req) => {
       case "leave":
         leaveRoom(ws, "leave");
         break;
-      case "match_win":
-        // Каждый клиент репортит только СВОЮ победу — так просто и
-        // безопасно: нельзя «назначить» победу сопернику. При форфейте
-        // ws.peer уже null (сервер закрыл пиринг), поэтому отдельно не
-        // обрабатываем этот случай.
+      case "match_win": {
+        // Запись победы в PvP-таблицу лидеров. Каждый клиент шлёт только за
+        // себя — нельзя «назначить» победу сопернику. При форфейте ws.peer
+        // уже null, поэтому отдельно не обрабатываем. Монеты за match.win
+        // идут отдельным {type:"award", kind:"match.win"} — так одна и та
+        // же ручка работает и в боте, и в онлайне, не раздувая матч_win.
         recordWin(ws.user);
         break;
+      }
+      case "award": {
+        // Серверно-авторитетные награды (все kind из AWARDS, включая match.win).
+        // Клиент шлёт {kind, matchId, context}. Клиентский amount игнорируется —
+        // размер награды определяет сервер. Защита от фарма бота:
+        // global cooldown 30 с между match.win + per-match cap по каждому kind.
+        const kind = String(msg.kind || "");
+        const mid = (typeof msg.matchId === "string") ? msg.matchId.slice(0, 64) : "";
+        if (!mid) break;
+        const ctx = (msg.context && typeof msg.context === "object") ? msg.context : null;
+        const res = awardCoins(ws.user, kind, mid, ctx);
+        if (res) send(ws, { type: "wallet", coins: res.coins, delta: res.delta, kind });
+        break;
+      }
       case "relay":
         // relay-payload прозрачно отдаём сопернику. Ограничение размера —
         // 4KB на сообщение, чтобы не положить рилей флудом.

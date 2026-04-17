@@ -33,13 +33,17 @@
 
   function normalize(u){
     if(!u || !u.id) return null;
-    return {
+    const out = {
       id:          u.id,
       username:    u.username,
       global_name: u.global_name || u.username,
       avatar_url:  u.avatar_url || null,
       color:       colorFor(u)
     };
+    // Пропускаем coins, если сервер их вернул (только /api/me). Для
+    // нормализации opponent-объектов поле отсутствует — и это ок.
+    if(typeof u.coins === "number") out.coins = u.coins | 0;
+    return out;
   }
 
   async function current(){

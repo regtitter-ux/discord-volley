@@ -64,7 +64,12 @@ async function boot(){
   // /api/me может вернуть 401 (не залогинен) или 200 с профилем.
   // Во время ожидания ответа экран авторизации — безопасный дефолт.
   const u = await Auth.current();
-  if(u){ state.user = u; enterMenu(); }
+  if(u){
+    state.user = u;
+    // Стартовый баланс приходит с сервера — кошелёк серверно-авторитетный.
+    if(typeof u.coins === "number") Wallet.set(u.coins, 0);
+    enterMenu();
+  }
   else { show("login"); }
 
   // Если вернулись с callback с ошибкой — мягко сообщаем в консоль,
@@ -76,125 +81,42 @@ async function boot(){
   }
 }
 
-/* ---------------- Wallet (persistent coin balance) ----------------
-   ВНИМАНИЕ: до релиза с онлайном кошелёк ДОЛЖЕН стать серверным. Текущая
-   реализация клиентская — локальный баланс только для SP-режима. Любой
-   подправит localStorage через DevTools. Мы добавляем:
-     1) честный лимит по событиям (rate-limit),
-     2) HMAC-подобная подпись на локальном «устройствном» секрете,
-        чтобы правки значения в devtools рушили запись (сбрасывало в 0),
-     3) API-контракт, удобный для свапа на серверный источник истины
-        (`WalletRemote.add(eventType, context)` → сервер возвращает delta).
-   НИЧТО ИЗ ЭТОГО — не настоящая защита. Сервер обязателен.
-*/
+/* ---------------- Wallet (server-authoritative) ----------------
+   Баланс живёт ТОЛЬКО на сервере: редактирование localStorage/DevTools ни на
+   что не влияет. Клиент — зеркало: получает стартовый баланс из /api/me и
+   hello-сообщения, слушает {type:"wallet", coins, delta} апдейты. award() —
+   заявка на начисление (отправляется по WS), ответ приходит асинхронно.
+   Для бот-матчей начисления идут так же через сервер — там хардкорные
+   кросс-матч лимиты (в т.ч. global cooldown 30 с на match.win) защищают
+   от фарма ботом. */
 const Wallet = (function(){
-  const KEY = "dv_coins_v1";
-  // Устройствный «секрет» — одноразово генерируется и хранится рядом.
-  // Атакующий всё равно достанет, но это ломает тривиальные правки типа
-  // «установил 999999 в DevTools»: подпись перестаёт совпадать → сброс.
-  const SECRET_KEY = "dv_wallet_secret_v1";
-  let secret;
-  try{
-    secret = localStorage.getItem(SECRET_KEY);
-    if(!secret){
-      secret = "s_" + Math.random().toString(36).slice(2) + Date.now().toString(36);
-      localStorage.setItem(SECRET_KEY, secret);
-    }
-  }catch(_){ secret = "fallback"; }
-
-  // FNV-1a 32-bit. Дешево, достаточно для anti-tamper на localStorage.
-  function sign(value){
-    let h = 0x811c9dc5;
-    const s = String(value) + "|" + secret;
-    for(let i = 0; i < s.length; i++){
-      h ^= s.charCodeAt(i);
-      h = (h + ((h << 1) + (h << 4) + (h << 7) + (h << 8) + (h << 24))) >>> 0;
-    }
-    return h.toString(36);
-  }
-
   let balance = 0;
-  try{
-    const raw = localStorage.getItem(KEY);
-    if(raw){
-      const parts = raw.split(":");
-      if(parts.length === 2){
-        const v = parseInt(parts[0], 10);
-        if(!isNaN(v) && v >= 0 && parts[1] === sign(v)) balance = v;
-      }
-    }
-  }catch(_){}
-
   const listeners = [];
-
-  // Троттлим запись: при частых начислениях (каждое касание мяча = +1)
-  // сбрасываем в localStorage не чаще раза в 200 мс. Форсим на pagehide,
-  // чтобы ничего не терялось при закрытии вкладки.
-  let saveTimer = 0;
-  function flush(){
-    if(saveTimer){ clearTimeout(saveTimer); saveTimer = 0; }
-    try{ localStorage.setItem(KEY, balance + ":" + sign(balance)); }catch(_){}
+  function set(newBalance, explicitDelta){
+    const n = Math.max(0, newBalance | 0);
+    const delta = (typeof explicitDelta === "number") ? explicitDelta : (n - balance);
+    balance = n;
+    for(const fn of listeners) { try { fn(delta, balance); } catch(_){} }
   }
-  function scheduleSave(){
-    if(saveTimer) return;
-    saveTimer = setTimeout(flush, 200);
-  }
-  // pagehide/beforeunload ненадёжны на iOS Safari; visibilitychange:hidden
-  // стреляет и когда пользователь переключает вкладку. Форсим запись тут же.
-  window.addEventListener("pagehide", flush);
-  window.addEventListener("beforeunload", flush);
-  document.addEventListener("visibilitychange", ()=>{
-    if(document.hidden) flush();
-  });
-
-  // Рейт-лимит по типам событий. Клиентская проверка — только от
-  // случайных багов (спам через залипшую коллизию) и от совсем ленивого
-  // читерства. Авторитет — сервер.
-  const RATE = {
-    // rally-hit не чаще 1 в ~250 мс: нормальный полёт мяча между
-    // касаниями редко короче, любой спам выходит за границу.
-    "rally.hit":   { minGapMs: 250, maxPerMatch: 200 },
-    "rally.combo": { minGapMs: 500, maxPerMatch: 40  },
-    "round.win":   { minGapMs: 500, maxPerMatch: 100 },
-    "match.win":   { minGapMs: 1000, maxPerMatch: 1  }
-  };
-  const eventState = Object.create(null); // { type → { lastAt, count } }
-  function matchReset(){
-    for(const k in eventState) delete eventState[k];
-  }
-
-  function tryAward(type, amount){
-    const cfg = RATE[type];
-    if(!cfg){ return false; } // неизвестный тип — отклоняем, лучше потерять очко, чем открыть вектор.
-    const now = Clock.now();
-    const st = eventState[type] || (eventState[type] = { lastAt: -Infinity, count: 0 });
-    if(now - st.lastAt < cfg.minGapMs) return false;
-    if(st.count >= cfg.maxPerMatch)    return false;
-    st.lastAt = now;
-    st.count++;
-    balance += amount | 0;
-    if(balance < 0) balance = 0;
-    scheduleSave();
-    for(const fn of listeners) { try{ fn(amount, balance); }catch(_){} }
+  function award(kind, amountOrCombo){
+    // Клиентское значение amount игнорируется сервером; для rally.combo мы
+    // всё же прокидываем combo в context, чтобы сервер знал размер серии.
+    if(!state.ws || state.ws.readyState !== 1) return false;
+    const payload = {
+      type: "award",
+      kind: String(kind || ""),
+      matchId: (state.session && state.session.matchId) || null
+    };
+    if(kind === "rally.combo") payload.context = { combo: amountOrCombo | 0 };
+    try { state.ws.send(JSON.stringify(payload)); } catch(_){}
     return true;
   }
-
   return {
     get(){ return balance; },
-    // Доменное API — каждый источник начислений именован. При переезде
-    // на сервер клиент будет слать {type, matchId, seq}, а сумма и
-    // валидация — на сервере.
-    award(type, amount){ return tryAward(type, amount); },
+    set: set,
+    award: award,
     onChange(fn){ if(typeof fn === "function") listeners.push(fn); },
-    matchReset: matchReset,
-    // Прямой `add` оставляем ТОЛЬКО для отладки/совместимости. Не
-    // использовать из игрового кода — используй award(type, amount).
-    _debugAdd(amount){
-      balance += amount | 0;
-      if(balance < 0) balance = 0;
-      scheduleSave();
-      for(const fn of listeners) { try{ fn(amount, balance); }catch(_){} }
-    }
+    matchReset(){ /* no-op: сервер трекает по matchId */ }
   };
 })();
 
@@ -330,6 +252,10 @@ $("btn-logout").addEventListener("click", async (e) => {
   closeUserPopup();
   await Auth.logout();
   state.user = null;
+  // Серверная сессия закрыта — сокет станет невалидным; закроем сами,
+  // чтобы не держать стухший коннект и не светить юзера в онлайн-счётчике.
+  if(state.ws){ try { state.ws.close(); } catch(_){} state.ws = null; }
+  Wallet.set(0, 0);
   show("login");
 });
 
@@ -367,6 +293,30 @@ function enterMenu(){
   show("menu");
   refreshOnlineCount();
   refreshLeaderboard();
+  // Держим WS открытым с момента входа в меню: счётчик онлайна считает
+  // именно подключённых юзеров (не тех, кто в матчмейкинге), а кошелёк
+  // получает серверные апдейты балланса пушем.
+  ensureMenuSocket();
+}
+
+// Один постоянный сокет на сессию. Переиспользуем его для matchmaking,
+// онлайн-счётчика и пушей кошелька. Закрываем только на logout/выгрузке.
+async function ensureMenuSocket(){
+  if(state.ws && state.ws.readyState === 1) return state.ws;
+  if(state.ws && state.ws.readyState === 0){
+    // Уже идёт handshake — подождём его завершения (race между вкладками).
+    return new Promise((res)=>{
+      const ws = state.ws;
+      const done = ()=> res(ws.readyState === 1 ? ws : null);
+      ws.addEventListener("open",  done, { once: true });
+      ws.addEventListener("error", done, { once: true });
+    });
+  }
+  const ws = await openSocket();
+  if(!ws) return null;
+  state.ws = ws;
+  attachSocketHandlers(ws);
+  return ws;
 }
 
 /* ---------------- Онлайн-счётчик и таблица лидеров ----------------
@@ -541,9 +491,20 @@ function onServerMessage(msg){
   switch(msg.type){
     case "hello":
       if(typeof msg.online === "number") setOnlineCount(msg.online);
+      if(typeof msg.coins  === "number") Wallet.set(msg.coins, 0);
       break;
     case "stats":
       if(typeof msg.online === "number") setOnlineCount(msg.online);
+      break;
+    case "wallet":
+      // Серверный пуш нового баланса. Передаём явный delta, чтобы UI
+      // анимировал именно то, что сервер фактически начислил (может
+      // отличаться от клиентской «ожидаемой» суммы — напр., rate-limit
+      // отклонил, или combo скорректировано сервером).
+      if(typeof msg.coins === "number"){
+        const d = (typeof msg.delta === "number") ? msg.delta : undefined;
+        Wallet.set(msg.coins, d);
+      }
       break;
     case "matched":
       startOnlineMatch(msg.role, msg.opponent);
@@ -583,18 +544,18 @@ function onPeerLeft(reason){
   // mode переключаем в "bot" — чтобы кнопка «В меню» на оверлее не пыталась
   // слать peer-сообщения обратно серверу.
   if(state.inGame && !state.matchOver){
-    // Репортим свою форфейт-победу в лидерборд ДО закрытия сокета.
+    // Репортим свою форфейт-победу в лидерборд.
     try {
       state.ws && state.ws.readyState === 1 && state.ws.send(JSON.stringify({ type: "match_win" }));
     } catch(_){}
     Game.endByForfeit();
-    closeSocket();
+    // Сокет НЕ закрываем: держим его постоянно открытым от меню до logout,
+    // чтобы онлайн-счётчик и пуши кошелька работали между матчами.
     state.mode = "bot";
     state.opponent = null;
     return;
   }
   // Матч ещё не начат или уже завершён — просто возвращаем в меню.
-  closeSocket();
   Game.stop();
   state.mode = "bot";
   state.opponent = null;
@@ -650,15 +611,15 @@ function startOnlineMatch(role, opponent){
 
 async function startMatchmaking(){
   showLobby();
-  const ws = await openSocket();
+  // Переиспользуем постоянный сокет из меню. Если его ещё нет (boot не успел
+  // или сеть упала) — пытаемся открыть; при неудаче откатываемся к боту.
+  const ws = await ensureMenuSocket();
   if(!ws){
     hideLobby();
     startBotMatch();
     return;
   }
-  state.ws = ws;
-  attachSocketHandlers(ws);
-  ws.send(JSON.stringify({ type: "queue" }));
+  try { ws.send(JSON.stringify({ type: "queue" })); } catch(_){}
 }
 
 $("btn-play").addEventListener("click", startMatchmaking);
@@ -668,7 +629,7 @@ $("btn-lobby-cancel").addEventListener("click", ()=>{
   if(state.ws){
     try { state.ws.send(JSON.stringify({ type: "cancel" })); } catch(_){}
   }
-  closeSocket();
+  // Сокет держим открытым — он общий для матчмейкинга, онлайн-счётчика и кошелька.
 });
 
 /* ---------------- Canvas sizing ---------------- */
@@ -814,11 +775,11 @@ const overlayTitle = $("overlay-title");
 const overlaySub = $("overlay-sub");
 $("btn-replay").addEventListener("click", ()=> Game.start());
 function quitToMenu(){
-  // Если мы в онлайне — сначала корректно уведомим сервер и закроем сокет,
-  // чтобы соперник увидел peer_left сразу, а не по таймауту.
+  // Если мы в онлайне — корректно уведомим сервер через {type:"leave"},
+  // чтобы соперник увидел peer_left сразу. Сокет НЕ закрываем — это общий
+  // сокет для online-счётчика и серверного кошелька, он живёт всю сессию.
   if(state.mode !== "bot" && state.ws){
     try { state.ws.send(JSON.stringify({ type: "leave" })); } catch(_){}
-    closeSocket();
   }
   state.mode = "bot";
   state.opponent = null;
