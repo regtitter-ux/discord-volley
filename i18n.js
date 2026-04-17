@@ -18,6 +18,13 @@
       "menu.hint":      "Стрелками / WAD двигайтесь и прыгайте. Не давайте мячу коснуться земли на вашей стороне.",
       "menu.points":    "До скольки очков",
       "menu.play":      "ИГРАТЬ",
+      "menu.online_label": "Сейчас онлайн",
+
+      "lb.title":       "Топ по победам",
+      "lb.empty":       "Пока никто не побеждал — будь первым!",
+      "lb.me_rank":     "Вы: #{rank} · {wins} побед",
+      "lb.me_empty":    "Выиграй первый матч, чтобы попасть в топ",
+      "lb.wins_suffix": "побед",
 
       "lobby.searching":     "Поиск соперника…",
       "lobby.fallback_hint": "Если никого не найдём за 3 секунды — начнём матч с ботом.",
@@ -41,6 +48,7 @@
       "game.serve_opp": "ПОДАЧА СОПЕРНИКА",
       "game.point":     "ОЧКО!",
       "game.miss":      "ПРОПУСК",
+      "game.opponent_left": "Соперник сдался",
 
       "wallet.label":   "Монеты",
 
@@ -62,6 +70,13 @@
       "menu.hint":      "Use arrows / WAD to move and jump. Don't let the ball touch the ground on your side.",
       "menu.points":    "Points to win",
       "menu.play":      "PLAY",
+      "menu.online_label": "Players online",
+
+      "lb.title":       "Top by wins",
+      "lb.empty":       "No winners yet — be the first!",
+      "lb.me_rank":     "You: #{rank} · {wins} wins",
+      "lb.me_empty":    "Win your first match to join the ranks",
+      "lb.wins_suffix": "wins",
 
       "lobby.searching":     "Searching for opponent…",
       "lobby.fallback_hint": "If nobody joins in 3 seconds, we'll start a match against a bot.",
@@ -85,6 +100,7 @@
       "game.serve_opp": "OPPONENT SERVE",
       "game.point":     "POINT!",
       "game.miss":      "MISS",
+      "game.opponent_left": "Opponent forfeited",
 
       "wallet.label":   "Coins",
 

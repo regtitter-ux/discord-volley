@@ -114,18 +114,15 @@ h1,h2,h3{font-weight:700}
   .react-btn img{width:24px;height:24px}
 }
 /* В портрете на тач-устройстве левой-боковой колонке не место: поле и так
-   узкое, колонка загораживает вид. Переносим реакции вниз, в 2 ряда с
-   горизонтальным скроллом (привычно по UX-стикер-пикерам), между игровым
-   полем и тач-кнопками управления. Тач-кнопки тоже приподнимаем, чтобы
-   палец тянулся меньше и эмодзи-полоса помещалась над ними. */
+   узкое, колонка загораживает вид. Переносим реакции вниз — горизонтальный
+   2-рядный стикер-пикер, между игровым полем и тач-кнопками управления. */
 @media (orientation:portrait){
-  body.is-touch .touch-controls{bottom:calc(72px + var(--safe-bot))}
   body.is-touch .reactions{
     top:auto;
     left:0;
     right:0;
-    /* над тач-кнопками (72 + ~74 высота + запас) */
-    bottom:calc(162px + var(--safe-bot));
+    /* Над тач-зоной (высота 84 + safe-bot) + небольшой зазор. */
+    bottom:calc(92px + var(--safe-bot));
     max-height:none;
     display:grid;
     grid-auto-flow:column;
@@ -182,6 +179,40 @@ body.is-touch .overlay{background:rgba(0,0,0,.72)}
 /* Карточки в стиле Discord — такие же плотные, как overlay-box у Паузы. */
 .card{background:var(--bg-2);border-radius:var(--radius-lg);padding:16px;box-shadow:var(--shadow)}
 .card-label{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.5px;margin-bottom:10px;font-weight:700}
+
+/* Индикатор числа игроков онлайн. Пилюля с пульсирующей точкой — узнаваемый
+   «live»-паттерн из чатов. Счётчик обновляется через WS push-сообщение
+   {type:"stats", online:n} и раз в 30 с по http фоллбеку. */
+.online-chip{display:inline-flex;align-self:center;align-items:center;gap:8px;padding:6px 12px;background:var(--bg-2);border:1px solid rgba(255,255,255,.06);border-radius:999px;font-size:13px;color:var(--muted);user-select:none}
+.online-chip .online-dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 0 rgba(35,165,90,.55);animation:online-pulse 1.8s ease-out infinite}
+.online-chip .online-count{color:var(--text);font-weight:700}
+@keyframes online-pulse{
+  0%  {box-shadow:0 0 0 0 rgba(35,165,90,.55)}
+  70% {box-shadow:0 0 0 8px rgba(35,165,90,0)}
+  100%{box-shadow:0 0 0 0 rgba(35,165,90,0)}
+}
+
+/* Топ по победам — плотная таблица строк "ранг · аватар · имя · побед". */
+.lb-card{text-align:left;margin-top:4px}
+.lb-head{display:flex;align-items:center;justify-content:space-between;gap:12px;margin-bottom:10px}
+.lb-head .card-label{margin-bottom:0}
+.lb-me{font-size:12px;color:var(--muted);font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:65%}
+.lb-me.me-topped{color:#ffd34a}
+.lb-list{list-style:none;margin:0;padding:0;display:flex;flex-direction:column;gap:2px}
+.lb-row{display:flex;align-items:center;gap:10px;padding:6px 8px;border-radius:8px;transition:background-color .12s ease}
+.lb-row:hover{background:var(--bg-3)}
+.lb-row.me{background:rgba(88,101,242,.14);outline:1px solid rgba(88,101,242,.45)}
+.lb-rank{width:24px;flex-shrink:0;font-weight:800;font-size:13px;color:var(--muted);text-align:center;font-variant-numeric:tabular-nums}
+.lb-row.top-1 .lb-rank{color:#ffd34a}
+.lb-row.top-2 .lb-rank{color:#d7dadc}
+.lb-row.top-3 .lb-rank{color:#cd7f32}
+.lb-avatar{width:26px;height:26px;border-radius:50%;overflow:hidden;flex-shrink:0;background:var(--blurple);display:flex;align-items:center;justify-content:center;color:#fff;font-size:11px;font-weight:700}
+.lb-avatar img{width:100%;height:100%;object-fit:cover}
+.lb-name{flex:1;min-width:0;font-size:13px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.lb-wins{flex-shrink:0;font-size:13px;font-weight:800;color:var(--text);font-variant-numeric:tabular-nums}
+.lb-wins .suffix{color:var(--muted);font-weight:600;font-size:11px;margin-left:4px;text-transform:uppercase;letter-spacing:.3px}
+.lb-empty{font-size:12px;text-align:center;padding:8px 0}
+.lb-list:not(:empty) + .lb-empty{display:none}
 .segmented{display:flex;gap:6px;background:var(--bg);padding:4px;border-radius:var(--radius)}
 .segmented button{flex:1;padding:10px 8px;border-radius:6px;color:var(--muted);font-weight:600;font-size:13px;transition:background-color .12s ease,color .12s ease}
 .segmented button:hover{color:var(--text);background:var(--bg-3)}
@@ -208,18 +239,26 @@ body.is-touch .overlay{background:rgba(0,0,0,.72)}
 .hud-diff{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;font-weight:700}
 
 /* Touch controls.
-   Каждая .side занимает ровно половину экрана и центрирует свои кнопки —
-   ◀▶ посередине игрового полукорта пользователя, ▲ посередине полукорта
-   соперника. Так большой палец попадает в кнопку из естественного хвата,
-   не тянется к краям и не перекрывает важные части сцены. */
-.touch-controls{position:absolute;left:0;right:0;bottom:calc(14px + var(--safe-bot));display:none;align-items:flex-end;pointer-events:none}
-.touch-controls .side{flex:1;display:flex;justify-content:center;gap:18px;pointer-events:auto}
-.tbtn{pointer-events:auto;width:74px;height:74px;border-radius:50%;background:rgba(88,101,242,.85);color:#fff;font-size:28px;font-weight:700;display:flex;align-items:center;justify-content:center;box-shadow:0 4px 10px rgba(0,0,0,.35);user-select:none;-webkit-user-select:none;-webkit-touch-callout:none}
-.tbtn:active{background:var(--blurple-hover);transform:scale(.96)}
-.tbtn-jump{background:rgba(35,165,90,.9)}
-.tbtn-jump:active{background:#1d8b4c}
+   Каждая .tbtn — прозрачная зона-хитбокс, растянутая на свою часть нижней
+   полосы экрана. Тап по любой точке такой зоны = нажатие соответствующей
+   клавиши, не нужно целиться в маленький круг. Визуальная пилюля (.tbtn-pill)
+   даёт пользователю ориентир, но сама не является хитбоксом.
+   Высота полосы контролов «отрезается» от canvas'а (см. body.is-touch #cv
+   в медиа-запросах и resizeCanvas в game.js), так что тач-зоны лежат ПОД
+   игровым полем и не перекрывают его. */
+.touch-controls{position:absolute;left:0;right:0;bottom:0;top:auto;height:calc(84px + var(--safe-bot));padding:0 0 var(--safe-bot);display:none;align-items:stretch;pointer-events:none;z-index:4}
+.touch-controls .side{flex:1;display:flex;align-items:stretch;justify-content:stretch;pointer-events:auto;gap:0}
+.tbtn{flex:1;pointer-events:auto;width:auto;height:auto;padding:0;background:transparent;color:#fff;font-size:0;font-weight:700;display:flex;align-items:center;justify-content:center;box-shadow:none;border-radius:0;user-select:none;-webkit-user-select:none;-webkit-touch-callout:none;position:relative}
+.tbtn-pill{display:flex;align-items:center;justify-content:center;width:64px;height:64px;border-radius:50%;background:rgba(88,101,242,.88);color:#fff;font-size:26px;font-weight:700;box-shadow:0 4px 10px rgba(0,0,0,.35);pointer-events:none;transition:background-color .1s ease,transform .06s ease;will-change:transform}
+.tbtn-jump .tbtn-pill{background:rgba(35,165,90,.92)}
+.tbtn:active .tbtn-pill{background:var(--blurple-hover);transform:scale(.94)}
+.tbtn-jump:active .tbtn-pill{background:#1d8b4c}
 
 body.is-touch .touch-controls{display:flex}
+/* На тач-устройстве укорачиваем canvas на высоту зоны управления — так
+   «пол» визуально поднимается, а кнопки сидят под полем и не загораживают
+   персонажей/мяч. CSS-высота отражена в resizeCanvas через canvas.clientHeight. */
+body.is-touch #cv{height:calc(100% - 84px - var(--safe-bot))}
 
 /* Corner icon buttons (e.g. home / exit-to-menu) */
 .icon-btn{position:absolute;width:40px;height:40px;border-radius:50%;display:flex;align-items:center;justify-content:center;background:rgba(30,31,34,.78);color:var(--text);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);border:1px solid rgba(255,255,255,.08);box-shadow:0 2px 8px rgba(0,0,0,.25);transition:background-color .12s ease,transform .06s ease;z-index:5}
@@ -239,12 +278,14 @@ body.is-touch .touch-controls{display:flex}
   .hud{padding:6px 10px;gap:10px}
   .hud-name{max-width:68px;font-size:11px}
   .hud-score{font-size:17px}
-  .tbtn{width:64px;height:64px;font-size:24px}
+  .tbtn-pill{width:54px;height:54px;font-size:22px}
 }
 @media (max-height:420px){
-  .tbtn{width:56px;height:56px;font-size:22px}
-  .touch-controls{bottom:calc(8px + var(--safe-bot))}
-  .touch-controls .side{gap:14px}
+  /* На низких экранах (ландшафт-мобиле) уменьшаем высоту зоны контролов,
+     иначе отжимает поле. Хитбокс всё равно растягивается на всю зону. */
+  body.is-touch .touch-controls{height:calc(64px + var(--safe-bot))}
+  body.is-touch #cv{height:calc(100% - 64px - var(--safe-bot))}
+  .tbtn-pill{width:48px;height:48px;font-size:20px}
   .hud{top:calc(6px + var(--safe-top));padding:4px 10px;gap:8px}
   .hud-name{max-width:56px}
   .hud-score{font-size:15px}

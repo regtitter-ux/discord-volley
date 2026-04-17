@@ -200,6 +200,83 @@ app.get("/api/version", (req, res) => {
   res.json({ build: BUILD_ID });
 });
 
+/* ---------- Leaderboard (wins) + live online counter ----------
+   Хранение — простой JSON-файл (data/leaderboard.json). Схема: { users: {
+   <id>: { id, username, global_name, avatar_url, wins, updatedAt } } }.
+   Записи апдейтим на endMatch (type:"match_win") от хоста — он авторитетен
+   по результату. Чтобы не потерять на рестарте, сохраняем debounced. */
+
+const DATA_DIR = path.join(__dirname, "data");
+const LB_PATH  = path.join(DATA_DIR, "leaderboard.json");
+try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch(_) {}
+
+function loadLeaderboard(){
+  try {
+    const raw = fs.readFileSync(LB_PATH, "utf8");
+    const j = JSON.parse(raw);
+    if (j && j.users && typeof j.users === "object") return j;
+  } catch(_) {}
+  return { users: {} };
+}
+const LB = loadLeaderboard();
+
+let _lbSaveTimer = null;
+function saveLeaderboardDebounced(){
+  if (_lbSaveTimer) return;
+  _lbSaveTimer = setTimeout(() => {
+    _lbSaveTimer = null;
+    try { fs.writeFileSync(LB_PATH, JSON.stringify(LB), "utf8"); }
+    catch(e){ console.error("[lb] write failed:", e); }
+  }, 500);
+}
+
+function recordWin(user){
+  if (!user || !user.id) return;
+  const prev = LB.users[user.id] || { wins: 0 };
+  LB.users[user.id] = {
+    id:          user.id,
+    username:    user.username || prev.username || "",
+    global_name: user.global_name || user.username || prev.global_name || "",
+    avatar_url:  user.avatar_url || prev.avatar_url || null,
+    wins:        (prev.wins || 0) + 1,
+    updatedAt:   Date.now()
+  };
+  saveLeaderboardDebounced();
+}
+
+function topLeaderboard(limit){
+  const arr = Object.values(LB.users);
+  arr.sort((a, b) => (b.wins || 0) - (a.wins || 0) || (a.updatedAt||0) - (b.updatedAt||0));
+  const n = Math.max(1, Math.min(limit|0 || 10, 50));
+  return arr.slice(0, n).map(u => ({
+    id: u.id,
+    global_name: u.global_name || u.username || "",
+    avatar_url: u.avatar_url || null,
+    wins: u.wins || 0
+  }));
+}
+
+app.get("/api/leaderboard", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const me = getSession(req);
+  const entries = topLeaderboard(10);
+  let mine = null;
+  if (me && LB.users[me.id]) {
+    const list = Object.values(LB.users).sort((a,b)=>(b.wins||0)-(a.wins||0));
+    const rank = list.findIndex(u => u.id === me.id) + 1;
+    const u = LB.users[me.id];
+    mine = { id: me.id, wins: u.wins || 0, rank };
+  } else if (me) {
+    mine = { id: me.id, wins: 0, rank: null };
+  }
+  res.json({ top: entries, me: mine, total: Object.keys(LB.users).length });
+});
+
+app.get("/api/stats", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  res.json({ online: onlineCount() });
+});
+
 /* ---------- Static frontend ---------- */
 
 function sendIndex(res){
@@ -264,6 +341,19 @@ function authUserFromCookie(req){
 
 let waiting = null;        // WebSocket или null
 const QUEUE_TIMEOUT_MS = 3000;
+
+// Счётчик активных авторизованных соединений. Использует внутреннее
+// состояние wss.clients, но мы фильтруем по ws.user (анон сюда не доходит
+// — мы закрываем соединение при отсутствии cookie) и readyState=1.
+function onlineCount(){
+  let n = 0;
+  wss.clients.forEach(c => { if (c.user && c.readyState === 1) n++; });
+  return n;
+}
+function broadcastStats(){
+  const msg = JSON.stringify({ type: "stats", online: onlineCount() });
+  wss.clients.forEach(c => { if (c.readyState === 1) { try { c.send(msg); } catch {} } });
+}
 
 function safeUser(u){
   if (!u) return null;
@@ -336,7 +426,8 @@ wss.on("connection", (ws, req) => {
   ws.peer = null;
   ws.roomId = null;
 
-  send(ws, { type: "hello", user: safeUser(user) });
+  send(ws, { type: "hello", user: safeUser(user), online: onlineCount() });
+  broadcastStats();
 
   ws.on("message", (raw) => {
     let msg;
@@ -353,6 +444,13 @@ wss.on("connection", (ws, req) => {
         break;
       case "leave":
         leaveRoom(ws, "leave");
+        break;
+      case "match_win":
+        // Каждый клиент репортит только СВОЮ победу — так просто и
+        // безопасно: нельзя «назначить» победу сопернику. При форфейте
+        // ws.peer уже null (сервер закрыл пиринг), поэтому отдельно не
+        // обрабатываем этот случай.
+        recordWin(ws.user);
         break;
       case "relay":
         // relay-payload прозрачно отдаём сопернику. Ограничение размера —
@@ -373,6 +471,8 @@ wss.on("connection", (ws, req) => {
   ws.on("close", () => {
     clearQueue(ws);
     leaveRoom(ws, "disconnect");
+    // Счётчик онлайна изменился — уведомим всех подключённых клиентов.
+    broadcastStats();
   });
 
   ws.on("error", () => {});

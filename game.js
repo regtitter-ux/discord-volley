@@ -314,6 +314,9 @@ langSeg.addEventListener("click", (e)=>{
 I18n.onChange(()=>{
   syncLangButtons();
   refreshLocalizedDynamicUI();
+  // Лидерборд и подпись «Сейчас онлайн» содержат динамически отрендеренный
+  // текст без data-i18n-ключей — перерисуем вручную.
+  if(typeof refreshLeaderboard === "function") refreshLeaderboard();
 });
 
 /* ---------------- Login ---------------- */
@@ -362,6 +365,101 @@ function enterMenu(){
   Auth.renderAvatarInto($("user-avatar"), state.user);
   $("user-name").textContent = userDisplayName(state.user);
   show("menu");
+  refreshOnlineCount();
+  refreshLeaderboard();
+}
+
+/* ---------------- Онлайн-счётчик и таблица лидеров ----------------
+   Счётчик: приходит push-сообщением по WS ({type:"stats", online}) или
+   по HTTP /api/stats при заходе в меню (на случай, когда сокет ещё не
+   открыт — до клика «ИГРАТЬ»). Лидерборд: /api/leaderboard. */
+
+const onlineCountEl = $("online-count");
+function setOnlineCount(n){
+  if(!onlineCountEl) return;
+  const v = Number.isFinite(n) ? Math.max(0, n|0) : null;
+  onlineCountEl.textContent = v == null ? "—" : String(v);
+}
+async function refreshOnlineCount(){
+  try {
+    const r = await fetch("/api/stats", { credentials: "same-origin", cache: "no-store" });
+    if(!r.ok) return;
+    const j = await r.json();
+    setOnlineCount(j.online);
+  } catch(_){}
+}
+setInterval(()=>{
+  // Фолбек-поллинг: WS может быть закрыт (юзер не нажал «ИГРАТЬ»).
+  // Раз в 30 с подтягиваем счётчик — чтобы он не казался «мёртвым».
+  if(document.hidden) return;
+  if(document.getElementById("screen-menu")?.classList.contains("hidden")) return;
+  refreshOnlineCount();
+}, 30000);
+
+const lbListEl  = $("lb-list");
+const lbEmptyEl = $("lb-empty");
+const lbMeEl    = $("lb-me");
+function fmtI18n(key, vars){
+  let s = I18n.t(key);
+  if(vars) for(const k in vars) s = s.split("{" + k + "}").join(String(vars[k]));
+  return s;
+}
+function renderLbRow(entry, rank, meId){
+  const li = document.createElement("li");
+  li.className = "lb-row";
+  if(rank === 1) li.classList.add("top-1");
+  else if(rank === 2) li.classList.add("top-2");
+  else if(rank === 3) li.classList.add("top-3");
+  if(meId && entry.id === meId) li.classList.add("me");
+
+  const rankEl = document.createElement("span");
+  rankEl.className = "lb-rank";
+  rankEl.textContent = "#" + rank;
+  const avatarEl = document.createElement("span");
+  avatarEl.className = "lb-avatar";
+  Auth.renderAvatarInto(avatarEl, entry);
+  const nameEl = document.createElement("span");
+  nameEl.className = "lb-name";
+  nameEl.textContent = entry.global_name || entry.username || "…";
+  const winsEl = document.createElement("span");
+  winsEl.className = "lb-wins";
+  winsEl.textContent = String(entry.wins || 0);
+  const suffixEl = document.createElement("span");
+  suffixEl.className = "suffix";
+  suffixEl.textContent = I18n.t("lb.wins_suffix");
+  winsEl.appendChild(suffixEl);
+
+  li.appendChild(rankEl);
+  li.appendChild(avatarEl);
+  li.appendChild(nameEl);
+  li.appendChild(winsEl);
+  return li;
+}
+async function refreshLeaderboard(){
+  if(!lbListEl) return;
+  try {
+    const r = await fetch("/api/leaderboard", { credentials: "same-origin", cache: "no-store" });
+    if(!r.ok) return;
+    const j = await r.json();
+    const top = Array.isArray(j.top) ? j.top : [];
+    const meId = state.user && state.user.id;
+
+    lbListEl.innerHTML = "";
+    for(let i = 0; i < top.length; i++){
+      lbListEl.appendChild(renderLbRow(top[i], i + 1, meId));
+    }
+    if(lbEmptyEl) lbEmptyEl.style.display = top.length === 0 ? "" : "none";
+
+    if(lbMeEl){
+      if(j.me && j.me.rank && j.me.wins > 0){
+        lbMeEl.textContent = fmtI18n("lb.me_rank", { rank: j.me.rank, wins: j.me.wins });
+        lbMeEl.classList.toggle("me-topped", j.me.rank <= 3);
+      }else{
+        lbMeEl.textContent = I18n.t("lb.me_empty");
+        lbMeEl.classList.remove("me-topped");
+      }
+    }
+  } catch(_){}
 }
 
 /* ---------------- Matchmaking ----------------
@@ -442,6 +540,10 @@ function attachSocketHandlers(ws){
 function onServerMessage(msg){
   switch(msg.type){
     case "hello":
+      if(typeof msg.online === "number") setOnlineCount(msg.online);
+      break;
+    case "stats":
+      if(typeof msg.online === "number") setOnlineCount(msg.online);
       break;
     case "matched":
       startOnlineMatch(msg.role, msg.opponent);
@@ -476,7 +578,22 @@ function onPeerPayload(p){
 
 function onPeerLeft(reason){
   if(state.mode === "bot") return;
-  // Закрываем сокет, возвращаем в меню с уведомлением.
+  // Если матч идёт — засчитываем форфейт: оставшийся игрок получает победу
+  // (+50 монет) и видит обычный оверлей окончания матча. Сокет закрываем,
+  // mode переключаем в "bot" — чтобы кнопка «В меню» на оверлее не пыталась
+  // слать peer-сообщения обратно серверу.
+  if(state.inGame && !state.matchOver){
+    // Репортим свою форфейт-победу в лидерборд ДО закрытия сокета.
+    try {
+      state.ws && state.ws.readyState === 1 && state.ws.send(JSON.stringify({ type: "match_win" }));
+    } catch(_){}
+    Game.endByForfeit();
+    closeSocket();
+    state.mode = "bot";
+    state.opponent = null;
+    return;
+  }
+  // Матч ещё не начат или уже завершён — просто возвращаем в меню.
   closeSocket();
   Game.stop();
   state.mode = "bot";
@@ -517,6 +634,12 @@ function startOnlineMatch(role, opponent){
   state.opponent = Auth.normalize(opponent) || opponent;
   state.bot = null;
   state.peerKeys.left = state.peerKeys.right = state.peerKeys.jump = false;
+  // Важно: модульный _relayLastMask сохраняется между матчами. Если гость
+  // играл прошлый матч и у него в конце была зажата, например, стрелка
+  // (или просто mask оказался 0), в новом матче первое нажатие с тем же
+  // mask-значением не отправится из-за дедупа — и гость не двигается.
+  // Форсим «ни разу не отправляли» состояние.
+  _relayLastMask = -1;
   $("hud-score-p1").textContent = "0";
   $("hud-score-p2").textContent = "0";
   refreshLocalizedDynamicUI();
@@ -563,8 +686,15 @@ function resizeCanvas(){
   const cap = (document.body && document.body.classList.contains("is-touch"))
     ? DPR_CAP_TOUCH : DPR_CAP_DESKTOP;
   const dpr = Math.min(window.devicePixelRatio || 1, cap);
-  const w = Math.max(1, window.innerWidth);
-  const h = Math.max(1, window.innerHeight);
+  // Берём ФАКТИЧЕСКИЙ размер canvas из CSS, а не window.innerHeight: на тач-
+  // устройствах CSS оставляет внизу полосу под хитбоксы управления, и canvas
+  // высотой меньше окна. Если бы мы использовали innerHeight, поле рендерилось
+  // бы полностью, а тач-зоны закрывали бы его нижнюю часть. clientWidth/Height
+  // возвращают реальные CSS-пиксели — умножаем на DPR для честного физического
+  // разрешения. Fallback на innerWidth/Height на случай, если canvas ещё не
+  // получил лейаут (например, вызов resizeCanvas до show("game")).
+  const w = Math.max(1, canvas.clientWidth  || window.innerWidth);
+  const h = Math.max(1, canvas.clientHeight || window.innerHeight);
   canvas.width  = Math.floor(w * dpr);
   canvas.height = Math.floor(h * dpr);
   // На «нормальных» пропорциях (мир 2:1) cover-fit заполняет весь экран
@@ -603,7 +733,10 @@ function classifyKey(e){
      k === "w" || k === "arrowup" || k === " " || k === "spacebar") return "jump";
   return null;
 }
-function clearKeys(){ keys.left = keys.right = keys.jump = false; }
+function clearKeys(){
+  keys.left = keys.right = keys.jump = false;
+  if(typeof relayInputIfGuest === "function") relayInputIfGuest();
+}
 window.addEventListener("keydown", e=>{
   // Никогда не перехватываем системные комбо Ctrl/Cmd+X (Ctrl+R/W/T,
   // закладки, devtools и т.п.) — preventDefault на них ломает браузер.
@@ -613,10 +746,16 @@ window.addEventListener("keydown", e=>{
   if(!act) return;
   keys[act] = true;
   if(state.inGame) e.preventDefault();
+  // Немедленный relay-пуш: ждать до 33 мс тика интервала на мобиле — это
+  // ощутимая задержка реакции; плюс в фоне браузер может троттлить таймеры.
+  if(typeof relayInputIfGuest === "function") relayInputIfGuest();
 }, {passive:false});
 window.addEventListener("keyup", e=>{
   const act = classifyKey(e);
-  if(act) keys[act] = false;
+  if(act){
+    keys[act] = false;
+    if(typeof relayInputIfGuest === "function") relayInputIfGuest();
+  }
 });
 // blur + visibilitychange + pagehide: если мы теряем фокус/видимость,
 // ключи и тачи надо сбрасывать, иначе зависают (особенно частая жалоба
@@ -630,8 +769,8 @@ document.addEventListener("visibilitychange", ()=>{
 document.querySelectorAll(".tbtn").forEach(btn=>{
   const k = btn.dataset.key;
   const act = k === "a" ? "left" : k === "d" ? "right" : "jump";
-  const on  = (e)=>{ e.preventDefault(); keys[act] = true;  };
-  const off = (e)=>{ e.preventDefault(); keys[act] = false; };
+  const on  = (e)=>{ e.preventDefault(); keys[act] = true;  if(typeof relayInputIfGuest === "function") relayInputIfGuest(); };
+  const off = (e)=>{ e.preventDefault(); keys[act] = false; if(typeof relayInputIfGuest === "function") relayInputIfGuest(); };
   btn.addEventListener("touchstart", on,  {passive:false});
   btn.addEventListener("touchend",   off, {passive:false});
   btn.addEventListener("touchcancel",off, {passive:false});
@@ -646,12 +785,12 @@ document.querySelectorAll(".tbtn").forEach(btn=>{
   document.addEventListener(ev, e=>e.preventDefault(), {passive:false});
 });
 
-// Гость шлёт своё состояние клавиш хосту. Делаем это поллингом на 30 Гц и
-// только при реальных изменениях — иначе каждое keydown/touch пришлось бы
-// обвешивать отдельным хуком. Сетевые пакеты уходят только когда маска
-// (left|right|jump) поменялась, так что при статичном нажатии трафик нулевой.
+// Гость шлёт своё состояние клавиш хосту. Отправляем немедленно при каждом
+// изменении (keydown/keyup/touch/blur) + фоновый heartbeat на 30 Гц как
+// страховка на случай, если где-то изменение keys произошло вне наших хуков.
+// Сетевые пакеты уходят только когда маска (left|right|jump) поменялась.
 let _relayLastMask = -1;
-setInterval(()=>{
+function relayInputIfGuest(){
   if(state.mode !== "guest") return;
   if(!state.ws || state.ws.readyState !== 1) return;
   const mask = (keys.left?1:0) | (keys.right?2:0) | (keys.jump?4:0);
@@ -666,7 +805,8 @@ setInterval(()=>{
       payload: { kind:"input", left: keys.right, right: keys.left, jump: keys.jump }
     }));
   } catch(_){}
-}, 33);
+}
+setInterval(relayInputIfGuest, 33);
 
 /* ---------------- Pause & overlay ---------------- */
 const overlay = $("overlay");
@@ -684,6 +824,9 @@ function quitToMenu(){
   state.opponent = null;
   Game.stop();
   show("menu");
+  // На случай, если за матч изменился счёт побед — перерисовать топ сразу.
+  refreshOnlineCount();
+  refreshLeaderboard();
 }
 $("btn-quit").addEventListener("click", quitToMenu);
 $("btn-home").addEventListener("click", quitToMenu);
@@ -1072,7 +1215,16 @@ const Game = (function(){
       sfx.lose();
     }
     // Хост отправляет финальный снапшот, чтобы гость корректно закрыл матч.
-    if(state.mode === "host") broadcastSnapshot();
+    if(state.mode === "host"){
+      broadcastSnapshot();
+      // Репорт в лидерборд — только за свою победу (каждая сторона
+      // отправляет сам за себя; гость это сделает в endMatchAsSnapshot).
+      if(winnerSide === 1){
+        try {
+          state.ws && state.ws.readyState === 1 && state.ws.send(JSON.stringify({ type: "match_win" }));
+        } catch(_){}
+      }
+    }
   }
 
   /* ------------- Physics ------------- */
@@ -1319,9 +1471,29 @@ const Game = (function(){
       sfx.win();
       // В зеркалке гостя side 1 — это его «я», так что матч-приз его.
       Wallet.award("match.win", 50);
+      // Гость репортит в лидерборд только свои победы.
+      try {
+        state.ws && state.ws.readyState === 1 && state.ws.send(JSON.stringify({ type: "match_win" }));
+      } catch(_){}
     }else{
       sfx.lose();
     }
+  }
+
+  // Соперник вышел из матча — засчитываем форфейт, победа «нашей» стороне (p1)
+  // c призом, как за честную победу. Вызывается из onPeerLeft при активном
+  // матче. Если матч уже завершён — просто ничего не делаем.
+  function endByForfeit(){
+    if(!state.inGame || state.matchOver) return;
+    state.matchOver = true;
+    lastWinnerSide = 1;
+    overlayTitle.textContent = I18n.t("game.victory");
+    overlaySub.textContent = I18n.t("game.opponent_left");
+    $("btn-replay").style.display = "none";
+    overlay.classList.remove("hidden");
+    keys.left = keys.right = keys.jump = false;
+    sfx.win();
+    Wallet.award("match.win", 50);
   }
 
   function applyInput(p, left, right, jump){
@@ -2141,7 +2313,7 @@ const Game = (function(){
     }
   }
 
-  return { start, stop, refreshOverlay, triggerEmote, applySnapshot };
+  return { start, stop, refreshOverlay, triggerEmote, applySnapshot, endByForfeit };
 })();
 
 /* ========================================================================

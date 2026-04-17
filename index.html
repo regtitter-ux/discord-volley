@@ -72,7 +72,25 @@
       <h2 data-i18n="menu.heading">Пляжный Волейбол</h2>
       <p class="muted" data-i18n="menu.hint">Стрелками / WAD двигайтесь и прыгайте. Не давайте мячу коснуться земли на вашей стороне.</p>
 
+      <div class="online-chip" id="online-chip" aria-live="polite">
+        <span class="online-dot" aria-hidden="true"></span>
+        <span data-i18n="menu.online_label">Сейчас онлайн</span>
+        <span class="online-count" id="online-count">—</span>
+      </div>
+
       <button id="btn-play" class="btn btn-primary btn-big" data-i18n="menu.play">ИГРАТЬ</button>
+
+      <!-- Таблица лидеров по количеству побед. Полный список и свою позицию
+           клиент запрашивает через /api/leaderboard и рефрешит при заходе
+           в меню и после завершения матча. -->
+      <div class="card lb-card">
+        <div class="lb-head">
+          <span class="card-label" data-i18n="lb.title">Топ по победам</span>
+          <span class="lb-me muted" id="lb-me"></span>
+        </div>
+        <ol class="lb-list" id="lb-list"></ol>
+        <div class="lb-empty muted" id="lb-empty" data-i18n="lb.empty">Пока никто не побеждал — будь первым!</div>
+      </div>
     </div>
   </section>
 
@@ -118,14 +136,18 @@
       </div>
     </div>
 
-    <!-- Touch controls, shown only on touch devices -->
+    <!-- Touch controls, shown only on touch devices.
+         Каждый .tbtn — прозрачный хитбокс, растягивающийся на свою долю
+         экрана: левая половина нижней зоны = «влево», правая = «вправо»,
+         правая зона целиком = «прыжок». Для глаза отрисовываем в центре
+         небольшую пилюлю (.tbtn-pill), сама кнопка без фона. -->
     <div class="touch-controls" id="touch-controls" aria-hidden="true">
       <div class="side side-left">
-        <button class="tbtn tbtn-left" data-key="a">◀</button>
-        <button class="tbtn tbtn-right" data-key="d">▶</button>
+        <button class="tbtn tbtn-left" data-key="a" aria-label="Влево"><span class="tbtn-pill">◀</span></button>
+        <button class="tbtn tbtn-right" data-key="d" aria-label="Вправо"><span class="tbtn-pill">▶</span></button>
       </div>
       <div class="side side-right">
-        <button class="tbtn tbtn-jump" data-key="w">▲</button>
+        <button class="tbtn tbtn-jump" data-key="w" aria-label="Прыжок"><span class="tbtn-pill">▲</span></button>
       </div>
     </div>
 
