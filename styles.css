@@ -116,13 +116,16 @@ h1,h2,h3{font-weight:700}
 /* В портрете на тач-устройстве левой-боковой колонке не место: поле и так
    узкое, колонка загораживает вид. Переносим реакции вниз, в 2 ряда с
    горизонтальным скроллом (привычно по UX-стикер-пикерам), между игровым
-   полем и тач-кнопками управления. */
-@media (orientation:portrait) and (hover:none) and (pointer:coarse){
+   полем и тач-кнопками управления. Тач-кнопки тоже приподнимаем, чтобы
+   палец тянулся меньше и эмодзи-полоса помещалась над ними. */
+@media (orientation:portrait){
+  body.is-touch .touch-controls{bottom:calc(72px + var(--safe-bot))}
   body.is-touch .reactions{
     top:auto;
     left:0;
     right:0;
-    bottom:calc(102px + var(--safe-bot));
+    /* над тач-кнопками (72 + ~74 высота + запас) */
+    bottom:calc(162px + var(--safe-bot));
     max-height:none;
     display:grid;
     grid-auto-flow:column;
