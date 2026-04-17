@@ -56,10 +56,20 @@ function show(name){
   screens[name].classList.remove("hidden");
 }
 
-function boot(){
-  const u = Auth.current();
+async function boot(){
+  // /api/me может вернуть 401 (не залогинен) или 200 с профилем.
+  // Во время ожидания ответа экран авторизации — безопасный дефолт.
+  const u = await Auth.current();
   if(u){ state.user = u; enterMenu(); }
   else { show("login"); }
+
+  // Если вернулись с callback с ошибкой — мягко сообщаем в консоль,
+  // чтобы не шуметь alert'ом. Сам UI остаётся на login-экране.
+  const err = new URLSearchParams(location.search).get("auth_error");
+  if(err){
+    console.warn("[auth] discord callback error:", err);
+    try{ history.replaceState(null, "", location.pathname); }catch(_){}
+  }
 }
 
 /* ---------------- Wallet (persistent coin balance) ----------------
@@ -287,13 +297,14 @@ I18n.onChange(()=>{
 
 /* ---------------- Login ---------------- */
 $("btn-login").addEventListener("click", () => {
-  state.user = Auth.login();
-  enterMenu();
+  // Редирект на /auth/discord — обратно вернёмся уже с сессионной cookie,
+  // и boot() при перезагрузке увидит Auth.current().
+  Auth.login();
 });
-$("btn-logout").addEventListener("click", (e) => {
+$("btn-logout").addEventListener("click", async (e) => {
   e.stopPropagation();
   closeUserPopup();
-  Auth.logout();
+  await Auth.logout();
   state.user = null;
   show("login");
 });

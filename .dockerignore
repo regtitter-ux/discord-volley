@@ -2,9 +2,13 @@
 .gitignore
 .dockerignore
 node_modules
+npm-debug.log*
+.env
+.env.*
 *.log
 .DS_Store
 Thumbs.db
 .vscode
 .idea
 README.md
+Caddyfile

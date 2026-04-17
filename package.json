@@ -1,0 +1,15 @@
+{
+  "name": "discord-volley",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Discord-themed 2D beach volleyball mini-game with Discord OAuth2",
+  "engines": { "node": ">=18" },
+  "scripts": {
+    "start": "node server.js",
+    "dev": "node server.js"
+  },
+  "dependencies": {
+    "cookie-parser": "^1.4.7",
+    "express": "^4.21.2"
+  }
+}
