@@ -1183,20 +1183,18 @@ const Game = (function(){
       sfx.win();
       // Приз за матч: в bot/host — своему игроку (p1), в guest матч-монеты
       // ставит endMatchAsSnapshot после зеркалирования.
-      if(state.mode === "bot" || state.mode === "host") Wallet.award("match.win", 50);
+      if(state.mode === "bot" || state.mode === "host"){
+        Wallet.award("match.win", 50);
+        try {
+          state.ws && state.ws.readyState === 1 && state.ws.send(JSON.stringify({ type: "match_win" }));
+        } catch(_){}
+      }
     }else{
       sfx.lose();
     }
     // Хост отправляет финальный снапшот, чтобы гость корректно закрыл матч.
     if(state.mode === "host"){
       broadcastSnapshot();
-      // Репорт в лидерборд — только за свою победу (каждая сторона
-      // отправляет сам за себя; гость это сделает в endMatchAsSnapshot).
-      if(winnerSide === 1){
-        try {
-          state.ws && state.ws.readyState === 1 && state.ws.send(JSON.stringify({ type: "match_win" }));
-        } catch(_){}
-      }
     }
   }
 
@@ -1479,6 +1477,9 @@ const Game = (function(){
     keys.left = keys.right = keys.jump = false;
     sfx.win();
     Wallet.award("match.win", 50);
+    try {
+      state.ws && state.ws.readyState === 1 && state.ws.send(JSON.stringify({ type: "match_win" }));
+    } catch(_){}
   }
 
   function applyInput(p, left, right, jump){

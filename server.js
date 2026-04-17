@@ -266,6 +266,7 @@ function recordWin(user){
   if (!u) return;
   u.wins = (u.wins || 0) + 1;
   u.updatedAt = Date.now();
+  console.log("[lb] win recorded", user.id, "→", u.wins);
   saveLeaderboardDebounced();
 }
 
