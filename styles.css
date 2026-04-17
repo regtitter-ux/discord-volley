@@ -213,6 +213,13 @@ body.is-touch .overlay{background:rgba(0,0,0,.72)}
 .lb-wins .suffix{color:var(--muted);font-weight:600;font-size:11px;margin-left:4px;text-transform:uppercase;letter-spacing:.3px}
 .lb-empty{font-size:12px;text-align:center;padding:8px 0}
 .lb-list:not(:empty) + .lb-empty{display:none}
+.lb-pager{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:10px;flex-wrap:wrap}
+.lb-pager-btn{width:28px;height:28px;border-radius:8px;background:var(--bg-3);color:var(--text);font-weight:700;font-size:14px;line-height:1;display:inline-flex;align-items:center;justify-content:center;transition:background-color .12s ease,color .12s ease,opacity .12s ease}
+.lb-pager-btn:hover:not(:disabled){background:var(--blurple);color:#fff}
+.lb-pager-btn:disabled{opacity:.35;cursor:default}
+.lb-pager-info{font-size:12px;font-weight:600;color:var(--muted);font-variant-numeric:tabular-nums;min-width:84px;text-align:center}
+.lb-pager-me{padding:6px 10px;border-radius:8px;background:rgba(88,101,242,.18);color:#dfe3ff;font-size:12px;font-weight:600;transition:background-color .12s ease}
+.lb-pager-me:hover{background:rgba(88,101,242,.32)}
 .segmented{display:flex;gap:6px;background:var(--bg);padding:4px;border-radius:var(--radius)}
 .segmented button{flex:1;padding:10px 8px;border-radius:6px;color:var(--muted);font-weight:600;font-size:13px;transition:background-color .12s ease,color .12s ease}
 .segmented button:hover{color:var(--text);background:var(--bg-3)}

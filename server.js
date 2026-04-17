@@ -328,32 +328,47 @@ function userCoins(id){
   return (u && typeof u.coins === "number") ? u.coins : 0;
 }
 
-function topLeaderboard(limit){
-  const arr = Object.values(LB.users);
-  arr.sort((a, b) => (b.wins || 0) - (a.wins || 0) || (a.updatedAt||0) - (b.updatedAt||0));
-  const n = Math.max(1, Math.min(limit|0 || 10, 50));
-  return arr.slice(0, n).map(u => ({
-    id: u.id,
-    global_name: u.global_name || u.username || "",
-    avatar_url: u.avatar_url || null,
-    wins: u.wins || 0
-  }));
+const LB_PAGE_SIZE = 10;
+
+// Отсортированный список юзеров с победами > 0. Лишний раз материализовать
+// не страшно — LB.users в памяти, сортировка O(n log n) на горстке записей.
+function rankedUsers(){
+  return Object.values(LB.users)
+    .filter(u => (u.wins || 0) > 0)
+    .sort((a, b) => (b.wins || 0) - (a.wins || 0) || (a.updatedAt || 0) - (b.updatedAt || 0));
 }
 
 app.get("/api/leaderboard", (req, res) => {
   res.setHeader("Cache-Control", "no-store");
   const me = getSession(req);
-  const entries = topLeaderboard(10);
+  const list = rankedUsers();
+  const total = list.length;
+  const pages = Math.max(1, Math.ceil(total / LB_PAGE_SIZE));
+  let page = parseInt(req.query.page, 10);
+  if (!Number.isFinite(page) || page < 1) page = 1;
+  if (page > pages) page = pages;
+  const start = (page - 1) * LB_PAGE_SIZE;
+  const entries = list.slice(start, start + LB_PAGE_SIZE).map((u, i) => ({
+    id: u.id,
+    global_name: u.global_name || u.username || "",
+    avatar_url: u.avatar_url || null,
+    wins: u.wins || 0,
+    rank: start + i + 1
+  }));
+
   let mine = null;
-  if (me && LB.users[me.id]) {
-    const list = Object.values(LB.users).sort((a,b)=>(b.wins||0)-(a.wins||0));
-    const rank = list.findIndex(u => u.id === me.id) + 1;
+  if (me) {
     const u = LB.users[me.id];
-    mine = { id: me.id, wins: u.wins || 0, rank };
-  } else if (me) {
-    mine = { id: me.id, wins: 0, rank: null };
+    const wins = (u && u.wins) || 0;
+    if (wins > 0) {
+      const idx = list.findIndex(x => x.id === me.id);
+      const rank = idx + 1;
+      mine = { id: me.id, wins, rank, page: Math.floor(idx / LB_PAGE_SIZE) + 1 };
+    } else {
+      mine = { id: me.id, wins: 0, rank: null, page: null };
+    }
   }
-  res.json({ top: entries, me: mine, total: Object.keys(LB.users).length });
+  res.json({ top: entries, me: mine, total, page, pages, pageSize: LB_PAGE_SIZE });
 });
 
 app.get("/api/stats", (req, res) => {

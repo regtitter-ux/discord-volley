@@ -346,9 +346,17 @@ setInterval(()=>{
   refreshOnlineCount();
 }, 30000);
 
-const lbListEl  = $("lb-list");
-const lbEmptyEl = $("lb-empty");
-const lbMeEl    = $("lb-me");
+const lbListEl      = $("lb-list");
+const lbEmptyEl     = $("lb-empty");
+const lbMeEl        = $("lb-me");
+const lbPagerEl     = $("lb-pager");
+const lbPrevBtn     = $("lb-prev");
+const lbNextBtn     = $("lb-next");
+const lbPageInfoEl  = $("lb-page-info");
+const lbJumpMeBtn   = $("lb-jump-me");
+let lbCurrentPage = 1;
+let lbMePage = null;
+
 function fmtI18n(key, vars){
   let s = I18n.t(key);
   if(vars) for(const k in vars) s = s.split("{" + k + "}").join(String(vars[k]));
@@ -385,20 +393,37 @@ function renderLbRow(entry, rank, meId){
   li.appendChild(winsEl);
   return li;
 }
-async function refreshLeaderboard(){
+async function refreshLeaderboard(page){
   if(!lbListEl) return;
+  const p = Number.isFinite(page) ? Math.max(1, page|0) : lbCurrentPage;
   try {
-    const r = await fetch("/api/leaderboard", { credentials: "same-origin", cache: "no-store" });
+    const r = await fetch("/api/leaderboard?page=" + p, { credentials: "same-origin", cache: "no-store" });
     if(!r.ok) return;
     const j = await r.json();
     const top = Array.isArray(j.top) ? j.top : [];
     const meId = state.user && state.user.id;
+    lbCurrentPage = j.page || p;
+    lbMePage = (j.me && j.me.page) || null;
 
     lbListEl.innerHTML = "";
     for(let i = 0; i < top.length; i++){
-      lbListEl.appendChild(renderLbRow(top[i], i + 1, meId));
+      // Сервер даёт абсолютный ранг (через страницу) в entry.rank —
+      // не пересчитываем на клиенте, иначе 2-я страница снова пойдёт с #1.
+      lbListEl.appendChild(renderLbRow(top[i], top[i].rank || (i + 1), meId));
     }
     if(lbEmptyEl) lbEmptyEl.style.display = top.length === 0 ? "" : "none";
+
+    if(lbPagerEl){
+      const pages = Math.max(1, j.pages || 1);
+      lbPagerEl.hidden = pages <= 1 && !(j.me && j.me.page && j.me.page !== lbCurrentPage);
+      if(lbPageInfoEl) lbPageInfoEl.textContent = fmtI18n("lb.page_info", { page: lbCurrentPage, pages });
+      if(lbPrevBtn) lbPrevBtn.disabled = lbCurrentPage <= 1;
+      if(lbNextBtn) lbNextBtn.disabled = lbCurrentPage >= pages;
+      if(lbJumpMeBtn){
+        const show = !!(lbMePage && lbMePage !== lbCurrentPage);
+        lbJumpMeBtn.hidden = !show;
+      }
+    }
 
     if(lbMeEl){
       if(j.me && j.me.rank && j.me.wins > 0){
@@ -411,6 +436,9 @@ async function refreshLeaderboard(){
     }
   } catch(_){}
 }
+if(lbPrevBtn) lbPrevBtn.addEventListener("click", ()=> refreshLeaderboard(lbCurrentPage - 1));
+if(lbNextBtn) lbNextBtn.addEventListener("click", ()=> refreshLeaderboard(lbCurrentPage + 1));
+if(lbJumpMeBtn) lbJumpMeBtn.addEventListener("click", ()=> { if(lbMePage) refreshLeaderboard(lbMePage); });
 
 /* ---------------- Matchmaking ----------------
    Клик по «ИГРАТЬ» запускает поиск: открываем WebSocket, встаём в очередь,
