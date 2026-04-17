@@ -946,6 +946,9 @@ const Game = (function(){
   const trail = [];                      // ball position trail (newest first)
   const TRAIL_LEN = 10;
   const PARTICLE_CAP = 160;
+  // alpha последнего render() — нужен drawTrail, чтобы «хвост» смещался
+  // синхронно с телом мяча (иначе между физ-тиками точки трейла отстают).
+  let renderAlpha = 1;
   let bigText = null;                    // { text, t, dur, color, size }
   // Активные «эмоции» над игроками. Каждая: { emoji, t, dur, side }.
   // side: 1 — игрок (левый), 2 — соперник (правый).
@@ -976,7 +979,13 @@ const Game = (function(){
 
   function makePlayer(x, side){
     // Feet rest on the ground: player.y is the CENTER, one radius above the floor.
-    return { x, y: GROUND_Y - PLR_R, vx:0, vy:0, r: PLR_R, onGround:true, coyoteT:0, side };
+    // prevX/prevY хранят позицию на начало прошлого физ-шага — рендер лерпит между
+    // ними и текущими (x,y) по alpha=acc/STEP, чтобы на мониторах 120/144/240 Гц
+    // не было stutter между физ-тиками (STEP=1/120). renderX/renderY — результат
+    // лерпа, которым пользуются все draw-функции.
+    const y = GROUND_Y - PLR_R;
+    return { x, y, vx:0, vy:0, r: PLR_R, onGround:true, coyoteT:0, side,
+             prevX: x, prevY: y, renderX: x, renderY: y };
   }
 
   /* ------------- Polish: FX helpers ------------- */
@@ -1105,13 +1114,16 @@ const Game = (function(){
     const serverX = servingSide===1 ? WORLD_W*0.25 : WORLD_W*0.75;
     // Offset toward center so the serve arcs toward the net
     const offset  = servingSide===1 ? 40 : -40;
+    const bx = serverX + offset;
     ball = {
-      x: serverX + offset,
+      x: bx,
       y: SERVE_SPAWN_Y,
       vx: 0, vy: 0,
       r: BALL_R,
       angle: 0,
-      touches: { left:0, right:0 }
+      touches: { left:0, right:0 },
+      prevX: bx, prevY: SERVE_SPAWN_Y, prevAngle: 0,
+      renderX: bx, renderY: SERVE_SPAWN_Y, renderAngle: 0
     };
     trail.length = 0;
     hitFlash = 0;
@@ -1229,6 +1241,12 @@ const Game = (function(){
 
   /* ------------- Physics ------------- */
   function step(dt){
+    // Снимок prev←curr для render-интерполяции. Делаем ДО любых обновлений
+    // позиций: конец прошлого шага == начало текущего. Render между тиками
+    // лерпит prev→curr по alpha, убирая stutter на 120/144/240 Гц дисплеях.
+    if(p1){ p1.prevX = p1.x; p1.prevY = p1.y; }
+    if(p2){ p2.prevX = p2.x; p2.prevY = p2.y; }
+    if(ball){ ball.prevX = ball.x; ball.prevY = ball.y; ball.prevAngle = ball.angle; }
     // Tick polish timers (particles, trail, squash, big text, clouds).
     // Оборачиваем matchTime, чтобы на длинных сессиях синусы/модульные расчёты
     // не теряли точность. Период кратен 2π (≈17 ч), так что sin-анимации
@@ -1418,6 +1436,12 @@ const Game = (function(){
     p2.x = WORLD_W - s.p1.x; p2.y = s.p1.y; p2.vx = -s.p1.vx; p2.vy = s.p1.vy; p2.onGround = !!s.p1.g;
     ball.x = WORLD_W - s.b.x; ball.y = s.b.y;
     ball.vx = -s.b.vx; ball.vy = s.b.vy; ball.angle = -s.b.a;
+    // Снапшот — телепорт к авторитетной позиции. Подтягиваем prev к curr,
+    // иначе интерполятор между кадрами нарисовал бы «резиновый» полёт от
+    // старой позиции к новой.
+    p1.prevX = p1.x; p1.prevY = p1.y;
+    p2.prevX = p2.x; p2.prevY = p2.y;
+    ball.prevX = ball.x; ball.prevY = ball.y; ball.prevAngle = ball.angle;
     servingSide = s.ss === 1 ? 2 : 1;
     roundOver = !!s.ro;
     const incomingRh = s.rh || 0;
@@ -1692,8 +1716,20 @@ const Game = (function(){
   }
 
   /* ------------- Render ------------- */
-  function render(){
+  function render(alpha){
     if(!p1) return;
+    // Лерп prev→curr по alpha. Все draw-функции читают .renderX/.renderY
+    // вместо .x/.y, чтобы между физ-тиками не было stutter.
+    const a = (alpha == null) ? 1 : alpha;
+    renderAlpha = a;
+    const lerp = (p, c) => p + (c - p) * a;
+    p1.renderX = lerp(p1.prevX, p1.x); p1.renderY = lerp(p1.prevY, p1.y);
+    p2.renderX = lerp(p2.prevX, p2.x); p2.renderY = lerp(p2.prevY, p2.y);
+    if(ball){
+      ball.renderX = lerp(ball.prevX, ball.x);
+      ball.renderY = lerp(ball.prevY, ball.y);
+      ball.renderAngle = lerp(ball.prevAngle, ball.angle);
+    }
     const cw = canvas.width, ch = canvas.height;
     ctx.fillStyle = "#1e1f22";
     ctx.fillRect(0,0,cw,ch);
@@ -1934,12 +1970,18 @@ const Game = (function(){
     // Fade from oldest to newest; only while ball is moving fast enough
     const speed2 = ball.vx*ball.vx + ball.vy*ball.vy;
     if(speed2 < 260*260) return;
-    for(let i = 1; i < trail.length; i++){
-      const pt = trail[i];
-      const a = (1 - i/trail.length) * 0.35;
+    // trail[i] — snapshot i физ-шагов назад. Тело мяча рисуется в
+    // lerp(trail[1], trail[0], renderAlpha). Чтобы хвост не отставал, каждую
+    // точку тоже сдвигаем: эффективная позиция i-й точки — lerp(trail[i+1], trail[i]).
+    const a = renderAlpha;
+    for(let i = 1; i < trail.length - 1; i++){
+      const cur = trail[i], old = trail[i+1];
+      const x = old.x + (cur.x - old.x) * a;
+      const y = old.y + (cur.y - old.y) * a;
+      const alpha = (1 - i/trail.length) * 0.35;
       const r = ball.r * (1 - i/trail.length*0.6);
-      ctx.fillStyle = "rgba(255,255,255," + a + ")";
-      ctx.beginPath(); ctx.arc(pt.x, pt.y, r, 0, Math.PI*2); ctx.fill();
+      ctx.fillStyle = "rgba(255,255,255," + alpha + ")";
+      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill();
     }
   }
 
@@ -1988,8 +2030,8 @@ const Game = (function(){
     // Fade-out на хвосте
     const alpha = k < 0.6 ? 1 : Math.max(0, 1 - (k - 0.6) / 0.4);
 
-    const headY = p.y - p.r - 24;
-    const cx = p.x + wobble;
+    const headY = p.renderY - p.r - 24;
+    const cx = p.renderX + wobble;
     const cy = headY + rise;
     const size = 42;
 
@@ -2016,8 +2058,9 @@ const Game = (function(){
   function drawServeIndicator(){
     // Small arrow above the server's head until they first hit the ball
     if(rallyHits > 0 || roundOver) return;
-    const sx = servingSide === 1 ? p1.x : p2.x;
-    const sy = (servingSide === 1 ? p1.y : p2.y) - (servingSide === 1 ? p1.r : p2.r) - 18;
+    const sp = servingSide === 1 ? p1 : p2;
+    const sx = sp.renderX;
+    const sy = sp.renderY - sp.r - 18;
     const bob = Math.sin(matchTime * 6) * 3;
     ctx.fillStyle = "#ffd34a";
     ctx.beginPath();
@@ -2201,14 +2244,15 @@ const Game = (function(){
 
   function drawPlayer(p, user){
     const r = p.r;
+    const px = p.renderX, py = p.renderY;
     // Ground shadow scales with height off the ground.
     // p.y is the CENTER; on the ground p.y == GROUND_Y - r (feet on floor).
-    const feetY = p.y + r;
+    const feetY = py + r;
     const air = Math.min(1, Math.max(0, (GROUND_Y - feetY) / 200));
     const sh  = 1 - air*0.5;
     ctx.fillStyle = "rgba(0,0,0," + (0.32 - air*0.18) + ")";
     ctx.beginPath();
-    ctx.ellipse(p.x, GROUND_Y - 1, r*0.95*sh, 6*sh, 0, 0, Math.PI*2);
+    ctx.ellipse(px, GROUND_Y - 1, r*0.95*sh, 6*sh, 0, 0, Math.PI*2);
     ctx.fill();
 
     // Landing squash: scale around feet so the head compresses toward the ground.
@@ -2222,7 +2266,7 @@ const Game = (function(){
 
     ctx.save();
     // Anchor squash at the feet (bottom of circle) so the top compresses down
-    ctx.translate(p.x, p.y + r * (1 - syAxis));
+    ctx.translate(px, py + r * (1 - syAxis));
     ctx.scale(sxAxis, syAxis);
 
     ctx.save();
@@ -2237,11 +2281,12 @@ const Game = (function(){
   }
 
   function drawBall(){
+    const bx = ball.renderX, by = ball.renderY;
     // Soft ground shadow scaled by height above court
-    const shf = 1 - Math.min(0.7, (GROUND_Y - ball.y)/GROUND_Y);
+    const shf = 1 - Math.min(0.7, (GROUND_Y - by)/GROUND_Y);
     ctx.fillStyle = "rgba(0,0,0,0.28)";
     ctx.beginPath();
-    ctx.ellipse(ball.x, GROUND_Y - 2, ball.r*1.15*shf, 5*shf, 0, 0, Math.PI*2);
+    ctx.ellipse(bx, GROUND_Y - 2, ball.r*1.15*shf, 5*shf, 0, 0, Math.PI*2);
     ctx.fill();
 
     // Squash-and-stretch along velocity vector for a brief moment after a hit
@@ -2251,11 +2296,11 @@ const Game = (function(){
     const ang = Math.atan2(ball.vy, ball.vx);
 
     ctx.save();
-    ctx.translate(ball.x, ball.y);
+    ctx.translate(bx, by);
     ctx.rotate(ang);
     ctx.scale(stretch, squeeze);
     ctx.rotate(-ang);
-    ctx.rotate(ball.angle);
+    ctx.rotate(ball.renderAngle);
 
     // Radial gradient: bright highlight offset toward upper-left
     ctx.fillStyle = hitFlash > 0 ? ballFlashGrad() : ballNormalGrad();
@@ -2297,7 +2342,12 @@ const Game = (function(){
       steps++;
     }
     if(steps === 6) acc = 0;
-    render();
+    // alpha ∈ [0,1] — доля незакоммиченного физ-времени между последним
+    // и следующим шагом. Передаём в render(), чтобы при рендер-частоте
+    // выше физ-частоты (120/144/240 Гц) позиции между тиками интерполировались,
+    // а не «дёргались».
+    const alpha = Math.min(1, Math.max(0, acc / STEP));
+    render(alpha);
   }
 
   // Перерисовать тексты overlay после смены языка. Ничего не делает,
