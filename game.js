@@ -36,10 +36,15 @@ const state = {
   targetScore: 10,
   inGame: false,
   matchOver: false,
-  // Защёлка: match_win уходит на сервер не больше одного раза за матч.
-  // Разные пути победы (endMatch/endMatchAsSnapshot/onPeerLeft) могут
-  // сработать в пересекающихся сценариях — без флага рейтинг дублируется.
+  // Защёлка: match_win/match_loss уходят на сервер не больше одного раза
+  // за матч. Разные пути исхода (endMatch/endMatchAsSnapshot/onPeerLeft)
+  // могут пересекаться — без флага рейтинг/ставки дублируются.
   winReported: false,
+  lossReported: false,
+  // Серверно-зафиксированные ставки трофеев текущего матча.
+  // {win, loss, matchId}. Ставки приходят с сервера: PvP — в matched,
+  // bot — в ответ на match_stakes_request.
+  stakes: null,
   // Сессия матча. matchId — идентификатор раунда, с которым в онлайне
   // клиент будет слать события на сервер (award-запросы, инпуты); seq —
   // монотонный счётчик сообщений, чтобы сервер мог отбрасывать ретраи/
@@ -71,7 +76,8 @@ async function boot(){
   if(u){
     state.user = u;
     // Стартовый баланс приходит с сервера — кошелёк серверно-авторитетный.
-    if(typeof u.coins === "number") Wallet.set(u.coins, 0);
+    if(typeof u.coins    === "number") Wallet.set(u.coins, 0);
+    if(typeof u.trophies === "number") Trophies.set(u.trophies, 0);
     enterMenu();
   }
   else { show("login"); }
@@ -124,6 +130,26 @@ const Wallet = (function(){
   };
 })();
 
+/* ---------------- Trophies (server-authoritative) ----------------
+   Кубки хранятся на сервере, клампятся в 0. Клиент — зеркало.
+   Пуш {type:"trophies", total, delta} приходит в ответ на match_win /
+   match_loss / leave-во-время-матча. UI просто подхватывает значение. */
+const Trophies = (function(){
+  let total = 0;
+  const listeners = [];
+  function set(newTotal, explicitDelta){
+    const n = Math.max(0, newTotal | 0);
+    const delta = (typeof explicitDelta === "number") ? explicitDelta : (n - total);
+    total = n;
+    for(const fn of listeners) { try { fn(delta, total); } catch(_){} }
+  }
+  return {
+    get(){ return total; },
+    set: set,
+    onChange(fn){ if(typeof fn === "function") listeners.push(fn); }
+  };
+})();
+
 /* ---- Wallet UI rendering ---- */
 const walletEls = [
   { value: $("wallet-balance-menu"), delta: $("wallet-delta-menu") },
@@ -161,6 +187,44 @@ Wallet.onChange((amount)=>{
   renderWallet();
   if(amount > 0) flashWalletDelta(amount);
 });
+
+/* ---- Trophies UI rendering ---- */
+const trophyValueEl = $("trophies-value-menu");
+const trophyDeltaEl = $("trophies-delta-menu");
+function renderTrophies(){
+  if(trophyValueEl) trophyValueEl.textContent = String(Trophies.get());
+}
+function flashTrophyDelta(amount){
+  if(!trophyValueEl || !trophyDeltaEl || !amount) return;
+  trophyValueEl.classList.remove("bump");
+  trophyDeltaEl.classList.remove("show");
+  void trophyDeltaEl.offsetWidth;
+  trophyDeltaEl.textContent = (amount > 0 ? "+" : "") + amount;
+  trophyDeltaEl.style.color = amount < 0 ? "#f87171" : "";
+  trophyValueEl.classList.add("bump");
+  trophyDeltaEl.classList.add("show");
+}
+renderTrophies();
+Trophies.onChange((delta)=>{
+  renderTrophies();
+  if(delta) flashTrophyDelta(delta);
+});
+
+/* ---- Stakes HUD (during match) ---- */
+const hudStakesEl     = $("hud-stakes");
+const hudStakesWinEl  = $("hud-stakes-win");
+const hudStakesLossEl = $("hud-stakes-loss");
+function updateStakesHud(){
+  if(!hudStakesEl) return;
+  const s = state.stakes;
+  if(s && s.win && s.loss){
+    if(hudStakesWinEl)  hudStakesWinEl.textContent  = "+" + s.win;
+    if(hudStakesLossEl) hudStakesLossEl.textContent = "−" + s.loss;
+    hudStakesEl.hidden = false;
+  } else {
+    hudStakesEl.hidden = true;
+  }
+}
 
 /* ---------------- Name helpers ---------------- */
 // Обрезаем длинные ники по графемам, а не по UTF-16 code units. Иначе
@@ -383,18 +447,21 @@ function renderLbRow(entry, rank, meId){
   const nameEl = document.createElement("span");
   nameEl.className = "lb-name";
   nameEl.textContent = entry.global_name || entry.username || "…";
-  const winsEl = document.createElement("span");
-  winsEl.className = "lb-wins";
-  winsEl.textContent = String(entry.wins || 0);
-  const suffixEl = document.createElement("span");
-  suffixEl.className = "suffix";
-  suffixEl.textContent = I18n.t("lb.wins_suffix");
-  winsEl.appendChild(suffixEl);
+  const scoreEl = document.createElement("span");
+  scoreEl.className = "lb-wins";
+  scoreEl.textContent = String(entry.trophies || 0);
+  const icoEl = document.createElement("img");
+  icoEl.src = "assets/trophy.webp";
+  icoEl.className = "lb-trophy-ico";
+  icoEl.alt = "";
+  icoEl.width = 14; icoEl.height = 14;
+  icoEl.decoding = "async";
+  scoreEl.appendChild(icoEl);
 
   li.appendChild(rankEl);
   li.appendChild(avatarEl);
   li.appendChild(nameEl);
-  li.appendChild(winsEl);
+  li.appendChild(scoreEl);
   return li;
 }
 async function refreshLeaderboard(page){
@@ -430,8 +497,8 @@ async function refreshLeaderboard(page){
     }
 
     if(lbMeEl){
-      if(j.me && j.me.rank && j.me.wins > 0){
-        lbMeEl.textContent = fmtI18n("lb.me_rank", { rank: j.me.rank, wins: j.me.wins });
+      if(j.me && j.me.rank && j.me.trophies > 0){
+        lbMeEl.textContent = fmtI18n("lb.me_rank", { rank: j.me.rank, trophies: j.me.trophies });
         lbMeEl.classList.toggle("me-topped", j.me.rank <= 3);
       }else{
         lbMeEl.textContent = I18n.t("lb.me_empty");
@@ -522,8 +589,9 @@ function attachSocketHandlers(ws){
 function onServerMessage(msg){
   switch(msg.type){
     case "hello":
-      if(typeof msg.online === "number") setOnlineCount(msg.online);
-      if(typeof msg.coins  === "number") Wallet.set(msg.coins, 0);
+      if(typeof msg.online   === "number") setOnlineCount(msg.online);
+      if(typeof msg.coins    === "number") Wallet.set(msg.coins, 0);
+      if(typeof msg.trophies === "number") Trophies.set(msg.trophies, 0);
       break;
     case "stats":
       if(typeof msg.online === "number") setOnlineCount(msg.online);
@@ -539,7 +607,33 @@ function onServerMessage(msg){
       }
       break;
     case "matched":
+      // PvP: сервер выдал matchId + ставки трофеев. Клиент НЕ катает
+      // случайки самостоятельно — используем то, что прислали, иначе
+      // host/guest увидят разные числа и сервер по-любому возьмёт своё.
+      if(msg.matchId){
+        state.stakes = {
+          matchId: msg.matchId,
+          win:  msg.stakes && msg.stakes.win  | 0,
+          loss: msg.stakes && msg.stakes.loss | 0
+        };
+      }
       startOnlineMatch(msg.role, msg.opponent);
+      break;
+    case "match_stakes":
+      if(msg.matchId){
+        state.stakes = {
+          matchId: msg.matchId,
+          win:  msg.win  | 0,
+          loss: msg.loss | 0
+        };
+        updateStakesHud();
+      }
+      break;
+    case "trophies":
+      if(typeof msg.total === "number"){
+        const d = (typeof msg.delta === "number") ? msg.delta : 0;
+        Trophies.set(msg.total, d);
+      }
       break;
     case "queue_timeout":
       hideLobby();
@@ -572,8 +666,20 @@ function onPeerPayload(p){
 function reportMatchWin(){
   if(state.winReported) return;
   state.winReported = true;
+  const mid = state.stakes && state.stakes.matchId;
   try {
-    state.ws && state.ws.readyState === 1 && state.ws.send(JSON.stringify({ type: "match_win" }));
+    state.ws && state.ws.readyState === 1 &&
+      state.ws.send(JSON.stringify({ type: "match_win", matchId: mid || null }));
+  } catch(_){}
+}
+
+function reportMatchLoss(){
+  if(state.lossReported) return;
+  state.lossReported = true;
+  const mid = state.stakes && state.stakes.matchId;
+  try {
+    state.ws && state.ws.readyState === 1 &&
+      state.ws.send(JSON.stringify({ type: "match_loss", matchId: mid || null }));
   } catch(_){}
 }
 
@@ -618,6 +724,12 @@ function startBotMatch(){
   state.mode = "bot";
   state.opponent = null;
   state.bot = Auth.makeBot();
+  // Серверу нужен зафиксированный matchId, чтобы ставки трофеев были
+  // одни и те же при начислении/списании. Генерим тут, а сервер в ответ
+  // на match_stakes_request покатит +win/-loss и сохранит по matchId.
+  state.session = { matchId: "b-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2,8), startedAt: Date.now(), seq: 0 };
+  state.stakes = null;
+  requestStakes(state.session.matchId);
   $("hud-score-p1").textContent = "0";
   $("hud-score-p2").textContent = "0";
   refreshLocalizedDynamicUI();
@@ -626,9 +738,22 @@ function startBotMatch(){
   Game.start();
 }
 
+function requestStakes(matchId){
+  try {
+    state.ws && state.ws.readyState === 1 &&
+      state.ws.send(JSON.stringify({ type: "match_stakes_request", matchId }));
+  } catch(_){}
+}
+
 function startOnlineMatch(role, opponent){
   hideLobby();
   state.mode = role; // 'host' | 'guest'
+  // PvP matchId уже пришёл в matched и лежит в state.stakes.matchId.
+  // Подменим session.matchId, чтобы кошелёк слал award-ы с тем же ключом.
+  if(state.stakes && state.stakes.matchId){
+    state.session = { matchId: state.stakes.matchId, startedAt: Date.now(), seq: 0 };
+  }
+  updateStakesHud();
   // Нормализуем пришедшего с сервера пользователя — добиваем color по id,
   // чтобы fallback-круг оппонента был стабильно окрашен, а не серо-дефолтным.
   state.opponent = Auth.normalize(opponent) || opponent;
@@ -812,7 +937,17 @@ setInterval(relayInputIfGuest, 33);
 const overlay = $("overlay");
 const overlayTitle = $("overlay-title");
 const overlaySub = $("overlay-sub");
-$("btn-replay").addEventListener("click", ()=> Game.start());
+$("btn-replay").addEventListener("click", ()=>{
+  // Новый матч — свежий matchId + свежие ставки трофеев. Иначе сервер
+  // увидит повторный match_win по закрытому matchId и проигнорирует.
+  if(state.mode === "bot"){
+    state.session = { matchId: "b-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2,8), startedAt: Date.now(), seq: 0 };
+    state.stakes = null;
+    updateStakesHud();
+    requestStakes(state.session.matchId);
+  }
+  Game.start();
+});
 function quitToMenu(){
   // Если мы в онлайне — корректно уведомим сервер через {type:"leave"},
   // чтобы соперник увидел peer_left сразу. Сокет НЕ закрываем — это общий
@@ -822,9 +957,12 @@ function quitToMenu(){
   }
   state.mode = "bot";
   state.opponent = null;
+  state.stakes = null;
+  state.session = null;
+  updateStakesHud();
   Game.stop();
   show("menu");
-  // На случай, если за матч изменился счёт побед — перерисовать топ сразу.
+  // На случай, если за матч изменились трофеи — перерисовать топ сразу.
   refreshOnlineCount();
   refreshLeaderboard();
 }
@@ -1139,6 +1277,7 @@ const Game = (function(){
     score1 = 0; score2 = 0;
     state.matchOver = false;
     state.winReported = false;
+    state.lossReported = false;
     lastWinnerSide = 0;
     servingSide = 1;
     roundOver = false;
@@ -1162,8 +1301,10 @@ const Game = (function(){
     // «maxPerMatch» останутся от предыдущего.
     Wallet.matchReset();
     // Новая сессия: свой matchId, seq=0. В онлайне именно его мы будем
-    // слать на сервер при каждом награждении/вводе.
-    state.session = newSession();
+    // слать на сервер при каждом награждении/вводе. Если startBotMatch/
+    // startOnlineMatch уже подложил сессию (с matchId под ставки трофеев) —
+    // НЕ перезаписываем, иначе на сервере не сойдётся matchId для match_win.
+    if(!state.session) state.session = newSession();
     // Пересеиваем детерминированный RNG от matchId — одна и та же строка
     // даст одну и ту же последовательность на всех клиентах. Подойдёт,
     // пока сервер не пришлёт авторитетный seed в join-ответе.
@@ -1229,6 +1370,8 @@ const Game = (function(){
       }
     }else{
       sfx.lose();
+      // Поражение: bot/host — свой p1 проиграл, списываем трофеи.
+      if(state.mode === "bot" || state.mode === "host") reportMatchLoss();
     }
     // Хост отправляет финальный снапшот, чтобы гость корректно закрыл матч.
     if(state.mode === "host"){
@@ -1496,6 +1639,7 @@ const Game = (function(){
       reportMatchWin();
     }else{
       sfx.lose();
+      reportMatchLoss();
     }
   }
 

@@ -51,6 +51,11 @@
       </div>
 
       <div class="topbar-right">
+        <div class="wallet wallet-trophies" id="trophies-menu" data-i18n-title="trophies.label" title="Кубки">
+          <img class="coin trophy-ico" src="assets/trophy.webp" width="18" height="18" alt="" aria-hidden="true" decoding="async">
+          <span class="wallet-value" id="trophies-value-menu">0</span>
+          <span class="wallet-delta" id="trophies-delta-menu" aria-hidden="true"></span>
+        </div>
         <div class="wallet" id="wallet-menu" data-i18n-title="wallet.label" title="Монеты">
           <img class="coin" src="assets/coin.gif" width="18" height="18" alt="" aria-hidden="true" decoding="async">
           <span class="wallet-value" id="wallet-balance-menu">0</span>
@@ -126,6 +131,12 @@
       </div>
       <div class="hud-mid">
         <div class="hud-diff" id="hud-diff">Средняя</div>
+        <div class="hud-stakes" id="hud-stakes" hidden>
+          <img class="trophy-ico" src="assets/trophy.webp" width="14" height="14" alt="" aria-hidden="true" decoding="async">
+          <span class="hud-stakes-win"  id="hud-stakes-win">+0</span>
+          <span class="hud-stakes-sep">/</span>
+          <span class="hud-stakes-loss" id="hud-stakes-loss">−0</span>
+        </div>
       </div>
       <div class="hud-side hud-right">
         <div class="hud-score" id="hud-score-p2">0</div>

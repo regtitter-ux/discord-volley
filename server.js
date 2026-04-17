@@ -186,7 +186,8 @@ app.get("/api/me", (req, res) => {
     username:    u.username,
     global_name: u.global_name,
     avatar_url:  u.avatar_url,
-    coins:       userCoins(u.id)
+    coins:       userCoins(u.id),
+    trophies:    userTrophies(u.id)
   });
 });
 
@@ -246,14 +247,14 @@ function ensureUser(user){
       global_name: user.global_name || user.username || "",
       avatar_url: user.avatar_url || null,
       wins: 0,
+      trophies: 0,
       coins: 0,
       updatedAt: Date.now()
     };
     LB.users[user.id] = u;
   } else {
-    // Миграция старых записей без coins — выставляем 0, не теряя wins.
-    if (typeof u.coins !== "number") u.coins = 0;
-    // Освежаем профильные поля (юзер мог сменить ник/аватар).
+    if (typeof u.coins    !== "number") u.coins    = 0;
+    if (typeof u.trophies !== "number") u.trophies = 0;
     if (user.username)    u.username    = user.username;
     if (user.global_name) u.global_name = user.global_name;
     if (user.avatar_url)  u.avatar_url  = user.avatar_url;
@@ -261,13 +262,53 @@ function ensureUser(user){
   return u;
 }
 
-function recordWin(user){
-  const u = ensureUser(user);
-  if (!u) return;
-  u.wins = (u.wins || 0) + 1;
+/* ---------- Match stakes (trophies) ----------
+   На старте матча сервер катает две случайные величины:
+     win  ∈ [20..35] — сколько +трофеев получит победитель
+     loss ∈ [25..40] — сколько −трофеев потеряет проигравший (клампим в 0).
+   Ставки хранятся по matchId, и match_win / match_loss смотрят именно
+   туда — клиент не может подменить размер награды. Каждый исход на матч
+   принимается один раз: повторный match_win с того же matchId → no-op.
+   Через 15 минут запись стирается (GC на случай, если клиент не закрыл
+   матч и не перезапросил). */
+const TROPHY_WIN_MIN  = 20, TROPHY_WIN_MAX  = 35;
+const TROPHY_LOSS_MIN = 25, TROPHY_LOSS_MAX = 40;
+const matchStakes = new Map();
+
+function randInt(min, max){ return min + Math.floor(Math.random() * (max - min + 1)); }
+
+function rollStakes(){
+  return {
+    win:  randInt(TROPHY_WIN_MIN,  TROPHY_WIN_MAX),
+    loss: randInt(TROPHY_LOSS_MIN, TROPHY_LOSS_MAX),
+    winnerReportedBy: null,
+    loserReportedBy:  null
+  };
+}
+
+function registerStakes(matchId, stakes){
+  matchStakes.set(matchId, stakes);
+  setTimeout(()=> matchStakes.delete(matchId), 15 * 60 * 1000);
+}
+
+function applyMatchOutcome(ws, matchId, outcome){
+  const st = matchStakes.get(matchId);
+  if (!st) return null;
+  if (outcome === "win") {
+    if (st.winnerReportedBy) return null;
+    st.winnerReportedBy = ws.user.id;
+  } else {
+    if (st.loserReportedBy) return null;
+    st.loserReportedBy = ws.user.id;
+  }
+  const u = ensureUser(ws.user);
+  if (!u) return null;
+  const delta = outcome === "win" ? st.win : -st.loss;
+  u.trophies = Math.max(0, (u.trophies | 0) + delta);
   u.updatedAt = Date.now();
-  console.log("[lb] win recorded", user.id, "→", u.wins);
+  console.log(`[lb] ${outcome} ${ws.user.id} Δ${delta} → ${u.trophies}`);
   saveLeaderboardDebounced();
+  return { total: u.trophies, delta };
 }
 
 /* ---------- Server-authoritative wallet ----------
@@ -328,14 +369,19 @@ function userCoins(id){
   return (u && typeof u.coins === "number") ? u.coins : 0;
 }
 
+function userTrophies(id){
+  const u = LB.users[id];
+  return (u && typeof u.trophies === "number") ? u.trophies : 0;
+}
+
 const LB_PAGE_SIZE = 10;
 
-// Отсортированный список юзеров с победами > 0. Лишний раз материализовать
+// Отсортированный список юзеров с трофеями > 0. Лишний раз материализовать
 // не страшно — LB.users в памяти, сортировка O(n log n) на горстке записей.
 function rankedUsers(){
   return Object.values(LB.users)
-    .filter(u => (u.wins || 0) > 0)
-    .sort((a, b) => (b.wins || 0) - (a.wins || 0) || (a.updatedAt || 0) - (b.updatedAt || 0));
+    .filter(u => (u.trophies || 0) > 0)
+    .sort((a, b) => (b.trophies || 0) - (a.trophies || 0) || (a.updatedAt || 0) - (b.updatedAt || 0));
 }
 
 app.get("/api/leaderboard", (req, res) => {
@@ -352,20 +398,20 @@ app.get("/api/leaderboard", (req, res) => {
     id: u.id,
     global_name: u.global_name || u.username || "",
     avatar_url: u.avatar_url || null,
-    wins: u.wins || 0,
+    trophies: u.trophies || 0,
     rank: start + i + 1
   }));
 
   let mine = null;
   if (me) {
     const u = LB.users[me.id];
-    const wins = (u && u.wins) || 0;
-    if (wins > 0) {
+    const trophies = (u && u.trophies) || 0;
+    if (trophies > 0) {
       const idx = list.findIndex(x => x.id === me.id);
       const rank = idx + 1;
-      mine = { id: me.id, wins, rank, page: Math.floor(idx / LB_PAGE_SIZE) + 1 };
+      mine = { id: me.id, trophies, rank, page: Math.floor(idx / LB_PAGE_SIZE) + 1 };
     } else {
-      mine = { id: me.id, wins: 0, rank: null, page: null };
+      mine = { id: me.id, trophies: 0, rank: null, page: null };
     }
   }
   res.json({ top: entries, me: mine, total, page, pages, pageSize: LB_PAGE_SIZE });
@@ -480,13 +526,18 @@ function clearQueue(ws){
 function pair(host, guest){
   clearQueue(host);
   clearQueue(guest);
-  const roomId = crypto.randomBytes(6).toString("hex");
+  const roomId  = crypto.randomBytes(6).toString("hex");
+  const matchId = "pm-" + crypto.randomBytes(8).toString("hex");
+  const stakes  = rollStakes();
+  registerStakes(matchId, stakes);
   host.peer  = guest; guest.peer = host;
   host.role  = "host"; guest.role = "guest";
   host.roomId = guest.roomId = roomId;
-  send(host,  { type: "matched", role: "host",  room: roomId, opponent: safeUser(guest.user) });
-  send(guest, { type: "matched", role: "guest", room: roomId, opponent: safeUser(host.user)  });
-  console.log(`[ws] matched host=${host.user.id} guest=${guest.user.id} room=${roomId}`);
+  host.activeMatchId = guest.activeMatchId = matchId;
+  const stakesMsg = { win: stakes.win, loss: stakes.loss };
+  send(host,  { type: "matched", role: "host",  room: roomId, matchId, stakes: stakesMsg, opponent: safeUser(guest.user) });
+  send(guest, { type: "matched", role: "guest", room: roomId, matchId, stakes: stakesMsg, opponent: safeUser(host.user)  });
+  console.log(`[ws] matched host=${host.user.id} guest=${guest.user.id} room=${roomId} match=${matchId} stakes=+${stakes.win}/-${stakes.loss}`);
 }
 
 function onQueue(ws){
@@ -507,6 +558,19 @@ function onQueue(ws){
 
 function leaveRoom(ws, reason){
   const peer = ws.peer;
+  // Анти-ренакт: уходящий из активного матча автоматически получает
+  // поражение (−loss трофеев). Только если матч ещё не закрыт и исход
+  // от этого юзера ещё не пришёл. Cancel в лобби (до pair) не достигает
+  // этой ветки — activeMatchId там не выставлен.
+  const mid = ws.activeMatchId;
+  if (mid && reason !== "cancel") {
+    const st = matchStakes.get(mid);
+    if (st && !st.loserReportedBy && !st.winnerReportedBy){
+      const res = applyMatchOutcome(ws, mid, "loss");
+      if (res) send(ws, { type: "trophies", total: res.total, delta: res.delta });
+    }
+  }
+  ws.activeMatchId = null;
   if (peer) {
     peer.peer = null;
     send(peer, { type: "peer_left", reason: reason || "disconnect" });
@@ -525,7 +589,7 @@ wss.on("connection", (ws, req) => {
   ws.peer = null;
   ws.roomId = null;
 
-  send(ws, { type: "hello", user: safeUser(user), online: onlineCount(), coins: userCoins(user.id) });
+  send(ws, { type: "hello", user: safeUser(user), online: onlineCount(), coins: userCoins(user.id), trophies: userTrophies(user.id) });
   broadcastStats();
 
   ws.on("message", (raw) => {
@@ -544,13 +608,38 @@ wss.on("connection", (ws, req) => {
       case "leave":
         leaveRoom(ws, "leave");
         break;
+      case "match_stakes_request": {
+        // Бот-матч: клиент сгенерил matchId локально и просит сервер
+        // зафиксировать ставки трофеев. Если для этого matchId уже есть
+        // запись — возвращаем кэш (ре-коннекты, повторный запрос).
+        const mid = (typeof msg.matchId === "string") ? msg.matchId.slice(0, 64) : "";
+        if (!mid) break;
+        let st = matchStakes.get(mid);
+        if (!st){
+          st = rollStakes();
+          registerStakes(mid, st);
+        }
+        ws.activeMatchId = mid;
+        send(ws, { type: "match_stakes", matchId: mid, win: st.win, loss: st.loss });
+        break;
+      }
       case "match_win": {
-        // Запись победы в PvP-таблицу лидеров. Каждый клиент шлёт только за
-        // себя — нельзя «назначить» победу сопернику. При форфейте ws.peer
-        // уже null, поэтому отдельно не обрабатываем. Монеты за match.win
-        // идут отдельным {type:"award", kind:"match.win"} — так одна и та
-        // же ручка работает и в боте, и в онлайне, не раздувая матч_win.
-        recordWin(ws.user);
+        // Сервер берёт размер награды из зафиксированных ставок — клиент
+        // не может раздуть сумму. Защищено одноразовостью: повторный
+        // match_win с тем же matchId → no-op.
+        const mid = (typeof msg.matchId === "string") ? msg.matchId.slice(0, 64) : (ws.activeMatchId || "");
+        if (!mid) break;
+        const res = applyMatchOutcome(ws, mid, "win");
+        if (res) send(ws, { type: "trophies", total: res.total, delta: res.delta });
+        break;
+      }
+      case "match_loss": {
+        // Потеря трофеев: сервер применяет ставку loss (с клампом в 0).
+        // Повторный match_loss с тем же matchId проигнорируется.
+        const mid = (typeof msg.matchId === "string") ? msg.matchId.slice(0, 64) : (ws.activeMatchId || "");
+        if (!mid) break;
+        const res = applyMatchOutcome(ws, mid, "loss");
+        if (res) send(ws, { type: "trophies", total: res.total, delta: res.delta });
         break;
       }
       case "award": {

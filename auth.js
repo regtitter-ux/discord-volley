@@ -40,9 +40,10 @@
       avatar_url:  u.avatar_url || null,
       color:       colorFor(u)
     };
-    // Пропускаем coins, если сервер их вернул (только /api/me). Для
-    // нормализации opponent-объектов поле отсутствует — и это ок.
-    if(typeof u.coins === "number") out.coins = u.coins | 0;
+    // Пропускаем coins / trophies, если сервер их вернул (только /api/me).
+    // Для нормализации opponent-объектов этих полей нет — и это ок.
+    if(typeof u.coins    === "number") out.coins    = u.coins | 0;
+    if(typeof u.trophies === "number") out.trophies = u.trophies | 0;
     return out;
   }
 

@@ -209,8 +209,9 @@ body.is-touch .overlay{background:rgba(0,0,0,.72)}
 .lb-avatar{width:26px;height:26px;border-radius:50%;overflow:hidden;flex-shrink:0;background:var(--blurple);display:flex;align-items:center;justify-content:center;color:#fff;font-size:11px;font-weight:700}
 .lb-avatar img{width:100%;height:100%;object-fit:cover}
 .lb-name{flex:1;min-width:0;font-size:13px;font-weight:600;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
-.lb-wins{flex-shrink:0;font-size:13px;font-weight:800;color:var(--text);font-variant-numeric:tabular-nums}
+.lb-wins{flex-shrink:0;display:inline-flex;align-items:center;gap:4px;font-size:13px;font-weight:800;color:var(--text);font-variant-numeric:tabular-nums}
 .lb-wins .suffix{color:var(--muted);font-weight:600;font-size:11px;margin-left:4px;text-transform:uppercase;letter-spacing:.3px}
+.lb-wins .lb-trophy-ico{filter:drop-shadow(0 1px 2px rgba(0,0,0,.35))}
 .lb-empty{font-size:12px;text-align:center;padding:8px 0}
 .lb-list:not(:empty) + .lb-empty{display:none}
 .lb-pager{display:flex;align-items:center;justify-content:center;gap:8px;margin-top:10px;flex-wrap:wrap}
@@ -242,8 +243,15 @@ body.is-touch .overlay{background:rgba(0,0,0,.72)}
   100%{transform:scale(1);   color:var(--text)}
 }
 .hud-score.pulse{animation:hud-score-pulse .45s ease}
-.hud-mid{display:flex;align-items:center;gap:10px;padding:0 8px;border-left:1px solid #3a3c43;border-right:1px solid #3a3c43}
+.hud-mid{display:flex;flex-direction:column;align-items:center;gap:2px;padding:0 8px;border-left:1px solid #3a3c43;border-right:1px solid #3a3c43}
 .hud-diff{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;font-weight:700}
+.hud-stakes{display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums;line-height:1}
+.hud-stakes .trophy-ico{filter:drop-shadow(0 1px 2px rgba(0,0,0,.35))}
+.hud-stakes-win{color:#ffd34a}
+.hud-stakes-loss{color:#f87171}
+.hud-stakes-sep{color:var(--muted);font-weight:600;margin:0 1px}
+.wallet-trophies .wallet-value{color:#ffd34a}
+.trophy-ico{flex-shrink:0;display:inline-block}
 
 /* Touch controls.
    Каждая .tbtn — прозрачная зона-хитбокс, растянутая на свою часть нижней
