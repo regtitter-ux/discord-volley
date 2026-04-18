@@ -57,6 +57,15 @@ class LocalBroker {
   unregisterClient(c){ this.clients.delete(c.wsId); }
 
   enqueue(c){
+    // Защёлка: если waiting-клиент «зомби» (ws закрылся, но ws.on("close")
+    // ещё не прокрутился и clearQueue не вызвался), не пытаемся его сопрячь.
+    // Иначе pairLocal проверит readyState !== 1 и молча пропустит pair —
+    // а обратившийся клиент упадёт в дыру (очередь пустая, таймер не
+    // поставлен, pair не случился). Сбрасываем мёртвого и даём путь как
+    // свежему waiter.
+    if (this.waiting && !(this.waiting.ws && this.waiting.ws.readyState === 1)){
+      this.waiting = null;
+    }
     if (this.waiting && this.waiting.wsId !== c.wsId){
       const partner = this.waiting;
       this.waiting = null;

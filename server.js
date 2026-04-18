@@ -773,13 +773,20 @@ async function onQueue(ws){
   if (ws.roomId) return; // уже в матче — игнорируем повторный queue
   if (ws._inQueue) return;
 
-  const res = await broker.enqueue(ws._client);
+  let res = await broker.enqueue(ws._client);
   if (res && res.kind === "local"){
     const partner = res.partner.ws; // client wraps ws
     if (partner && partner.readyState === 1){
       await pairLocal(partner, ws);
+      return;
     }
-    return;
+    // Partner умер в узкой гонке между LocalBroker.enqueue (там уже есть
+    // readyState-гард) и этой веткой. broker.waiting=null, мы «достались»
+    // из очереди, но pair не случился. Без ре-enqueue клиент застрял бы
+    // в лобби: _inQueue=false, таймер не поставлен, никакое событие его
+    // не разбудит. Перекладываем себя обратно в waiting и падаем в null-
+    // ветку ниже (таймер + _inQueue).
+    res = await broker.enqueue(ws._client);
   }
   if (res && res.kind === "remote"){
     // Партнёр на другом инстансе — мы guest, он host. Сгенерим общие
