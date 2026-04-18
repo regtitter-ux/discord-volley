@@ -6,9 +6,9 @@ const { startServer, devLogin, openClient } = require("./helpers/harness");
 
 // Онлайн-счётчик ведётся на брокере (incrOnline/decrOnline) и рассылается
 // всем подключённым фреймом {type:"stats", online}. Проверяем:
-//   1) три клиента последовательно → у третьего hello.online >= 3 и/или
-//      приходит stats-фрейм с online >= 3.
-//   2) после закрытия всех трёх → следующий свежий клиент видит
+//   1) N клиентов последовательно → у последнего hello.online >= N,
+//      и все предыдущие получают stats-фрейм с online >= N.
+//   2) после закрытия всех → следующий свежий клиент видит
 //      hello.online == 1 (он сам — единственный).
 let srv;
 test.before(async () => { srv = await startServer({ STATS_INTERVAL_MS: "400" }); });
