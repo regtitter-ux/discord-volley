@@ -951,6 +951,14 @@ function resizeCanvas(){
 }
 window.addEventListener("resize", resizeCanvas);
 window.addEventListener("orientationchange", resizeCanvas);
+// Сразу после show("game") (особенно на «Играть снова» онлайн) браузер
+// ещё не успевает пересчитать layout только что раскрытого section'а —
+// canvas.clientWidth/Height кратковременно возвращают 0, resizeCanvas
+// выставляет scale≈0, и первый кадр рисуется как пустая точка. Observer
+// ловит момент, когда layout реально применился, и переразмеряет canvas.
+if(typeof ResizeObserver === "function"){
+  new ResizeObserver(resizeCanvas).observe(canvas);
+}
 
 /* ---------------- Input ----------------
    We check BOTH e.code (physical key, layout-independent) and e.key

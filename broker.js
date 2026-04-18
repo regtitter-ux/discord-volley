@@ -108,7 +108,12 @@ class LocalBroker {
     const st = this.stakes.get(matchId);
     if (!st) return null;
     const field = outcome === "win" ? "winnerReportedBy" : "loserReportedBy";
+    const opposite = outcome === "win" ? "loserReportedBy" : "winnerReportedBy";
     if (st[field]) return null;
+    // Тот же юзер не может получить и win, и loss по одному матчу: если он уже
+    // заявил обратный исход (например, пришёл match_win, а потом leaveRoom
+    // пытается засчитать −loss), второй claim игнорируем.
+    if (st[opposite] === userId) return null;
     st[field] = userId;
     const delta = outcome === "win" ? st.win : -st.loss;
     return { delta, win: st.win, loss: st.loss };
@@ -327,7 +332,9 @@ class RedisBroker {
       if not raw then return nil end
       local st = cjson.decode(raw)
       local field = (ARGV[2] == "win") and "winnerReportedBy" or "loserReportedBy"
+      local opposite = (ARGV[2] == "win") and "loserReportedBy" or "winnerReportedBy"
       if st[field] then return nil end
+      if st[opposite] == ARGV[1] then return nil end
       st[field] = ARGV[1]
       local ttl = redis.call("PTTL", KEYS[1])
       redis.call("SET", KEYS[1], cjson.encode(st))
