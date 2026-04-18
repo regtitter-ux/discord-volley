@@ -645,6 +645,22 @@ async function leaveRoom(ws, reason){
     // В local-режиме это прямой send, в Redis-режиме — publish по каналу.
     const frame = JSON.stringify({ type: "peer_left", reason: reason || "disconnect" });
     broker.publishRoom(roomId, ws.wsId, frame);
+    // Симметрично сбрасываем серверное состояние локальных пиров в этой
+    // комнате: матч кончился, комната больше не нужна. Иначе у пира
+    // остаётся ws.roomId, и его следующий queue игнорится как "уже в
+    // матче", пока он не нажмёт cancel. В Redis-режиме аналогичная
+    // чистка отдалённого пира происходит в broker._onRoomFrame при
+    // доставке peer_left — так покрыты оба layout'а.
+    if (broker.getLocalRoomClients){
+      const peers = broker.getLocalRoomClients(roomId);
+      for (const c of peers){
+        if (!c || c.wsId === ws.wsId) continue;
+        // Только roomId — это ворота для "уже в матче" в onQueue. activeMatchId
+        // держим: оставшийся пир всё ещё может прислать match_win/match_loss
+        // без matchId-в-пейлоаде, и сервер найдёт нужный matchId через него.
+        if (c.ws) c.ws.roomId = null;
+      }
+    }
     await broker.leaveRoom(roomId, ws._client);
   }
 }

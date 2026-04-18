@@ -80,6 +80,19 @@ class LocalBroker {
     s.delete(c.wsId);
     if (s.size === 0) this.rooms.delete(roomId);
   }
+  // Локальные клиенты, подписанные на комнату на ЭТОМ инстансе — нужны
+  // серверу, чтобы после чужого leaveRoom сбросить у оставшегося ws.roomId/
+  // activeMatchId (иначе следующий queue у него игнорится как "уже в матче").
+  getLocalRoomClients(roomId){
+    const s = this.rooms.get(roomId);
+    if (!s) return [];
+    const out = [];
+    for (const wsId of s){
+      const c = this.clients.get(wsId);
+      if (c) out.push(c);
+    }
+    return out;
+  }
   // Важно: в local-режиме ограничение на «не отправить самому себе» идёт по wsId,
   // а не по ссылке — ws может уходить/переподключаться, но wsId стабилен на коннект.
   publishRoom(roomId, senderId, frame){
@@ -241,6 +254,18 @@ class RedisBroker {
       try { await this.sub.unsubscribe(chanB); } catch {}
     }
   }
+  // Симметрично LocalBroker: возвращаем подписанных локально клиентов, чтобы
+  // серверный leaveRoom мог сбросить roomId/activeMatchId у оставшегося пира.
+  getLocalRoomClients(roomId){
+    const s = this.localRooms.get(roomId);
+    if (!s) return [];
+    const out = [];
+    for (const wsId of s){
+      const c = this.clients.get(wsId);
+      if (c) out.push(c);
+    }
+    return out;
+  }
 
   _onRoomFrame(roomId, raw, isBinary){
     // Формат для обеих веток: первые 10 ASCII hex = senderWsId, затем ":",
@@ -264,7 +289,24 @@ class RedisBroker {
     for (const wsId of s){
       if (wsId === senderId) continue;
       const c = this.clients.get(wsId);
-      if (c && c.sendRaw) c.sendRaw(frame);
+      if (!c) continue;
+      // peer_left, доставленный через Redis pub/sub с другого инстанса, —
+      // признак того, что комната распалась. Чистим серверное состояние
+      // локального пира, иначе его следующий queue будет отвергнут как
+      // "уже в матче". Сниф через indexOf дешёвый (peer_left не встречается
+      // в hot-path'ах relay/peer-снапшотах).
+      if (!isBinary && typeof frame === "string" && frame.indexOf("peer_left") >= 0){
+        try {
+          const obj = JSON.parse(frame);
+          if (obj && obj.type === "peer_left" && c.ws){
+            // Освобождаем пира из комнаты: следующий queue должен работать.
+            // activeMatchId оставляем — winner может дослать match_win без
+            // matchId-в-пейлоаде, и сервер найдёт матч через этот флаг.
+            c.ws.roomId = null;
+          }
+        } catch {}
+      }
+      if (c.sendRaw) c.sendRaw(frame);
     }
   }
 
