@@ -2602,6 +2602,22 @@ const Game = (function(){
     return hit;
   }
 
+  // Кеш атласов украшений: один Image на URL, переиспользуется между
+  // игроками, матчами и ре-рендерами. Пустой src никогда не кешируем —
+  // такая запись может блокировать будущие попытки.
+  const decoAtlasCache = new Map();
+  function getDecoAtlas(url){
+    if(!url) return null;
+    let img = decoAtlasCache.get(url);
+    if(!img){
+      img = new Image();
+      img.decoding = "async";
+      img.src = url;
+      decoAtlasCache.set(url, img);
+    }
+    return img;
+  }
+
   function getAvatarCanvas(user, size){
     const safeUrl = Auth.sanitizeAvatarUrl(user.avatar_url);
     const key = (safeUrl || user.color || "?") + "|" + (user.global_name||user.username||"?") + "|" + size;
@@ -2674,6 +2690,31 @@ const Game = (function(){
 
     ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI*2);
     ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 4; ctx.stroke();
+
+    // Украшение: вырезаем нужный кадр из атласа (cols×rows сетка) и
+    // рисуем поверх аватара. Размер — тот же «inset:-18%», что и в DOM
+    // (avatar ×1.36). Без clip — нимб/звёзды должны выходить за рамку.
+    const deco = user && user.decoration;
+    if(deco && deco.atlas && (deco.frames|0) > 0 && (deco.cols|0) > 0 && (deco.rows|0) > 0){
+      const img = getDecoAtlas(deco.atlas);
+      if(img && img.complete && img.naturalWidth > 0){
+        const fps    = Math.max(1, deco.fps|0);
+        const frames = deco.frames|0;
+        const cols   = deco.cols|0;
+        const rows   = deco.rows|0;
+        const idx    = Math.floor(performance.now() * fps / 1000) % frames;
+        const col    = idx % cols;
+        const row    = (idx / cols) | 0;
+        const fw     = img.naturalWidth  / cols;
+        const fh     = img.naturalHeight / rows;
+        const dSize  = size * 1.36;
+        try {
+          ctx.drawImage(img,
+            col*fw, row*fh, fw, fh,
+            -dSize/2, -dSize/2, dSize, dSize);
+        } catch(_){}
+      }
+    }
 
     ctx.restore();
   }
