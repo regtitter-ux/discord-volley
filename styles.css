@@ -433,6 +433,12 @@ body.is-touch #cv{height:calc(100% - 84px - var(--safe-bot))}
 @keyframes spinner-spin{to{transform:rotate(360deg)}}
 
 /* Admin mode ---------------------------------------------------------- */
+/* .hidden в проекте работает только через .screen.hidden / .user-popup.hidden
+   и т.д. — для admin-кнопок добавляем собственные правила, иначе класс
+   просто не скрывает их и у не-админов видны тогглер и «+». */
+.user-popup-item.hidden{display:none}
+.icon-btn.btn-admin.hidden{display:none}
+
 /* Индикатор активности в popup-строке: серый кружок → зелёный при ON. */
 .admin-toggle-dot{margin-left:auto;width:10px;height:10px;border-radius:50%;background:#4b4d55;transition:background-color .15s ease,box-shadow .15s ease}
 #btn-admin-toggle.is-on .admin-toggle-dot{background:var(--green);box-shadow:0 0 0 2px rgba(35,165,90,.25)}
