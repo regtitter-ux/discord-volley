@@ -4,11 +4,11 @@
   "private": true,
   "description": "Discord-themed 2D online volleyball mini-game with Discord OAuth2",
   "engines": {
-    "node": ">=18"
+    "node": ">=22.5"
   },
   "scripts": {
-    "start": "node server.js",
-    "dev": "node server.js"
+    "start": "node --experimental-sqlite server.js",
+    "dev": "node --experimental-sqlite server.js"
   },
   "dependencies": {
     "cookie": "^0.6.0",

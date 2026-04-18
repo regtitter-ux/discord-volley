@@ -203,83 +203,28 @@ app.get("/api/version", (req, res) => {
   res.json({ build: BUILD_ID });
 });
 
-/* ---------- Leaderboard (wins) + live online counter ----------
-   Хранение — простой JSON-файл (data/leaderboard.json). Схема: { users: {
-   <id>: { id, username, global_name, avatar_url, wins, updatedAt } } }.
-   Записи апдейтим на endMatch (type:"match_win") от хоста — он авторитетен
-   по результату. Чтобы не потерять на рестарте, сохраняем debounced. */
+/* ---------- Leaderboard (trophies) + wallet (coins) ----------
+   Хранение — SQLite (data/volley.sqlite). Одна таблица users со всеми
+   полями лидерборда/кошелька. Писатели — applyMatchOutcome (+трофеи/-трофеи)
+   и awardCoins (+монеты); читатель /api/leaderboard идёт через индекс по
+   trophies DESC и работает за O(log n + pageSize). При росте таблицы
+   in-memory LB.users + sort() в каждом ответе стал бы узким местом. */
 
 // Путь к каталогу персистентных данных. На локалке — ./data (под .gitignore).
 // В проде на Railway FS эфемерна между деплоями — нужно смонтировать Volume
 // (например, в /data) и задать DATA_DIR=/data в Variables. Иначе топ и
 // балансы кошелька сбросятся на каждом редеплое.
 const DATA_DIR = process.env.DATA_DIR || path.join(__dirname, "data");
-const LB_PATH  = path.join(DATA_DIR, "leaderboard.json");
-try { fs.mkdirSync(DATA_DIR, { recursive: true }); } catch(_) {}
 
-function loadLeaderboard(){
-  try {
-    const raw = fs.readFileSync(LB_PATH, "utf8");
-    const j = JSON.parse(raw);
-    if (j && j.users && typeof j.users === "object") return j;
-  } catch(_) {}
-  return { users: {} };
-}
-const LB = loadLeaderboard();
+// SQLite (node:sqlite, WAL-mode). Заменил JSON-файл, который блокировал
+// event loop на каждый flush и требовал сериализации всей таблицы при
+// любом изменении. Теперь update — это одна транзакция в пару мс без
+// участия event loop'а в I/O. Миграция leaderboard.json → users делается
+// внутри openDb() лениво, при первом старте на чистой базе.
+const { openDb } = require("./db");
+const DB = openDb(DATA_DIR);
 
-// Async + atomic. writeFileSync блокировал event loop на весь JSON-дамп
-// (у тысяч юзеров это десятки мс). Пишем во временный файл и атомарно
-// переименовываем — если процесс упадёт посреди записи, LB_PATH останется
-// консистентным. _lbDirty сигнализирует «пока писали, прилетели новые
-// апдейты» — тогда запускаем ещё один проход.
-let _lbSaveTimer = null;
-let _lbWriting   = false;
-let _lbDirty     = false;
-async function _lbFlush(){
-  _lbWriting = true;
-  _lbDirty   = false;
-  const snap = JSON.stringify(LB);
-  const tmp  = LB_PATH + ".tmp";
-  try {
-    await fs.promises.writeFile(tmp, snap, "utf8");
-    await fs.promises.rename(tmp, LB_PATH);
-  } catch(e){ console.error("[lb] write failed:", e); }
-  finally { _lbWriting = false; }
-  if (_lbDirty) saveLeaderboardDebounced();
-}
-function saveLeaderboardDebounced(){
-  _lbDirty = true;
-  if (_lbSaveTimer || _lbWriting) return;
-  _lbSaveTimer = setTimeout(() => {
-    _lbSaveTimer = null;
-    _lbFlush();
-  }, 500);
-}
-
-function ensureUser(user){
-  if (!user || !user.id) return null;
-  let u = LB.users[user.id];
-  if (!u){
-    u = {
-      id: user.id,
-      username: user.username || "",
-      global_name: user.global_name || user.username || "",
-      avatar_url: user.avatar_url || null,
-      wins: 0,
-      trophies: 0,
-      coins: 0,
-      updatedAt: Date.now()
-    };
-    LB.users[user.id] = u;
-  } else {
-    if (typeof u.coins    !== "number") u.coins    = 0;
-    if (typeof u.trophies !== "number") u.trophies = 0;
-    if (user.username)    u.username    = user.username;
-    if (user.global_name) u.global_name = user.global_name;
-    if (user.avatar_url)  u.avatar_url  = user.avatar_url;
-  }
-  return u;
-}
+function ensureUser(user){ return DB.ensureUser(user); }
 
 /* ---------- Match stakes (trophies) ----------
    На старте матча сервер катает две случайные величины:
@@ -347,14 +292,10 @@ function applyMatchOutcome(ws, matchId, outcome){
     if (st.loserReportedBy) return null;
     st.loserReportedBy = ws.user.id;
   }
-  const u = ensureUser(ws.user);
-  if (!u) return null;
   const delta = outcome === "win" ? st.win : -st.loss;
-  u.trophies = Math.max(0, (u.trophies | 0) + delta);
-  u.updatedAt = Date.now();
-  console.log(`[lb] ${outcome} ${ws.user.id} Δ${delta} → ${u.trophies}`);
-  saveLeaderboardDebounced();
-  return { total: u.trophies, delta };
+  const total = DB.addTrophies(ws.user, delta);
+  console.log(`[lb] ${outcome} ${ws.user.id} Δ${delta} → ${total}`);
+  return { total, delta };
 }
 
 /* ---------- Server-authoritative wallet ----------
@@ -383,8 +324,7 @@ function awardCoins(user, kind, matchId, context){
   const cfg = AWARDS[kind];
   if (!cfg) return null;
   if (!matchId || typeof matchId !== "string" || matchId.length > 64) return null;
-  const u = ensureUser(user);
-  if (!u) return null;
+  if (!user || !user.id) return null;
   const now = Date.now();
   let rec = userRates.get(user.id);
   if (!rec){ rec = { _lastMatchWinAt: 0 }; userRates.set(user.id, rec); }
@@ -403,64 +343,33 @@ function awardCoins(user, kind, matchId, context){
   st.lastAt = now;
   st.count++;
   if (kind === "match.win") rec._lastMatchWinAt = now;
-  u.coins = (u.coins || 0) + amount;
-  if (u.coins < 0) u.coins = 0;
-  u.updatedAt = now;
-  saveLeaderboardDebounced();
-  return { coins: u.coins, delta: amount };
+  const coins = DB.addCoins(user, amount);
+  return { coins, delta: amount };
 }
 
-function userCoins(id){
-  const u = LB.users[id];
-  return (u && typeof u.coins === "number") ? u.coins : 0;
-}
-
-function userTrophies(id){
-  const u = LB.users[id];
-  return (u && typeof u.trophies === "number") ? u.trophies : 0;
-}
+function userCoins(id){    return DB.getCoins(id); }
+function userTrophies(id){ return DB.getTrophies(id); }
 
 const LB_PAGE_SIZE = 10;
-
-// Отсортированный список юзеров с трофеями > 0. Лишний раз материализовать
-// не страшно — LB.users в памяти, сортировка O(n log n) на горстке записей.
-function rankedUsers(){
-  return Object.values(LB.users)
-    .filter(u => (u.trophies || 0) > 0)
-    .sort((a, b) => (b.trophies || 0) - (a.trophies || 0) || (a.updatedAt || 0) - (b.updatedAt || 0));
-}
 
 app.get("/api/leaderboard", (req, res) => {
   res.setHeader("Cache-Control", "no-store");
   const me = getSession(req);
-  const list = rankedUsers();
-  const total = list.length;
-  const pages = Math.max(1, Math.ceil(total / LB_PAGE_SIZE));
   let page = parseInt(req.query.page, 10);
   if (!Number.isFinite(page) || page < 1) page = 1;
-  if (page > pages) page = pages;
-  const start = (page - 1) * LB_PAGE_SIZE;
-  const entries = list.slice(start, start + LB_PAGE_SIZE).map((u, i) => ({
-    id: u.id,
-    global_name: u.global_name || u.username || "",
-    avatar_url: u.avatar_url || null,
-    trophies: u.trophies || 0,
-    rank: start + i + 1
-  }));
-
-  let mine = null;
-  if (me) {
-    const u = LB.users[me.id];
-    const trophies = (u && u.trophies) || 0;
-    if (trophies > 0) {
-      const idx = list.findIndex(x => x.id === me.id);
-      const rank = idx + 1;
-      mine = { id: me.id, trophies, rank, page: Math.floor(idx / LB_PAGE_SIZE) + 1 };
-    } else {
-      mine = { id: me.id, trophies: 0, rank: null, page: null };
-    }
-  }
-  res.json({ top: entries, me: mine, total, page, pages, pageSize: LB_PAGE_SIZE });
+  // Индексированный SELECT ORDER BY trophies DESC LIMIT/OFFSET — при росте
+  // таблицы до десятков тысяч пользователей остаётся O(log n + pageSize),
+  // а не O(n log n) как было при сортировке in-memory массива.
+  const pg = DB.leaderboardPage(page, LB_PAGE_SIZE);
+  const mine = me ? DB.meRank(me.id, LB_PAGE_SIZE) : null;
+  res.json({
+    top: pg.entries,
+    me: mine,
+    total: pg.total,
+    page: pg.page,
+    pages: pg.pages,
+    pageSize: LB_PAGE_SIZE
+  });
 });
 
 app.get("/api/stats", (req, res) => {
