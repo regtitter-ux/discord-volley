@@ -369,8 +369,18 @@ app.get("/api/leaderboard", (req, res) => {
   // а не O(n log n) как было при сортировке in-memory массива.
   const pg = DB.leaderboardPage(page, LB_PAGE_SIZE);
   const mine = me ? DB.meRank(me.id, LB_PAGE_SIZE) : null;
+  // Раскрываем decoration_id → payload из каталога. decoration_id из БД
+  // может указывать на украшение, удалённое из каталога — тогда null.
+  const top = pg.entries.map(e => ({
+    id:          e.id,
+    global_name: e.global_name,
+    avatar_url:  e.avatar_url,
+    trophies:    e.trophies,
+    rank:        e.rank,
+    decoration:  selectedDecorationPayload(e.decoration_id)
+  }));
   res.json({
-    top: pg.entries,
+    top,
     me: mine,
     total: pg.total,
     page: pg.page,
@@ -610,12 +620,14 @@ function takeToken(ws){
 
 function safeUser(u){
   if (!u) return null;
+  const deco = DB.getDecorations(u.id);
   return {
     id:          u.id,
     username:    u.username,
     global_name: u.global_name || u.username,
     avatar_url:  u.avatar_url || null,
-    trophies:    userTrophies(u.id)
+    trophies:    userTrophies(u.id),
+    decoration:  selectedDecorationPayload(deco.selected)
   };
 }
 

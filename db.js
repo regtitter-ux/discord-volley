@@ -128,7 +128,7 @@ function openDb(dataDir){
     getCoins: db.prepare("SELECT coins FROM users WHERE id = ?"),
     getTrophies: db.prepare("SELECT trophies FROM users WHERE id = ?"),
     topPage: db.prepare(`
-      SELECT id, global_name, username, avatar_url, trophies
+      SELECT id, global_name, username, avatar_url, trophies, selected_decoration
       FROM users
       WHERE trophies > 0
       ORDER BY trophies DESC, updated_at ASC
@@ -249,7 +249,8 @@ function openDb(dataDir){
       global_name: r.global_name || r.username || "",
       avatar_url: r.avatar_url || null,
       trophies: r.trophies | 0,
-      rank: offset + i + 1
+      rank: offset + i + 1,
+      decoration_id: r.selected_decoration || null
     }));
     return { entries, total, page, pages };
   }

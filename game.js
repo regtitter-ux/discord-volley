@@ -2892,7 +2892,10 @@ const Decorations = (function(){
     row.tabIndex = 0;
 
     const thumb = document.createElement("div");
-    thumb.className = "deco-thumb";
+    thumb.className = "avatar deco-thumb";
+    // Превью: сам аватар юзера без украшения. Так видно, как будет
+    // выглядеть профиль, если сбросить выбор украшения.
+    if(state.user) Auth.renderAvatarInto(thumb, { ...state.user, decoration: null });
 
     const info = document.createElement("div");
     info.className = "deco-info";
@@ -2920,9 +2923,14 @@ const Decorations = (function(){
     row.setAttribute("role", "listitem");
 
     const thumb = document.createElement("div");
-    thumb.className = "deco-thumb";
-    // Миниатюра — просто пустой кружок с анимированным украшением поверх.
-    Auth.attachDecoration(thumb, d);
+    thumb.className = "avatar deco-thumb";
+    // Превью: аватар юзера + украшение сверху — так видно, как будет
+    // выглядеть профиль даже до покупки.
+    if(state.user){
+      Auth.renderAvatarInto(thumb, { ...state.user, decoration: d });
+    }else{
+      Auth.attachDecoration(thumb, d);
+    }
 
     const info = document.createElement("div");
     info.className = "deco-info";
