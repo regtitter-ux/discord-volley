@@ -162,6 +162,11 @@ body.is-touch .hud,
 body.is-touch .icon-btn,
 body.is-touch .react-btn{background:rgba(30,31,34,.92)}
 body.is-touch .overlay{background:rgba(0,0,0,.72)}
+/* filter:drop-shadow на мобильных — второй по тяжести эффект после blur, к тому
+   же висит на каждой иконке монет/кубков. В топе и HUD отключаем ради FPS. */
+body.is-touch .wallet .coin,
+body.is-touch .lb-wins .lb-trophy-ico,
+body.is-touch .hud-stakes .trophy-ico{filter:none}
 .user-meta{min-width:0}
 .user-name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
 .user-status{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
@@ -184,12 +189,15 @@ body.is-touch .overlay{background:rgba(0,0,0,.72)}
    «live»-паттерн из чатов. Счётчик обновляется через WS push-сообщение
    {type:"stats", online:n} и раз в 30 с по http фоллбеку. */
 .online-chip{display:inline-flex;align-self:center;align-items:center;gap:8px;padding:6px 12px;background:var(--bg-2);border:1px solid rgba(255,255,255,.06);border-radius:999px;font-size:13px;color:var(--muted);user-select:none}
-.online-chip .online-dot{width:8px;height:8px;border-radius:50%;background:var(--green);box-shadow:0 0 0 0 rgba(35,165,90,.55);animation:online-pulse 1.8s ease-out infinite}
+.online-chip .online-dot{position:relative;width:8px;height:8px;border-radius:50%;background:var(--green)}
+/* Пульс вынесен в ::after с transform+opacity — композитор-only, не триггерит
+   paint каждый кадр (в отличие от анимированного box-shadow). */
+.online-chip .online-dot::after{content:"";position:absolute;inset:-4px;border-radius:50%;background:rgba(35,165,90,.5);animation:online-pulse 1.8s ease-out infinite;will-change:transform,opacity;pointer-events:none}
 .online-chip .online-count{color:var(--text);font-weight:700}
 @keyframes online-pulse{
-  0%  {box-shadow:0 0 0 0 rgba(35,165,90,.55)}
-  70% {box-shadow:0 0 0 8px rgba(35,165,90,0)}
-  100%{box-shadow:0 0 0 0 rgba(35,165,90,0)}
+  0%  {transform:scale(.5);opacity:1}
+  70% {transform:scale(2.2);opacity:0}
+  100%{transform:scale(2.2);opacity:0}
 }
 
 /* Топ по победам — плотная таблица строк "ранг · аватар · имя · побед". */
