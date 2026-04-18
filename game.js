@@ -1835,11 +1835,14 @@ const Game = (function(){
     // 4-touch rule
     if(p.side === 1){ ball.touches.left++;  ball.touches.right = 0; }
     else            { ball.touches.right++; ball.touches.left  = 0; }
-    if(ball.touches.left  >= 4){ awardPoint(2); return; }
-    if(ball.touches.right >= 4){ awardPoint(1); return; }
+    if(ball.touches.left  >= 4){ awardPoint(2, "foul"); return; }
+    if(ball.touches.right >= 4){ awardPoint(1, "foul"); return; }
   }
 
-  function awardPoint(side){
+  // reason: "foul" — очко присуждено за 4-е касание соперника (лишнее).
+  // В этом случае показываем "ФОЛ/FOUL" вместо обычного "ОЧКО/ПРОПУСК",
+  // цвет оставляем тот же (зелёный если выиграли, красный если проиграли).
+  function awardPoint(side, reason){
     if(roundOver) return;
     roundOver = true;
     roundTimer = POST_POINT_TIME;
@@ -1854,8 +1857,9 @@ const Game = (function(){
     void pulseEl.offsetWidth; // reflow to restart animation
     pulseEl.classList.add("pulse");
     spawnParticles(ball.x, GROUND_Y - 2, 22, side === 1 ? "rgba(35,165,90,1)" : "rgba(242,63,66,1)", 260);
-    if(side === 1){ showBig(I18n.t("game.point"), "#23a55a", 0.9, 96); sfx.point(); }
-    else          { showBig(I18n.t("game.miss"),  "#f23f42", 0.9, 80); sfx.lose(); }
+    const isFoul = reason === "foul";
+    if(side === 1){ showBig(I18n.t(isFoul ? "game.foul" : "game.point"), "#23a55a", 0.9, 96); sfx.point(); }
+    else          { showBig(I18n.t(isFoul ? "game.foul" : "game.miss"),  "#f23f42", 0.9, 80); sfx.lose(); }
     // Монеты: +5 за выигранное очко. Bot/host — когда side===1 (свой игрок).
     // Гостю начисляется в applySnapshot, когда его «свой» счёт (mirror s.s2)
     // вырос между снапшотами.

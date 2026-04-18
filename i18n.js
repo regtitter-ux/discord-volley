@@ -55,6 +55,7 @@
       "game.serve_opp": "ПОДАЧА СОПЕРНИКА",
       "game.point":     "ОЧКО!",
       "game.miss":      "ПРОПУСК",
+      "game.foul":      "ФОЛ",
       "game.opponent_left": "Соперник сдался",
 
       "wallet.label":   "Монеты",
@@ -114,6 +115,7 @@
       "game.serve_opp": "OPPONENT SERVE",
       "game.point":     "POINT!",
       "game.miss":      "MISS",
+      "game.foul":      "FOUL",
       "game.opponent_left": "Opponent forfeited",
 
       "wallet.label":   "Coins",
