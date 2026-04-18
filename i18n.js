@@ -14,12 +14,25 @@
 
       "menu.status":    "В сети",
       "menu.decorations":"Украшения",
+      "menu.admin":     "Админ-режим",
       "menu.logout":    "Выйти",
+
+      "admin.title":    "Изменить баланс",
+      "admin.target":   "ID или username игрока",
+      "admin.amount":   "Сумма (с + или −)",
+      "admin.apply":    "Применить",
+      "admin.close":    "Закрыть",
+      "admin.open":     "Изменить баланс",
+      "admin.ok":       "Готово: баланс игрока теперь {coins}",
+      "admin.err_notfound": "Игрок не найден",
+      "admin.err_amount":   "Сумма: +число или −число",
+      "admin.err_generic":  "Не удалось применить",
 
       "deco.title":      "Украшения",
       "deco.close":      "Закрыть",
       "deco.none":       "Без украшения",
-      "deco.name_deco1": "Галлюцинация",
+      "deco.name_deco1": "Сумеречный аметист",
+      "deco.name_deco2": "Тёмные розы",
       "deco.buy":        "Купить",
       "deco.select":     "Выбрать",
       "deco.selected":   "Выбрано",
@@ -90,7 +103,8 @@
       "deco.title":      "Decorations",
       "deco.close":      "Close",
       "deco.none":       "No decoration",
-      "deco.name_deco1": "Hallucination",
+      "deco.name_deco1": "Twilight Amethyst",
+      "deco.name_deco2": "Dark Roses",
       "deco.buy":        "Buy",
       "deco.select":     "Select",
       "deco.selected":   "Selected",
@@ -185,12 +199,13 @@
     const r = root || document;
     // Один проход вместо трёх querySelectorAll: элемент может иметь любую
     // комбинацию data-i18n / data-i18n-title / data-i18n-aria одновременно.
-    const sel = "[data-i18n],[data-i18n-title],[data-i18n-aria]";
+    const sel = "[data-i18n],[data-i18n-title],[data-i18n-aria],[data-i18n-placeholder]";
     r.querySelectorAll(sel).forEach(el => {
       const ds = el.dataset;
-      if(ds.i18n)      el.textContent = t(ds.i18n);
-      if(ds.i18nTitle) el.title = t(ds.i18nTitle);
-      if(ds.i18nAria)  el.setAttribute("aria-label", t(ds.i18nAria));
+      if(ds.i18n)            el.textContent = t(ds.i18n);
+      if(ds.i18nTitle)       el.title = t(ds.i18nTitle);
+      if(ds.i18nAria)        el.setAttribute("aria-label", t(ds.i18nAria));
+      if(ds.i18nPlaceholder) el.placeholder = t(ds.i18nPlaceholder);
     });
     document.documentElement.lang = lang;
   }

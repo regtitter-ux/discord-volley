@@ -44,6 +44,7 @@
     // Для нормализации opponent-объектов этих полей нет — и это ок.
     if(typeof u.coins    === "number") out.coins    = u.coins | 0;
     if(typeof u.trophies === "number") out.trophies = u.trophies | 0;
+    if(u.is_admin === true) out.is_admin = true;
     // decoration — объект с параметрами атласа (atlas, frames, cols, rows,
     // frameW, frameH, fps). Приходит с /api/me и с хеллоу в матче.
     if(u.decoration && typeof u.decoration === "object" && typeof u.decoration.atlas === "string"){

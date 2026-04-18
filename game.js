@@ -421,6 +421,7 @@ function enterMenu(){
   Auth.renderAvatarInto($("user-avatar"), state.user);
   $("user-name").textContent = userDisplayName(state.user);
   show("menu");
+  if(typeof Admin !== "undefined") Admin.applyUi();
   refreshOnlineCount();
   refreshLeaderboard();
   // Держим WS открытым с момента входа в меню: счётчик онлайна считает
@@ -3077,6 +3078,107 @@ $("decorations-modal").addEventListener("click", (e)=>{
 document.addEventListener("keydown", (e)=>{
   if(e.key === "Escape" && !$("decorations-modal").classList.contains("hidden")) Decorations.close();
 });
+
+/* Admin -----------------------------------------------------------------
+   Строго UI-only модуль: решение, админ ты или нет, принимает сервер
+   (user.is_admin в /api/me). Режим — клиентский переключатель (что
+   показывать в шапке), в localStorage. Даже при ручном включении в
+   DevTools серверные ручки /api/admin/* проверят право отдельно. */
+const Admin = (function(){
+  const KEY = "dv_admin_mode_v1";
+  const toggleBtn = $("btn-admin-toggle");
+  const addBtn    = $("btn-admin-add");
+  const modal     = $("admin-modal");
+  const form      = $("admin-form");
+  const targetIn  = $("admin-target");
+  const amountIn  = $("admin-amount");
+  const msgEl     = $("admin-msg");
+
+  function isAllowed(){ return !!(state.user && state.user.is_admin); }
+  function isOn(){
+    if(!isAllowed()) return false;
+    try{ return localStorage.getItem(KEY) === "1"; }catch(_){ return false; }
+  }
+  function setOn(v){
+    try{ localStorage.setItem(KEY, v ? "1" : "0"); }catch(_){}
+    applyUi();
+  }
+  function applyUi(){
+    const allowed = isAllowed();
+    toggleBtn.classList.toggle("hidden", !allowed);
+    const on = allowed && isOn();
+    toggleBtn.classList.toggle("is-on", on);
+    toggleBtn.setAttribute("aria-checked", on ? "true" : "false");
+    addBtn.classList.toggle("hidden", !on);
+  }
+
+  toggleBtn.addEventListener("click", (e)=>{
+    e.stopPropagation();
+    if(!isAllowed()){ closeUserPopup(); return; }
+    setOn(!isOn());
+    closeUserPopup();
+  });
+  addBtn.addEventListener("click", ()=>{
+    if(!isOn()) return;
+    openModal();
+  });
+
+  function openModal(){
+    setMsg("", "");
+    targetIn.value = "";
+    amountIn.value = "";
+    modal.classList.remove("hidden");
+    setTimeout(()=> targetIn.focus(), 30);
+  }
+  function closeModal(){ modal.classList.add("hidden"); }
+  function setMsg(text, kind){
+    msgEl.textContent = text || "";
+    msgEl.classList.remove("is-err", "is-ok");
+    if(kind === "err") msgEl.classList.add("is-err");
+    if(kind === "ok")  msgEl.classList.add("is-ok");
+  }
+
+  $("btn-admin-close").addEventListener("click", closeModal);
+  modal.addEventListener("click", (e)=>{ if(e.target.id === "admin-modal") closeModal(); });
+  document.addEventListener("keydown", (e)=>{
+    if(e.key === "Escape" && !modal.classList.contains("hidden")) closeModal();
+  });
+
+  form.addEventListener("submit", async (e)=>{
+    e.preventDefault();
+    const q = targetIn.value.trim();
+    // Принимаем +N / −N / -N; NBSP минус (−, U+2212) отдельно, пользователь
+    // может вставить его из системной клавиатуры. Знак обязателен — иначе
+    // команда двусмысленная («100» это +100 или −100?).
+    const raw = amountIn.value.trim().replace(/\u2212/g, "-");
+    const m = /^([+-])(\d+)$/.exec(raw);
+    if(!q){ setMsg(I18n.t("admin.err_notfound"), "err"); return; }
+    if(!m){ setMsg(I18n.t("admin.err_amount"), "err"); return; }
+    const delta = (m[1] === "-" ? -1 : 1) * parseInt(m[2], 10);
+    if(!Number.isFinite(delta) || delta === 0){ setMsg(I18n.t("admin.err_amount"), "err"); return; }
+    try{
+      // Резолвим id: числовой snowflake Discord / dev-id → сразу, иначе
+      // lookup по username/global_name.
+      let id = q;
+      if(!/^\d{5,}$/.test(q)){
+        const r = await fetch("/api/admin/lookup?q=" + encodeURIComponent(q), { credentials: "same-origin" });
+        if(r.status === 404){ setMsg(I18n.t("admin.err_notfound"), "err"); return; }
+        if(!r.ok){ setMsg(I18n.t("admin.err_generic"), "err"); return; }
+        const j = await r.json();
+        id = j.id;
+      }
+      const r2 = await fetch("/api/admin/coins?id=" + encodeURIComponent(id) + "&delta=" + delta, {
+        method: "POST", credentials: "same-origin"
+      });
+      if(r2.status === 404){ setMsg(I18n.t("admin.err_notfound"), "err"); return; }
+      if(!r2.ok){ setMsg(I18n.t("admin.err_generic"), "err"); return; }
+      const j2 = await r2.json();
+      setMsg(fmtI18n("admin.ok", { coins: j2.coins }), "ok");
+    }catch(_){ setMsg(I18n.t("admin.err_generic"), "err"); }
+  });
+
+  return { applyUi };
+})();
 
 /* ---------------- Boot ---------------- */
 resizeCanvas();

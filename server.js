@@ -189,7 +189,8 @@ app.get("/api/me", (req, res) => {
     avatar_url:  u.avatar_url,
     coins:       userCoins(u.id),
     trophies:    userTrophies(u.id),
-    decoration:  selectedDecorationPayload(deco.selected)
+    decoration:  selectedDecorationPayload(deco.selected),
+    is_admin:    isAdmin(u)
   });
 });
 
@@ -405,8 +406,19 @@ app.get("/api/stats", async (req, res) => {
 const DECORATIONS = {
   deco1: {
     id:         "deco1",
-    price:      100,
+    price:      10000,
     atlas:      "/assets/decorations/deco1/atlas.png",
+    frames:     60,
+    fps:        12,
+    frameW:     96,
+    frameH:     96,
+    cols:       6,
+    rows:       10
+  },
+  deco2: {
+    id:         "deco2",
+    price:      10000,
+    atlas:      "/assets/decorations/deco2/atlas.png",
     frames:     60,
     fps:        12,
     frameW:     96,
@@ -464,6 +476,52 @@ app.post("/api/decorations/buy", (req, res) => {
   // открытые в других вкладках меню сразу увидят новую сумму.
   pushCoinsToUser(u.id, r.coins);
   res.json({ ok: true, coins: r.coins, owned: r.owned, selected: r.selected });
+});
+
+/* ---------- Admin ----------
+   Белый список ID с админ-правами. Хардкод на сервере — клиенту верить
+   нельзя: is_admin во флаге /api/me нужен только для UI (показать кнопку
+   «+»), реальная проверка прав стоит на каждой admin-ручке. */
+const ADMIN_IDS = new Set(["743913502997086219"]);
+function isAdmin(u){ return !!(u && ADMIN_IDS.has(String(u.id))); }
+
+// Поиск пользователя по произвольному хендлу: сперва пробуем как точный ID
+// (у Discord это числовой snowflake, у dev-login — любой TEXT), потом
+// fallback — username / global_name без учёта регистра. Возвращаем только
+// id — больше серверу ничего не нужно для addCoins.
+app.get("/api/admin/lookup", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const me = getSession(req);
+  if (!isAdmin(me)) return res.status(403).json({ error: "forbidden" });
+  const q = String(req.query.q || "").trim();
+  if (!q) return res.status(400).json({ error: "empty_query" });
+  const byId = DB.db.prepare("SELECT id, global_name, username, coins FROM users WHERE id = ?").get(q);
+  const row = byId || DB.db.prepare(
+    "SELECT id, global_name, username, coins FROM users WHERE username = ? COLLATE NOCASE OR global_name = ? COLLATE NOCASE LIMIT 1"
+  ).get(q, q);
+  if (!row) return res.status(404).json({ error: "not_found" });
+  res.json({ id: row.id, global_name: row.global_name || row.username || "", coins: row.coins | 0 });
+});
+
+// Изменение баланса: delta — signed integer. Серверная правка идёт через
+// DB.addCoins (MAX(0,...) не уходит в минус), так что «−5000» у юзера с
+// балансом 100 обнулит его, а не улетит в отрицательное.
+app.post("/api/admin/coins", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const me = getSession(req);
+  if (!isAdmin(me)) return res.status(403).json({ error: "forbidden" });
+  const id = String(req.query.id || "").trim();
+  const delta = parseInt(req.query.delta, 10);
+  if (!id) return res.status(400).json({ error: "empty_id" });
+  if (!Number.isFinite(delta) || delta === 0) return res.status(400).json({ error: "bad_delta" });
+  // DB.addCoins сам вызовет ensureUser — если записи нет, создастся с пустым
+  // username (он проставится при следующем логине юзера через ensureUser).
+  // Это нужно, чтобы админ мог начислить монеты игроку, который ещё ни разу
+  // не сыграл матч (до этого момента у него может не быть строки в users).
+  const coins = DB.addCoins({ id }, delta);
+  pushCoinsToUser(id, coins);
+  console.log(`[admin] ${me.id} adjusted ${id} coins by ${delta} → ${coins}`);
+  res.json({ ok: true, id, coins });
 });
 
 app.post("/api/decorations/select", (req, res) => {

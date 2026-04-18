@@ -19,6 +19,16 @@
 
 *{box-sizing:border-box;margin:0;padding:0}
 html,body{height:100%;width:100%;overflow:hidden;background:var(--bg);color:var(--text);font:14px/1.4 "gg sans","Noto Sans","Segoe UI",system-ui,sans-serif;-webkit-tap-highlight-color:transparent;overscroll-behavior:none;touch-action:none}
+
+/* Скроллбары в цвет сайта — белый дефолтный сильно выделялся на тёмном
+   фоне. Оставляем только бегунок (bg-3 → hover чуть светлее), трек
+   прозрачный. Firefox — через scrollbar-width/scrollbar-color. */
+*{scrollbar-width:thin;scrollbar-color:var(--bg-hover) transparent}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-track{background:transparent}
+::-webkit-scrollbar-thumb{background:var(--bg-3);border-radius:4px}
+::-webkit-scrollbar-thumb:hover{background:var(--bg-hover)}
+::-webkit-scrollbar-corner{background:transparent}
 button{font:inherit;color:inherit;background:none;border:0;cursor:pointer}
 h1,h2,h3{font-weight:700}
 
@@ -421,3 +431,22 @@ body.is-touch #cv{height:calc(100% - 84px - var(--safe-bot))}
 .spinner-ring{position:absolute;inset:0;border-radius:50%;border:3px solid rgba(88,101,242,.22);border-top-color:var(--blurple);animation:spinner-spin 1s linear infinite}
 .lobby-countdown{font-size:30px;font-weight:800;color:var(--text);font-variant-numeric:tabular-nums}
 @keyframes spinner-spin{to{transform:rotate(360deg)}}
+
+/* Admin mode ---------------------------------------------------------- */
+/* Индикатор активности в popup-строке: серый кружок → зелёный при ON. */
+.admin-toggle-dot{margin-left:auto;width:10px;height:10px;border-radius:50%;background:#4b4d55;transition:background-color .15s ease,box-shadow .15s ease}
+#btn-admin-toggle.is-on .admin-toggle-dot{background:var(--green);box-shadow:0 0 0 2px rgba(35,165,90,.25)}
+
+/* Кнопка «+» в topbar: та же статика, что и wallet-pill, другой акцент. */
+.btn-admin{position:static;width:36px;height:36px;border-radius:10px;background:var(--bg-2);border:1px solid rgba(255,255,255,.06);color:var(--text)}
+.btn-admin:hover{background:var(--bg-hover)}
+
+/* Admin modal: те же правила, что и decorations-box, плюс форма. */
+.admin-box{max-width:380px;padding:26px 22px 20px}
+.admin-box h3{font-size:20px;margin-bottom:14px;text-align:center}
+.admin-form{display:flex;flex-direction:column;gap:10px}
+.admin-input{width:100%;padding:11px 12px;border-radius:var(--radius);background:var(--bg-3);border:1px solid rgba(255,255,255,.06);color:var(--text);font:inherit}
+.admin-input:focus{outline:none;border-color:var(--blurple);background:var(--bg-hover)}
+.admin-msg{min-height:18px;font-size:13px;color:var(--muted);text-align:center}
+.admin-msg.is-err{color:var(--red)}
+.admin-msg.is-ok{color:var(--green)}
