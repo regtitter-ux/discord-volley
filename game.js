@@ -51,6 +51,10 @@ const state = {
   // дубликаты. Пересоздаётся на каждый новый матч.
   session: null
 };
+// Открываем state для E2E-тестов. В проде это read-only хэндл; влиять на
+// геймплей через него нельзя (физика/сетевой поток берут данные из
+// замыкания, а не window).
+if (typeof window !== "undefined") window.__dvState = state;
 function newSession(){
   return {
     matchId: "m-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2, 8),

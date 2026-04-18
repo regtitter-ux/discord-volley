@@ -59,7 +59,7 @@
       "id": "US-005",
       "title": "E2E: canvas не чёрный после 'Играть снова' (online → online)",
       "priority": 5,
-      "passes": false,
+      "passes": true,
       "acceptanceCriteria": [
         "Файл tests/e2e/replay.spec.js использует два browserContext, каждый логинится через /dev/login, оба нажимают на кнопку очереди.",
         "Проверяется, что оба получают matched (state.mode !== 'bot' на клиенте).",

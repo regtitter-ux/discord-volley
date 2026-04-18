@@ -37,7 +37,11 @@ module.exports = defineConfig({
       DISCORD_CLIENT_SECRET: "test-secret",
       SESSION_SECRET: "test-session-secret-please-change",
       PUBLIC_URL: BASE,
-      DATA_DIR: "./data-test"
+      DATA_DIR: "./data-test",
+      // Ускоряем replay-сценарий: в тесте Б жмёт replay один, сервер не
+      // найдёт пару, и через QUEUE_TIMEOUT_MS fallback-нёт его в бот-матч.
+      // 1500мс достаточно коротко, чтобы тест не ушёл в таймаут 30с.
+      QUEUE_TIMEOUT_MS: "1500"
     }
   }
 });
