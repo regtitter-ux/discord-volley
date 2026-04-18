@@ -64,6 +64,15 @@ test("replay после peer_left: canvas не чёрный и screen-game ви�
     return await pageB.evaluate(() => !!(window.__dvState || {}).inGame);
   }, { timeout: 5_000 }).toBe(true);
 
+  // HUD-индикатор режима должен совпадать со state.mode: в онлайне это
+  // перевод "hud.online" (ONLINE/ОНЛАЙН), в боте — "hud.bot" (BOT/БОТ).
+  // Берём фактический текст из I18n через окно, чтобы тест был
+  // language-agnostic (ru дефолт, en fallback).
+  const onlineLabel = await pageB.evaluate(() => (window.I18n && window.I18n.t("hud.online")) || "ONLINE");
+  const botLabel    = await pageB.evaluate(() => (window.I18n && window.I18n.t("hud.bot"))    || "BOT");
+  const hudDiffOnline = (await pageB.locator("#hud-diff").textContent() || "").trim();
+  expect(hudDiffOnline).toBe(onlineLabel);
+
   // A уходит в меню через btn-home → сервер рассылает peer_left → у B
   // срабатывает endByForfeit и показывает end-match оверлей с btn-replay.
   await pageA.locator("#btn-home").click();
@@ -86,6 +95,14 @@ test("replay после peer_left: canvas не чёрный и screen-game ви�
     const s = await canvasSize(pageB);
     return s ? Math.min(s.w, s.h) : 0;
   }, { timeout: 10_000, intervals: [150, 250, 500, 1000] }).toBeGreaterThanOrEqual(300);
+
+  // После fallback в бот (QUEUE_TIMEOUT_MS выстрелил) state.mode === "bot"
+  // и hud-diff обязан переключиться на перевод "hud.bot".
+  await expect.poll(async () => {
+    return await pageB.evaluate(() => (window.__dvState || {}).mode);
+  }, { timeout: 10_000 }).toBe("bot");
+  const hudDiffBot = (await pageB.locator("#hud-diff").textContent() || "").trim();
+  expect(hudDiffBot).toBe(botLabel);
 
   await ctxA.close();
   await ctxB.close();
