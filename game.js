@@ -1364,6 +1364,14 @@ const Game = (function(){
   let rallyHits = 0;                     // consecutive hits for combo feedback
   let lastHitSide = 0;                   // side (1/2) последнего касания — для гостевых наград
   let prevSnapRallyHits = 0;             // на клиенте-госте: последний отрисованный счётчик касаний
+  // Первый принятый snapshot у гостя. Нужен, чтобы показать корректную
+  // подачу на старте: resetMatch() у гостя ставит servingSide=1 и вызывает
+  // serveBall() (= showBig «ПОДАЧА»), но реальная сторона подачи приходит
+  // только с первого снапшота — и если переход roundOver true→false не
+  // срабатывает, гость видит ложную «ПОДАЧА» и без явного индикатора,
+  // чья это подача на самом деле. Флаг позволяет один раз триггернуть
+  // корректный showBig после зеркалирования ss.
+  let firstSnapshotSeen = false;
 
   // Seedable RNG (mulberry32). Math.random десинкнет P2P/rollback-сценарии
   // в будущем, т.к. разные клиенты будут эволюционировать разные «случайные»
@@ -1554,6 +1562,7 @@ const Game = (function(){
     rallyHits = 0;
     lastHitSide = 0;
     prevSnapRallyHits = 0;
+    firstSnapshotSeen = false;
     hitFlash = 0;
     matchTime = 0;
     particles.length = 0;
@@ -1715,8 +1724,21 @@ const Game = (function(){
         ball.angle += ball.vx * dt * 0.025;
         // Страховка от визуального «проваливания под землю» между снапшотами,
         // если мяч как раз в момент удара о землю. Следующий снапшот всё
-        // равно перепишет авторитетную позицию.
-        if(ball.y + ball.r > GROUND_Y){ ball.y = GROUND_Y - ball.r; if(ball.vy > 0) ball.vy = 0; }
+        // равно перепишет авторитетную позицию. Заодно эмитим те же bounce-
+        // искры + squash, что и хост в stepBall — без этого гость видел
+        // «пустой» удар мяча о пол, без фидбека.
+        if(ball.y + ball.r > GROUND_Y){
+          const impactSpeed = Math.abs(ball.vy);
+          ball.y = GROUND_Y - ball.r;
+          if(ball.vy > 0){
+            if(impactSpeed > 80){
+              sfx.bounce();
+              spawnParticles(ball.x, GROUND_Y - 2, Math.min(12, 4 + (impactSpeed/120)|0), "rgba(255,255,255,1)", 180);
+              squash.ball = Math.max(squash.ball, 0.12);
+            }
+            ball.vy = 0;
+          }
+        }
       }
       return;
     }
@@ -1883,18 +1905,56 @@ const Game = (function(){
       p2.prevX = p2.x; p2.prevY = p2.y;
       ball.prevX = ball.x; ball.prevY = ball.y; ball.prevAngle = ball.angle;
     }
+    const prevRoundOver = roundOver;
+    const prevServingSide = servingSide;
     servingSide = s.ss === 1 ? 2 : 1;
     roundOver = !!s.ro;
+    // Фидбек подачи у гостя: переход roundOver true→false на хосте = только
+    // что сработал serveBall(). Показываем тот же showBig/sfx.serve(), что
+    // и host, чтобы гость понимал, чья сейчас подача. На первом снапшоте
+    // триггерим явно: resetMatch() у гостя по умолчанию показал «ПОДАЧА»
+    // (servingSide=1), но реальная сторона могла прийти другой — обновляем,
+    // если хост-авторитет не совпал с нашим локальным дефолтом.
+    const serveTransition = prevRoundOver && !roundOver;
+    const firstServeCorrection = !firstSnapshotSeen && !roundOver && servingSide !== prevServingSide;
+    if(serveTransition || firstServeCorrection){
+      sfx.serve();
+      showBig(I18n.t(servingSide === 1 ? "game.serve_you" : "game.serve_opp"),
+              servingSide === 1 ? "#ffffff" : "#b5bac1",
+              0.8, servingSide === 1 ? 62 : 46);
+    }
+    firstSnapshotSeen = true;
     const incomingRh = s.rh || 0;
     // Гостевые награды за касания мяча. В мировых координатах хоста
     // гость — p2 (lh===2). Счётчик rh у хоста только растёт в пределах
     // раунда и сбрасывается в 0 на очко; зеркалим это, смотрим прирост.
-    if(incomingRh > prevSnapRallyHits && s.lh === 2){
+    if(incomingRh > prevSnapRallyHits){
       const deltaHits = incomingRh - prevSnapRallyHits;
-      for(let i = 0; i < deltaHits; i++){
-        Wallet.award("rally.hit", 1);
-        const combo = prevSnapRallyHits + i + 1;
-        if(combo > 0 && combo % 5 === 0) Wallet.award("rally.combo", combo);
+      if(s.lh === 2){
+        for(let i = 0; i < deltaHits; i++){
+          Wallet.award("rally.hit", 1);
+          const combo = prevSnapRallyHits + i + 1;
+          if(combo > 0 && combo % 5 === 0) Wallet.award("rally.combo", combo);
+        }
+      }
+      // Визуальный фидбек касания у гостя. Хост в spawnHitEffects
+      // крутит particles+hitFlash+squash, но это локальное состояние —
+      // через snapshot оно не летит. Раньше гость видел только, что мяч
+      // резко меняет направление, без искр и «удара». Ставим искры у мяча
+      // (координаты близки к точке контакта: snapshot приходит сразу
+      // после соударения), вспышку и сквош — на стороне того, кто ударил.
+      // lastHitSide — post-mirror: у хоста lh===1 → у гостя это p2 (справа).
+      const hitterSide = s.lh === 1 ? 2 : (s.lh === 2 ? 1 : 0);
+      hitFlash = 1;
+      squash.ball = Math.max(squash.ball, 0.11);
+      spawnParticles(ball.x, ball.y, 8, "rgba(255,255,255,0.95)", 220);
+      if(hitterSide === 1)      squash.p1 = Math.max(squash.p1, 0.14);
+      else if(hitterSide === 2) squash.p2 = Math.max(squash.p2, 0.14);
+      sfx.hit();
+      lastHitSide = hitterSide;
+      rallyHits = incomingRh;
+      if(rallyHits > 0 && rallyHits % 5 === 0){
+        showBig("x" + rallyHits, "#ffd34a", 0.6, 52);
       }
     }
     prevSnapRallyHits = incomingRh;
@@ -1911,8 +1971,21 @@ const Game = (function(){
         void pulseEl.offsetWidth;
         pulseEl.classList.add("pulse");
       }
-      // Очко гостя = рост score1 (его собственной половины в зеркалке).
-      if(score1 > wasP1) Wallet.award("round.win", 5);
+      // Фидбек на очко у гостя: хост показывает showBig+sfx+particles в
+      // awardPoint, но гость проходит через applySnapshot и раньше видел
+      // только смену цифры в HUD — без «ОЧКО!/ПРОПУСК», без звука, без
+      // искр. Это ломало ощущение матча: казалось, что очки «случаются
+      // в тишине». Цвет/вдохновение копируем из awardPoint.
+      if(score1 > wasP1){
+        showBig(I18n.t("game.point"), "#23a55a", 0.9, 96);
+        sfx.point();
+        spawnParticles(ball.x, GROUND_Y - 2, 22, "rgba(35,165,90,1)", 260);
+        Wallet.award("round.win", 5);
+      } else if(score2 > wasP2){
+        showBig(I18n.t("game.miss"), "#f23f42", 0.9, 80);
+        sfx.lose();
+        spawnParticles(ball.x, GROUND_Y - 2, 22, "rgba(242,63,66,1)", 260);
+      }
     }
     if(s.mo && !state.matchOver){
       // winnerSide тоже зеркалим: если хост выиграл (s.w===1),
@@ -2699,7 +2772,14 @@ const Game = (function(){
     return entry.frames[idx] || null;
   }
 
+  // Фолбэк-юзер для рендера, когда state.opponent/state.user временно
+  // null — например, peer_left мидматч после forfeit: оппонент чистится,
+  // но render продолжается до unmount overlay'ем. Без фолбэка drawPlayer
+  // кидал TypeError по .avatar_url на каждый кадр, забивая консоль и сжирая
+  // CPU перехватами ошибок на слабых устройствах.
+  const FALLBACK_USER = { color: "#5865f2", global_name: "?", avatar_url: null };
   function getAvatarCanvas(user, size){
+    if(!user) user = FALLBACK_USER;
     const safeUrl = Auth.sanitizeAvatarUrl(user.avatar_url);
     const key = (safeUrl || user.color || "?") + "|" + (user.global_name||user.username||"?") + "|" + size;
     const hit = avatarCacheGet(key);
