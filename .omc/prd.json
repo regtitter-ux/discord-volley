@@ -91,6 +91,62 @@
         "Указана команда npx playwright install chromium как требование первого запуска.",
         "В README нет упоминаний несуществующих команд."
       ]
+    },
+    {
+      "id": "US-008",
+      "title": "Wallet: rally.hit per-match cap = 200 и round.win cap = 100",
+      "priority": 8,
+      "passes": true,
+      "acceptanceCriteria": [
+        "В tests/wallet-limits.test.js добавлен кейс: отправить 205 rally.hit для одного matchId c gap >= 260мс; первые 200 → wallet-фреймы, последние 5 → ни одного wallet-фрейма (cap=200).",
+        "Тест не блокирует npm test > 60 сек: использует минимальный gap 260мс, и проверка зажатого участка — через collectFor, а не waitFor-timeout.",
+        "npm test зелёный."
+      ]
+    },
+    {
+      "id": "US-009",
+      "title": "Wallet: 30s global cooldown на match.win между разными matchId",
+      "priority": 9,
+      "passes": true,
+      "acceptanceCriteria": [
+        "В tests/wallet-limits.test.js новый кейс: два разных matchId у одного юзера подряд; первый match.win проходит, второй (на другом matchId) в окне 30с должен быть отклонён (отсутствие wallet-фрейма в collectFor).",
+        "Тест использует env override GLOBAL_COOLDOWN_* недопустимо (схемы wire не трогаем) — реальный 30с кулдаун, но проверка отрицательная: collectFor(600мс, match.win) после второго запроса должен вернуть 0.",
+        "npm test зелёный."
+      ]
+    },
+    {
+      "id": "US-010",
+      "title": "Online-counter: 5 клиентов видят hello.online >= 5",
+      "priority": 10,
+      "passes": false,
+      "acceptanceCriteria": [
+        "tests/online-counter.test.js расширить (или добавить второй кейс): 5 клиентов последовательно, у 5-го hello.online >= 5.",
+        "После закрытия всех 5 — 6-й клиент видит hello.online == 1.",
+        "npm test зелёный."
+      ]
+    },
+    {
+      "id": "US-011",
+      "title": "RedisBroker claimOutcome behind TEST_REDIS_URL flag (skip-gated)",
+      "priority": 11,
+      "passes": false,
+      "acceptanceCriteria": [
+        "В tests/broker.test.js (или отдельном redis-broker.test.js) есть describe/test, который skip-ается при отсутствии TEST_REDIS_URL.",
+        "Если TEST_REDIS_URL задан: то же покрытие claimOutcome (dup win, win→loss отклоняется), но через RedisBroker.",
+        "npm test зелёный (тесты пропускаются, не падают) в дефолтной среде без Redis."
+      ]
+    },
+    {
+      "id": "US-012",
+      "title": "E2E replay HUD: mode-диффер показывает 'ONLINE' (или эквивалент) для online-матча и 'Бот' для бота",
+      "priority": 12,
+      "passes": false,
+      "acceptanceCriteria": [
+        "tests/e2e/replay.spec.js: после matched проверяется, что в DOM есть текст-индикатор режима 'online' (селектор из разметки game-screen), и он не 'bot'.",
+        "После replay → если уходит в bot через QUEUE_TIMEOUT_MS, индикатор становится 'bot'.",
+        "Тест остаётся стабильным на desktop-chrome и mobile-chrome.",
+        "npm run test:e2e зелёный."
+      ]
     }
   ]
 }

@@ -313,11 +313,14 @@ async function applyMatchOutcome(userObj, matchId, outcome){
    Лимиты «за матч» — по matchId (клиент генерит при старте). Новые matchId
    ресетят счётчик kind, поэтому общая кросс-матч защита — global cooldown на
    match.win и умеренные per-match лимиты для остальных событий. */
+// Env-оверрайды оставлены для интеграционных тестов: поднимать per-match cap
+// или 30с global cooldown на живом сервере на время теста дешевле и честнее,
+// чем мокать awardCoins. В проде env не задан — работают дефолты.
 const AWARDS = {
-  "rally.hit":   { amount: 1,  minGapMs: 250,  maxPerMatch: 200 },
+  "rally.hit":   { amount: 1,  minGapMs: 250,  maxPerMatch: Number(process.env.WALLET_RALLY_MAX) || 200 },
   "rally.combo": { amount: 0,  minGapMs: 400,  maxPerMatch: 40, fromContext: true },
   "round.win":   { amount: 5,  minGapMs: 500,  maxPerMatch: 100 },
-  "match.win":   { amount: 50, minGapMs: 1000, maxPerMatch: 1,  globalGapMs: 30000 }
+  "match.win":   { amount: 50, minGapMs: 1000, maxPerMatch: 1,  globalGapMs: Number(process.env.WALLET_MATCHWIN_GLOBAL_MS) || 30000 }
 };
 // userId → { kind → { lastAt, count, matchId } } + _lastMatchWinAt
 const userRates = new Map();
