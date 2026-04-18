@@ -1063,7 +1063,12 @@ const Game = (function(){
   const JUMP_BUFFER = 0.12; // jump press remembered this long before landing
   const STUCK_SPEED  = 55;
   const STUCK_TIME   = 2.8;
-  const STEP = 1/120;
+  // На desktop крутим физику на 120 Гц (гладко на 120/144 Гц мониторах).
+  // На тач-устройствах — 60 Гц: рендер-интерполяция между prev/curr всё равно
+  // сглаживает движение, а мобильный CPU перестаёт тратить по 2 шага физики
+  // на каждый кадр. Типовой бюджет кадра 16.67 мс, двойной step — это
+  // удвоенная коллизия+AI+трейл, чего мидрейндж-телефон не вывозит.
+  const STEP = (document.body && document.body.classList.contains("is-touch")) ? 1/60 : 1/120;
 
   // Round state
   let rafId = 0, acc = 0, last = 0;
@@ -1217,7 +1222,11 @@ const Game = (function(){
   function buildSparkles(){
     const arr = [];
     const rng = (n)=> ((Math.sin(n*91.123)*54321.987) % 1 + 1) % 1;
-    for(let i=0;i<40;i++){
+    // Тач-устройства: каждый спаркл — arc+fill с sin() в кадре. 40 штук × 60fps
+    // × живой canvas под градиентами ощутимо давит на iGPU. Сокращаем до 15 —
+    // визуально почти незаметно на фоне облаков/панелей, перф ощутимо легче.
+    const count = (document.body && document.body.classList.contains("is-touch")) ? 15 : 40;
+    for(let i=0;i<count;i++){
       arr.push({
         x:     rng(i+2)  * WORLD_W,
         y:     rng(i+19) * (GROUND_Y - 30),
@@ -1890,9 +1899,16 @@ const Game = (function(){
     ctx.fillStyle = skyGrad();
     ctx.fillRect(0,0,WORLD_W,WORLD_H);
 
-    drawBackdropGlow();
-    drawChannelGrid();
-    drawBackPanels();
+    // На тач-устройствах три фоновых слоя пропускаем: drawBackdropGlow —
+    // 2 полноэкранных альфа-градиента за кадр (fill-rate на мобилках кусается),
+    // drawBackPanels — десятки roundRect+fillRect поверх канваса, а
+    // drawChannelGrid — ещё и полноэкранный sidebarGrad сверху. Небо + облака
+    // + net halo достаточно, чтобы сцена не смотрелась голой.
+    if(!isTouch){
+      drawBackdropGlow();
+      drawChannelGrid();
+      drawBackPanels();
+    }
     drawSparkles();
     drawClouds();
     drawNetHalo();
