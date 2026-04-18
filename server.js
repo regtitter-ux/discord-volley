@@ -643,10 +643,21 @@ wss.on("connection", async (ws, req) => {
   send(ws, { type: "hello", user: safeUser(user), online: _lastStatsTotal, coins: userCoins(user.id), trophies: userTrophies(user.id) });
   scheduleStatsBroadcast();
 
-  ws.on("message", async (raw) => {
+  ws.on("message", async (raw, isBinary) => {
     if (!takeToken(ws)) return;
     // Сверхгабаритные фреймы отрезаем по сырому размеру ещё до JSON.parse.
     if (raw && raw.length > 8192) return;
+    // Бинарный горячий путь — relay без JSON.parse/JSON.stringify.
+    // Клиент шлёт снапшоты/инпут/эмоции как бинарные WS-фреймы (см. Codec
+    // в game.js); сервер forward'ит байты как есть всем в комнате через
+    // broker.publishRoom. При 10k матчей × 30 Гц это снимает ~300k JSON-
+    // циклов в секунду с главного event loop'а.
+    if (isBinary) {
+      if (!ws.roomId) return;
+      if (!raw || raw.length < 2 || raw.length > 256) return;
+      broker.publishRoom(ws.roomId, ws.wsId, raw);
+      return;
+    }
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
     if (!msg || typeof msg.type !== "string") return;

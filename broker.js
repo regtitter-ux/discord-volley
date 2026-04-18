@@ -213,9 +213,14 @@ class RedisBroker {
     if (!s){
       s = new Set();
       this.localRooms.set(roomId, s);
-      // Первый локальный клиент в комнате → подписка на канал.
-      const chan = this.ROOM_PREFIX + roomId;
-      await this.sub.subscribe(chan, (raw) => this._onRoomFrame(roomId, raw));
+      // Первый локальный клиент → две подписки: текстовая (peer_left и пр.)
+      // и бинарная (снапшоты/инпут/эмоции). Разведены, чтобы бинарный канал
+      // мог жить в bufferMode, а текстовый оставался обычной строкой — без
+      // лишних Buffer→string конверсий на каждом кадре.
+      const chanT = this.ROOM_PREFIX + "t:" + roomId;
+      const chanB = this.ROOM_PREFIX + "b:" + roomId;
+      await this.sub.subscribe(chanT, (raw) => this._onRoomFrame(roomId, raw, false));
+      await this.sub.subscribe(chanB, (raw) => this._onRoomFrame(roomId, raw, true), true);
     }
     s.add(c.wsId);
   }
@@ -225,20 +230,32 @@ class RedisBroker {
     s.delete(c.wsId);
     if (s.size === 0){
       this.localRooms.delete(roomId);
-      const chan = this.ROOM_PREFIX + roomId;
-      try { await this.sub.unsubscribe(chan); } catch {}
+      const chanT = this.ROOM_PREFIX + "t:" + roomId;
+      const chanB = this.ROOM_PREFIX + "b:" + roomId;
+      try { await this.sub.unsubscribe(chanT); } catch {}
+      try { await this.sub.unsubscribe(chanB); } catch {}
     }
   }
 
-  _onRoomFrame(roomId, raw){
-    // Формат: первые 11 символов = senderWsId (10 hex + ":"), дальше готовый
-    // фрейм для отправки. Сделано, чтобы не парсить JSON на каждой доставке.
-    const sep = raw.indexOf(":");
-    if (sep < 0) return;
-    const senderId = raw.slice(0, sep);
-    const frame = raw.slice(sep + 1);
+  _onRoomFrame(roomId, raw, isBinary){
+    // Формат для обеих веток: первые 10 ASCII hex = senderWsId, затем ":",
+    // дальше готовый фрейм для доставки (string либо Buffer). Это позволяет
+    // не парсить содержимое при каждой доставке — мы знаем только
+    // отправителя, чтобы не отправить ему эхо обратно.
     const s = this.localRooms.get(roomId);
     if (!s) return;
+    let senderId, frame;
+    if (isBinary){
+      // raw — Buffer. Заголовок ровно 11 байт (10 hex + ':').
+      if (raw.length < 11) return;
+      senderId = raw.slice(0, 10).toString("ascii");
+      frame = raw.slice(11);
+    } else {
+      const sep = raw.indexOf(":");
+      if (sep < 0) return;
+      senderId = raw.slice(0, sep);
+      frame = raw.slice(sep + 1);
+    }
     for (const wsId of s){
       if (wsId === senderId) continue;
       const c = this.clients.get(wsId);
@@ -247,9 +264,17 @@ class RedisBroker {
   }
 
   publishRoom(roomId, senderId, frame){
-    const chan = this.ROOM_PREFIX + roomId;
     // fire-and-forget — промахи по доставке не переспрашиваем (снапшоты 30Гц).
-    this.pub.publish(chan, senderId + ":" + frame).catch(() => {});
+    // String → текстовый канал, Buffer → бинарный. Без JSON-слоя на горячем пути.
+    if (typeof frame === "string"){
+      const chan = this.ROOM_PREFIX + "t:" + roomId;
+      this.pub.publish(chan, senderId + ":" + frame).catch(() => {});
+    } else {
+      const chan = this.ROOM_PREFIX + "b:" + roomId;
+      const header = Buffer.from(senderId + ":", "ascii");
+      const body = Buffer.isBuffer(frame) ? frame : Buffer.from(frame.buffer || frame);
+      this.pub.publish(chan, Buffer.concat([header, body])).catch(() => {});
+    }
   }
 
   onPairFromPeer(cb){ this._onPair = cb; }

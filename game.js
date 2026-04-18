@@ -558,6 +558,10 @@ function openSocket(){
     let ws;
     try { ws = new WebSocket(proto + "//" + location.host + "/ws"); }
     catch(_){ resolve(null); return; }
+    // Для бинарных relay-фреймов (снапшоты/инпут/эмоции) нужен ArrayBuffer
+    // в ev.data — по умолчанию браузер отдаёт Blob, что заставило бы делать
+    // асинхронный arrayBuffer() на каждом кадре.
+    ws.binaryType = "arraybuffer";
     let settled = false;
     const done = (val) => { if(!settled){ settled = true; resolve(val); } };
     ws.addEventListener("open",  ()=> done(ws));
@@ -568,8 +572,113 @@ function openSocket(){
   });
 }
 
+/* ---------- Relay binary codec ----------
+   Горячий путь relay свёрнут в бинарные WS-фреймы: сервер их не парсит и
+   не стрингифит, просто форвардит через broker.publishRoom. В покое
+   снимает ~60% CPU у сервера при 30 Гц × 10k матчей (JSON.parse +
+   re-stringify там главные едоки).
+
+   Формат: byte 0 = opcode, дальше payload.
+     0x01 input  — 2 байта. [1] = биты 0/1/2 = left/right/jump.
+     0x02 state  — 61 байт. 13× f32 физики + 3× i16 (s1,s2,rh) +
+                   2 flags-байта. ~4× компактнее JSON и без парсинга.
+     0x03 emote  — 2 байта. [1] = id эмоции как uint8 (1..26).
+   Все числа — little-endian. */
+const Codec = (function(){
+  const LE = true;
+  function encodeInput(left, right, jump){
+    const u = new Uint8Array(2);
+    u[0] = 0x01;
+    u[1] = (left?1:0) | (right?2:0) | (jump?4:0);
+    return u;
+  }
+  function encodeState(p1, p2, ball, s1, s2, rh, mo, ro, ss, w, lh){
+    const buf = new ArrayBuffer(61);
+    const dv  = new DataView(buf);
+    dv.setUint8(0, 0x02);
+    let o = 1;
+    dv.setFloat32(o, p1.x,  LE); o+=4;
+    dv.setFloat32(o, p1.y,  LE); o+=4;
+    dv.setFloat32(o, p1.vx, LE); o+=4;
+    dv.setFloat32(o, p1.vy, LE); o+=4;
+    dv.setFloat32(o, p2.x,  LE); o+=4;
+    dv.setFloat32(o, p2.y,  LE); o+=4;
+    dv.setFloat32(o, p2.vx, LE); o+=4;
+    dv.setFloat32(o, p2.vy, LE); o+=4;
+    dv.setFloat32(o, ball.x,     LE); o+=4;
+    dv.setFloat32(o, ball.y,     LE); o+=4;
+    dv.setFloat32(o, ball.vx,    LE); o+=4;
+    dv.setFloat32(o, ball.vy,    LE); o+=4;
+    dv.setFloat32(o, ball.angle, LE); o+=4;
+    dv.setInt16(o, s1|0, LE); o+=2;
+    dv.setInt16(o, s2|0, LE); o+=2;
+    dv.setInt16(o, rh|0, LE); o+=2;
+    // ss у нас всегда +1 или -1 (кто подаёт) — хватит одного бита.
+    // w может быть null/1/2, lh — 0/1/2. По 2 бита каждому в отдельном байте.
+    const flags = (p1.onGround?1:0) | (p2.onGround?2:0) | (mo?4:0) | (ro?8:0) | (ss > 0 ? 16:0);
+    dv.setUint8(59, flags);
+    const wCode  = (w === 1) ? 1 : (w === 2 ? 2 : 0);
+    const lhCode = (lh === 1) ? 1 : (lh === 2 ? 2 : 0);
+    dv.setUint8(60, (lhCode & 0x0F) | ((wCode & 0x0F) << 4));
+    return new Uint8Array(buf);
+  }
+  function encodeEmote(id){
+    const n = parseInt(id, 10) | 0;
+    if (n < 1 || n > 255) return null;
+    const u = new Uint8Array(2);
+    u[0] = 0x03;
+    u[1] = n;
+    return u;
+  }
+  function decode(buf){
+    // buf — ArrayBuffer из WebSocket с binaryType="arraybuffer".
+    const u = new Uint8Array(buf);
+    if (u.length < 1) return null;
+    const op = u[0];
+    if (op === 0x01 && u.length >= 2){
+      const f = u[1];
+      return { kind:"input", left:!!(f&1), right:!!(f&2), jump:!!(f&4) };
+    }
+    if (op === 0x02 && u.length >= 61){
+      const dv = new DataView(buf);
+      let o = 1;
+      const p1 = { x:dv.getFloat32(o,LE), y:dv.getFloat32(o+4,LE), vx:dv.getFloat32(o+8,LE), vy:dv.getFloat32(o+12,LE) }; o+=16;
+      const p2 = { x:dv.getFloat32(o,LE), y:dv.getFloat32(o+4,LE), vx:dv.getFloat32(o+8,LE), vy:dv.getFloat32(o+12,LE) }; o+=16;
+      const b  = { x:dv.getFloat32(o,LE), y:dv.getFloat32(o+4,LE), vx:dv.getFloat32(o+8,LE), vy:dv.getFloat32(o+12,LE), a:dv.getFloat32(o+16,LE) }; o+=20;
+      const s1 = dv.getInt16(o, LE); o+=2;
+      const s2 = dv.getInt16(o, LE); o+=2;
+      const rh = dv.getInt16(o, LE); o+=2;
+      const f  = dv.getUint8(59);
+      const lhw = dv.getUint8(60);
+      p1.g = (f & 1) ? 1 : 0;
+      p2.g = (f & 2) ? 1 : 0;
+      const mo = (f & 4) ? 1 : 0;
+      const ro = (f & 8) ? 1 : 0;
+      const ss = (f & 16) ? 1 : -1;
+      const wCode  = (lhw >> 4) & 0x0F;
+      const lhCode = lhw & 0x0F;
+      const w  = wCode === 0 ? null : wCode;
+      const lh = lhCode;
+      return { kind:"state", p1, p2, b, s1, s2, rh, mo, ro, ss, w, lh };
+    }
+    if (op === 0x03 && u.length >= 2){
+      return { kind:"emote", id: String(u[1]).padStart(2, "0") };
+    }
+    return null;
+  }
+  return { encodeInput, encodeState, encodeEmote, decode };
+})();
+
 function attachSocketHandlers(ws){
   ws.addEventListener("message", (ev)=>{
+    // Бинарные фреймы — это всегда relay-payload от соперника (снапшот,
+    // инпут, эмоция); сервер их не оборачивает, так что идём в Codec и
+    // сразу в onPeerPayload. Всё остальное — текстовый JSON-контроль.
+    if(typeof ev.data !== "string"){
+      const p = Codec.decode(ev.data);
+      if(p) onPeerPayload(p);
+      return;
+    }
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
     if(!msg || typeof msg.type !== "string") return;
@@ -925,10 +1034,7 @@ function relayInputIfGuest(){
     // На гостe картинка зеркалирована: он видит себя слева, но в мировых
     // координатах хоста он — правый игрок. Левая стрелка гостя = движение p2
     // вправо у хоста, поэтому при отправке меняем left↔right.
-    state.ws.send(JSON.stringify({
-      type: "relay",
-      payload: { kind:"input", left: keys.right, right: keys.left, jump: keys.jump }
-    }));
+    state.ws.send(Codec.encodeInput(keys.right, keys.left, keys.jump));
   } catch(_){}
 }
 setInterval(relayInputIfGuest, 33);
@@ -1022,9 +1128,8 @@ document.getElementById("reactions").addEventListener("click", (ev)=>{
   Game.triggerEmote(1, btn.dataset.emoteId);
   // Онлайн: пробрасываем эмоцию сопернику через relay.
   if(state.ws && state.ws.readyState === 1 && state.mode !== "bot"){
-    try {
-      state.ws.send(JSON.stringify({ type:"relay", payload:{ kind:"emote", id: btn.dataset.emoteId } }));
-    } catch(_){}
+    const enc = Codec.encodeEmote(btn.dataset.emoteId);
+    if(enc){ try { state.ws.send(enc); } catch(_){} }
   }
   // Снимаем фокус: иначе при клике мышью фокус остаётся на кнопке, и
   // следующие нажатия клавиш (пробел/Enter) ре-триггерят её, а браузер
@@ -1558,22 +1663,16 @@ const Game = (function(){
     const ws = state.ws;
     if(!ws || ws.readyState !== 1) return;
     try {
-      ws.send(JSON.stringify({
-        type: "relay",
-        payload: {
-          kind: "state",
-          p1: { x:p1.x, y:p1.y, vx:p1.vx, vy:p1.vy, g:p1.onGround?1:0 },
-          p2: { x:p2.x, y:p2.y, vx:p2.vx, vy:p2.vy, g:p2.onGround?1:0 },
-          b:  { x:ball.x, y:ball.y, vx:ball.vx, vy:ball.vy, a:ball.angle },
-          s1: score1, s2: score2,
-          mo: state.matchOver ? 1 : 0,
-          w:  lastWinnerSide,
-          ss: servingSide,
-          ro: roundOver ? 1 : 0,
-          rh: rallyHits,
-          lh: lastHitSide
-        }
-      }));
+      const u = Codec.encodeState(
+        p1, p2, ball,
+        score1, score2, rallyHits,
+        state.matchOver ? 1 : 0,
+        roundOver ? 1 : 0,
+        servingSide,
+        lastWinnerSide,
+        lastHitSide
+      );
+      ws.send(u);
     } catch(_){}
   }
 
