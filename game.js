@@ -1343,6 +1343,14 @@ const Game = (function(){
   // alpha последнего render() — нужен drawTrail, чтобы «хвост» смещался
   // синхронно с телом мяча (иначе между физ-тиками точки трейла отстают).
   let renderAlpha = 1;
+  // Адаптивное качество. На слабом десктопе (isTouch=false, но FPS < 50)
+  // исходный тяжёлый набор фоновых слоёв (backdrop glow + channel grid +
+  // back panels) съедает бюджет кадра. Измеряем усреднённое время кадра
+  // и, если стабильно ниже порога, отключаем эти слои на остаток сессии.
+  // Один раз вниз — без гистерезиса наверх, чтобы не мигало.
+  let frameTimeAvg = 16;
+  let slowFrames = 0;
+  let lowQuality = false;
   let bigText = null;                    // { text, t, dur, color, size }
   // Активные «эмоции» над игроками. Каждая: { emoji, t, dur, side }.
   // side: 1 — игрок (левый), 2 — соперник (правый).
@@ -2179,12 +2187,13 @@ const Game = (function(){
     ctx.fillStyle = skyGrad();
     ctx.fillRect(0,0,WORLD_W,WORLD_H);
 
-    // На тач-устройствах три фоновых слоя пропускаем: drawBackdropGlow —
-    // 2 полноэкранных альфа-градиента за кадр (fill-rate на мобилках кусается),
-    // drawBackPanels — десятки roundRect+fillRect поверх канваса, а
-    // drawChannelGrid — ещё и полноэкранный sidebarGrad сверху. Небо + облака
-    // + net halo достаточно, чтобы сцена не смотрелась голой.
-    if(!isTouch){
+    // На тач-устройствах и на замеренно-слабых десктопах три фоновых слоя
+    // пропускаем: drawBackdropGlow — 2 полноэкранных альфа-градиента за кадр
+    // (fill-rate на мобилках и слабых GPU кусается), drawBackPanels —
+    // десятки roundRect+fillRect поверх канваса, а drawChannelGrid — ещё и
+    // полноэкранный sidebarGrad сверху. Небо + облака + net halo достаточно,
+    // чтобы сцена не смотрелась голой.
+    if(!isTouch && !lowQuality){
       drawBackdropGlow();
       drawChannelGrid();
       drawBackPanels();
@@ -2649,17 +2658,45 @@ const Game = (function(){
   // Кеш атласов украшений: один Image на URL, переиспользуется между
   // игроками, матчами и ре-рендерами. Пустой src никогда не кешируем —
   // такая запись может блокировать будущие попытки.
+  // После загрузки атлас разрезается на массив offscreen-канвасов по кадрам:
+  // render рисует готовый кадр одним drawImage без аргументов-кропа, что на
+  // слабых GPU дешевле, чем сэмплить из большой текстуры с sx/sy/sw/sh каждый
+  // кадр на каждого игрока.
   const decoAtlasCache = new Map();
   function getDecoAtlas(url){
     if(!url) return null;
-    let img = decoAtlasCache.get(url);
-    if(!img){
-      img = new Image();
+    let entry = decoAtlasCache.get(url);
+    if(!entry){
+      const img = new Image();
       img.decoding = "async";
+      entry = { img, frames: null };
       img.src = url;
-      decoAtlasCache.set(url, img);
+      decoAtlasCache.set(url, entry);
     }
-    return img;
+    return entry;
+  }
+  function getDecoFrameCanvas(entry, cols, rows, frames, idx){
+    if(!entry || !entry.img || !entry.img.complete || !entry.img.naturalWidth) return null;
+    if(!entry.frames || entry.frames.length !== frames
+       || entry._cols !== cols || entry._rows !== rows){
+      const fw = entry.img.naturalWidth  / cols;
+      const fh = entry.img.naturalHeight / rows;
+      const arr = new Array(frames);
+      for(let i = 0; i < frames; i++){
+        const c = document.createElement("canvas");
+        c.width = Math.max(1, Math.floor(fw));
+        c.height = Math.max(1, Math.floor(fh));
+        const g = c.getContext("2d");
+        const col = i % cols;
+        const row = (i / cols) | 0;
+        try{ g.drawImage(entry.img, col*fw, row*fh, fw, fh, 0, 0, c.width, c.height); }
+        catch(_){ return null; }
+        arr[i] = c;
+      }
+      entry.frames = arr;
+      entry._cols = cols; entry._rows = rows;
+    }
+    return entry.frames[idx] || null;
   }
 
   function getAvatarCanvas(user, size){
@@ -2735,27 +2772,22 @@ const Game = (function(){
     ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI*2);
     ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 4; ctx.stroke();
 
-    // Украшение: вырезаем нужный кадр из атласа (cols×rows сетка) и
-    // рисуем поверх аватара. Размер — тот же «inset:-18%», что и в DOM
-    // (avatar ×1.36). Без clip — нимб/звёзды должны выходить за рамку.
+    // Украшение: берём заранее нарезанный кадр из атласа и рисуем поверх
+    // аватара. Размер — тот же «inset:-18%», что и в DOM (avatar ×1.36).
+    // Без clip — нимб/звёзды должны выходить за рамку.
     const deco = user && user.decoration;
     if(deco && deco.atlas && (deco.frames|0) > 0 && (deco.cols|0) > 0 && (deco.rows|0) > 0){
-      const img = getDecoAtlas(deco.atlas);
-      if(img && img.complete && img.naturalWidth > 0){
-        const fps    = Math.max(1, deco.fps|0);
-        const frames = deco.frames|0;
-        const cols   = deco.cols|0;
-        const rows   = deco.rows|0;
-        const idx    = Math.floor(performance.now() * fps / 1000) % frames;
-        const col    = idx % cols;
-        const row    = (idx / cols) | 0;
-        const fw     = img.naturalWidth  / cols;
-        const fh     = img.naturalHeight / rows;
-        const dSize  = size * 1.36;
+      const entry = getDecoAtlas(deco.atlas);
+      const fps    = Math.max(1, deco.fps|0);
+      const frames = deco.frames|0;
+      const cols   = deco.cols|0;
+      const rows   = deco.rows|0;
+      const idx    = Math.floor(performance.now() * fps / 1000) % frames;
+      const frame  = getDecoFrameCanvas(entry, cols, rows, frames, idx);
+      if(frame){
+        const dSize = size * 1.36;
         try {
-          ctx.drawImage(img,
-            col*fw, row*fh, fw, fh,
-            -dSize/2, -dSize/2, dSize, dSize);
+          ctx.drawImage(frame, -dSize/2, -dSize/2, dSize, dSize);
         } catch(_){}
       }
     }
@@ -2827,6 +2859,20 @@ const Game = (function(){
     // а не «дёргались».
     const alpha = Math.min(1, Math.max(0, acc / STEP));
     render(alpha);
+    // Адаптивное качество: считаем EWMA времени кадра. Порог 22 мс ≈ 45 FPS
+    // — ниже этого на десктопе включаем lowQuality и скидываем тяжёлые
+    // фоновые слои. Нужно подряд несколько «плохих» кадров, чтобы не
+    // реагировать на разовый GC-пик.
+    if(!lowQuality && !isTouch){
+      const ft = dt * 1000;
+      frameTimeAvg = frameTimeAvg * 0.9 + ft * 0.1;
+      if(frameTimeAvg > 22){
+        slowFrames++;
+        if(slowFrames > 60) lowQuality = true;
+      } else {
+        slowFrames = Math.max(0, slowFrames - 1);
+      }
+    }
   }
 
   // Перерисовать тексты overlay после смены языка. Ничего не делает,
