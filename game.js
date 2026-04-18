@@ -1084,7 +1084,6 @@ const Game = (function(){
   let snapAcc = 0;
   const SNAP_STEP = 1/30;
   let hitFlash = 0;
-  let prevJump1 = false;
   let jumpBufferT = 0;
   let stuckT = 0;
 
@@ -1294,7 +1293,6 @@ const Game = (function(){
     lastWinnerSide = 0;
     servingSide = 1;
     roundOver = false;
-    prevJump1 = false;
     jumpBufferT = 0;
     stuckT = 0;
     rallyHits = 0;
@@ -1695,10 +1693,11 @@ const Game = (function(){
     if(right) ax += 1;
     p.vx = ax * MOVE;
 
-    // Edge detect: fresh press fills the buffer; otherwise decay it
-    if(jumpHeld && !prevJump1) jumpBufferT = JUMP_BUFFER;
-    else                       jumpBufferT = Math.max(0, jumpBufferT - dt);
-    prevJump1 = jumpHeld;
+    // Autohop: пока W зажата — буфер постоянно полон, и как только игрок
+    // касается земли, он тут же прыгает снова. Отпустил — буфер распадается
+    // за JUMP_BUFFER секунд (это и есть grace-period для pre-land пресса).
+    if(jumpHeld) jumpBufferT = JUMP_BUFFER;
+    else         jumpBufferT = Math.max(0, jumpBufferT - dt);
 
     if(p.onGround) p.coyoteT = COYOTE;
     else           p.coyoteT = Math.max(0, p.coyoteT - dt);
