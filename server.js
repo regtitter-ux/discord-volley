@@ -457,7 +457,7 @@ const QUEUE_TIMEOUT_MS = Number(process.env.QUEUE_TIMEOUT_MS) || 30000;
 // Под Redis-брокером счётчик онлайна общий; пульс публикуется каждым
 // инстансом в дружественный dv:stats канал, и каждый локально фанаутит
 // в свои wss.clients. В local-режиме работает идентично.
-const STATS_INTERVAL_MS = 2000;
+const STATS_INTERVAL_MS = Number(process.env.STATS_INTERVAL_MS) || 2000;
 let _statsTimer   = null;
 let _statsPending = false;
 let _lastStatsTotal = 0;

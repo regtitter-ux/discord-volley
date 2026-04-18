@@ -46,7 +46,7 @@
       "id": "US-004",
       "title": "Онлайн-счётчик корректно растёт/падает в рамках одного инстанса",
       "priority": 4,
-      "passes": false,
+      "passes": true,
       "acceptanceCriteria": [
         "Файл tests/online-counter.test.js подключает 3 клиента последовательно к уже запущенному серверу теста.",
         "Финальный принятый stats-фрейм (или hello.online) у 3-го клиента содержит online >= 3.",
