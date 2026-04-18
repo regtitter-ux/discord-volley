@@ -44,6 +44,20 @@
     // Для нормализации opponent-объектов этих полей нет — и это ок.
     if(typeof u.coins    === "number") out.coins    = u.coins | 0;
     if(typeof u.trophies === "number") out.trophies = u.trophies | 0;
+    // decoration — объект с параметрами атласа (atlas, frames, cols, rows,
+    // frameW, frameH, fps). Приходит с /api/me и с хеллоу в матче.
+    if(u.decoration && typeof u.decoration === "object" && typeof u.decoration.atlas === "string"){
+      out.decoration = {
+        id:     String(u.decoration.id || ""),
+        atlas:  u.decoration.atlas,
+        frames: u.decoration.frames | 0,
+        cols:   u.decoration.cols   | 0,
+        rows:   u.decoration.rows   | 0,
+        frameW: u.decoration.frameW | 0,
+        frameH: u.decoration.frameH | 0,
+        fps:    u.decoration.fps    | 0
+      };
+    }
     return out;
   }
 
@@ -85,9 +99,13 @@
   }
 
   // Отрисовка аватара: если есть URL — img, иначе цветной круг с первой буквой.
+  // Если у юзера задано decoration (объект { atlas, frameW, frameH, cols, rows,
+  // frames, fps }), добавляем сверху .avatar-deco слой — общий rAF-цикл в
+  // game.js (DecoAnim) листает кадры через background-position.
   function renderAvatarInto(el, user){
     el.innerHTML = "";
     el.style.background = "";
+    el.classList.remove("has-deco");
     const safeUrl = sanitizeAvatarUrl(user && user.avatar_url);
     if(safeUrl){
       const img = new Image();
@@ -96,15 +114,42 @@
       img.alt = "";
       img.referrerPolicy = "no-referrer";
       img.onerror = ()=>{
+        const hadDeco = el.classList.contains("has-deco");
         el.innerHTML = "";
         el.style.background = (user && user.color) || "#5865f2";
         el.textContent = ((user && (user.global_name || user.username)) || "?").charAt(0).toUpperCase();
+        if(hadDeco && user && user.decoration) attachDecoration(el, user.decoration);
       };
       img.src = safeUrl;
       el.appendChild(img);
     }else{
       el.style.background = (user && user.color) || "#5865f2";
       el.textContent = ((user && (user.global_name || user.username)) || "?").charAt(0).toUpperCase();
+    }
+    if(user && user.decoration) attachDecoration(el, user.decoration);
+  }
+
+  // Добавляет (или заменяет) .avatar-deco-слой внутри контейнера. Сам рендер
+  // анимации — централизованный rAF-цикл в game.js; этот модуль только
+  // выставляет CSS-переменные под атлас, ставит data-frames/fps и отдаёт
+  // узел на учёт тиккеру.
+  function attachDecoration(el, d){
+    if(!el || !d || !d.atlas) return;
+    el.classList.add("has-deco");
+    let layer = el.querySelector(".avatar-deco");
+    if(!layer){
+      layer = document.createElement("div");
+      layer.className = "avatar-deco";
+      el.appendChild(layer);
+    }
+    layer.style.setProperty("--deco-atlas",   `url("${d.atlas}")`);
+    layer.style.setProperty("--deco-bg-size", `${(d.cols|0)*100}% ${(d.rows|0)*100}%`);
+    layer.dataset.frames = String(d.frames|0);
+    layer.dataset.cols   = String(d.cols|0);
+    layer.dataset.rows   = String(d.rows|0);
+    layer.dataset.fps    = String(d.fps|0);
+    if(typeof window.DecoAnim === "object" && typeof window.DecoAnim.attach === "function"){
+      window.DecoAnim.attach(layer);
     }
   }
 
@@ -115,6 +160,7 @@
     makeBot,
     normalize,
     renderAvatarInto,
+    attachDecoration,
     sanitizeAvatarUrl
   };
 })(window);

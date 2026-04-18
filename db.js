@@ -42,6 +42,19 @@ function openDb(dataDir){
     CREATE INDEX IF NOT EXISTS idx_users_trophies ON users(trophies DESC, updated_at ASC);
   `);
 
+  // Миграция на лету: добавляем колонки под систему украшений на уже
+  // существующей базе. owned_decorations — csv из id'шек купленных украшений
+  // (id без запятых — ограничиваем серверным regex), selected_decoration —
+  // текущее выбранное либо NULL. SQLite ADD COLUMN безопасен и идемпотентен
+  // через проверку PRAGMA table_info.
+  {
+    const cols = db.prepare("PRAGMA table_info(users)").all().map(r => r.name);
+    if (!cols.includes("owned_decorations"))
+      db.exec("ALTER TABLE users ADD COLUMN owned_decorations TEXT NOT NULL DEFAULT ''");
+    if (!cols.includes("selected_decoration"))
+      db.exec("ALTER TABLE users ADD COLUMN selected_decoration TEXT");
+  }
+
   // Ленивая миграция с JSON. Запускаем только если таблица пуста — так
   // передеплои на уже мигрированной базе ничего не перезапишут.
   try {
@@ -129,6 +142,31 @@ function openDb(dataDir){
            OR (u2.trophies = u1.trophies AND u2.updated_at < u1.updated_at)
       ) AS rank
       FROM users u1 WHERE u1.id = ?
+    `),
+    getDecorations: db.prepare("SELECT owned_decorations, selected_decoration, coins FROM users WHERE id = ?"),
+    // Атомарная покупка: в одном UPDATE проверяем баланс и отсутствие
+    // дубликата в owned_decorations. Если changes = 0 — либо не хватило
+    // монет, либо уже куплено; вызывающий код интерпретирует оба случая
+    // по текущему состоянию. instr(',' || csv || ',', ',id,') = 0 —
+    // точное совпадение id без подстрок (поэтому в csv всегда обёрнуто
+    // в запятые на обоих концах).
+    buyDecoration: db.prepare(`
+      UPDATE users
+      SET coins = coins - ?2,
+          owned_decorations = CASE
+            WHEN owned_decorations = '' THEN ?3
+            ELSE owned_decorations || ',' || ?3
+          END,
+          updated_at = ?4
+      WHERE id = ?1
+        AND coins >= ?2
+        AND instr(',' || owned_decorations || ',', ',' || ?3 || ',') = 0
+    `),
+    setSelectedDecoration: db.prepare(`
+      UPDATE users
+      SET selected_decoration = ?2,
+          updated_at = ?3
+      WHERE id = ?1
     `)
   };
 
@@ -172,6 +210,33 @@ function openDb(dataDir){
     return getTrophies(user.id);
   }
 
+  function getDecorations(id){
+    const r = stmts.getDecorations.get(id);
+    if (!r) return { owned: [], selected: null, coins: 0 };
+    const csv = (r.owned_decorations || "").trim();
+    const owned = csv ? csv.split(",").filter(Boolean) : [];
+    return { owned, selected: r.selected_decoration || null, coins: r.coins | 0 };
+  }
+
+  function buyDecoration(user, decoId, price){
+    ensureUser(user);
+    const info = stmts.buyDecoration.run(user.id, price | 0, String(decoId), Date.now());
+    if (!info || !info.changes){
+      return { ok: false, ...getDecorations(user.id) };
+    }
+    return { ok: true, ...getDecorations(user.id) };
+  }
+
+  function setSelectedDecoration(user, decoId){
+    ensureUser(user);
+    const val = decoId == null ? null : String(decoId);
+    const state = getDecorations(user.id);
+    // Нельзя выбрать не купленное — серверный guard, клиенту верить нельзя.
+    if (val && !state.owned.includes(val)) return { ok: false, ...state };
+    stmts.setSelectedDecoration.run(user.id, val, Date.now());
+    return { ok: true, ...getDecorations(user.id) };
+  }
+
   function leaderboardPage(page, pageSize){
     const total = stmts.totalRanked.get().n | 0;
     const pages = Math.max(1, Math.ceil(total / pageSize));
@@ -206,6 +271,9 @@ function openDb(dataDir){
     getTrophies,
     addCoins,
     addTrophies,
+    getDecorations,
+    buyDecoration,
+    setSelectedDecoration,
     leaderboardPage,
     meRank
   };

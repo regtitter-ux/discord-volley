@@ -181,13 +181,15 @@ app.get("/api/me", (req, res) => {
   const u = getSession(req);
   if (!u) return res.status(401).json(null);
   res.setHeader("Cache-Control", "no-store");
+  const deco = DB.getDecorations(u.id);
   res.json({
     id:          u.id,
     username:    u.username,
     global_name: u.global_name,
     avatar_url:  u.avatar_url,
     coins:       userCoins(u.id),
-    trophies:    userTrophies(u.id)
+    trophies:    userTrophies(u.id),
+    decoration:  selectedDecorationPayload(deco.selected)
   });
 });
 
@@ -383,6 +385,95 @@ app.get("/api/stats", async (req, res) => {
   res.json({ online });
 });
 
+/* ---------- Decorations ----------
+   Каталог — статический сервер-авторитетный словарь: id, цена в монетах
+   и параметры атласа (размер кадра + сетка + длительность кадра). Клиент
+   использует их, чтобы проиграть анимацию через background-position без
+   догадок. Добавление нового украшения = строка сюда + спрайт-лист в
+   /assets/decorations/<id>/atlas.png. Цены и размеры никогда не приходят
+   с клиента. */
+const DECORATIONS = {
+  deco1: {
+    id:         "deco1",
+    price:      100,
+    atlas:      "/assets/decorations/deco1/atlas.png",
+    frames:     60,
+    fps:        12,
+    frameW:     96,
+    frameH:     96,
+    cols:       6,
+    rows:       10
+  }
+};
+const DECORATION_IDS = new Set(Object.keys(DECORATIONS));
+
+function decorationCatalogList(){
+  return Object.values(DECORATIONS).map(d => ({ ...d }));
+}
+
+// Клиент получает украшение вместе с /api/me и в WS hello — ему нужны
+// параметры атласа (frameW/cols/fps), чтобы отрисовать. Если выбранное
+// украшение было удалено из каталога (теоретический случай), возвращаем
+// null — клиент просто отрендерит голый аватар.
+function selectedDecorationPayload(id){
+  if (!id) return null;
+  const d = DECORATIONS[id];
+  return d ? { ...d } : null;
+}
+
+app.get("/api/decorations", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const u = getSession(req);
+  if (!u) return res.status(401).json({ error: "unauthorized" });
+  const s = DB.getDecorations(u.id);
+  res.json({
+    catalog:  decorationCatalogList(),
+    owned:    s.owned,
+    selected: s.selected,
+    coins:    s.coins
+  });
+});
+
+// Покупка — query-параметр, чтобы не тащить body-parser ради одной ручки.
+// Атомарный UPDATE в БД гарантирует, что даже при параллельных запросах
+// монеты снимутся ровно один раз; повторный POST с тем же id вернёт
+// already_owned (changes = 0 при instr-матче).
+app.post("/api/decorations/buy", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const u = getSession(req);
+  if (!u) return res.status(401).json({ error: "unauthorized" });
+  const id = String(req.query.id || "");
+  if (!DECORATION_IDS.has(id)) return res.status(400).json({ error: "unknown_decoration" });
+  const cur = DB.getDecorations(u.id);
+  if (cur.owned.includes(id)) return res.json({ ok: true, already_owned: true, ...cur });
+  const price = DECORATIONS[id].price | 0;
+  if ((cur.coins | 0) < price) return res.status(402).json({ error: "insufficient_coins", coins: cur.coins });
+  const r = DB.buyDecoration(u, id, price);
+  if (!r.ok) return res.status(409).json({ error: "buy_failed", coins: r.coins });
+  // Пушим обновлённый баланс через живой WS-коннект, если он есть —
+  // открытые в других вкладках меню сразу увидят новую сумму.
+  pushCoinsToUser(u.id, r.coins);
+  res.json({ ok: true, coins: r.coins, owned: r.owned, selected: r.selected });
+});
+
+app.post("/api/decorations/select", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const u = getSession(req);
+  if (!u) return res.status(401).json({ error: "unauthorized" });
+  const raw = req.query.id;
+  const id = (raw === "" || raw == null || raw === "null") ? null : String(raw);
+  if (id && !DECORATION_IDS.has(id)) return res.status(400).json({ error: "unknown_decoration" });
+  const r = DB.setSelectedDecoration(u, id);
+  if (!r.ok) return res.status(403).json({ error: "not_owned" });
+  res.json({
+    ok: true,
+    selected: r.selected,
+    decoration: selectedDecorationPayload(r.selected),
+    owned: r.owned,
+    coins: r.coins
+  });
+});
+
 /* ---------- Static frontend ---------- */
 
 function sendIndex(res){
@@ -467,6 +558,19 @@ let _lastStatsTotal = 0;
 function _doBroadcastStats(){
   const msg = JSON.stringify({ type: "stats", online: _lastStatsTotal });
   wss.clients.forEach(c => { if (c.readyState === 1) { try { c.send(msg); } catch {} } });
+}
+
+// Точечный пуш нового баланса монет всем живым WS-сессиям этого юзера на
+// текущем инстансе. Используется после HTTP-покупки украшения, чтобы
+// открытое меню в другой вкладке не показывало устаревший баланс до
+// следующего award'а.
+function pushCoinsToUser(userId, coins){
+  const msg = JSON.stringify({ type: "wallet", coins: coins | 0, delta: 0, kind: "deco.buy" });
+  wss.clients.forEach(c => {
+    if (c.readyState !== 1) return;
+    if (!c.user || c.user.id !== userId) return;
+    try { c.send(msg); } catch {}
+  });
 }
 function scheduleStatsBroadcast(){
   if (_statsTimer){ _statsPending = true; return; }

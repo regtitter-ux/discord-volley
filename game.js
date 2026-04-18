@@ -23,6 +23,53 @@ const Clock = {
   now(){ return performance.now() + this.offsetMs; }
 };
 
+/* ---------------- DecoAnim ----------------
+   Единый rAF-цикл, листающий кадры украшений через background-position.
+   Вместо N таймеров на каждый аватар — один тикер на все .avatar-deco
+   элементы. Когда узел удалён из DOM (el.isConnected === false) —
+   самоочищается. Тикер стартует по первой .attach() и засыпает после
+   удаления последнего слоя.
+
+   Почему background-position, а не canvas: атлас загружается браузером
+   раз, дальше — одна CSS-пропертя на кадр, без decode и без перерисовки
+   img. rAF в фоновой вкладке сам засыпает, так что пауза при скрытии
+   тоже бесплатна. */
+const DecoAnim = (function(){
+  const layers = new Set();
+  let running = false;
+  function attach(el){
+    if(!el) return;
+    layers.add(el);
+    if(!running){ running = true; requestAnimationFrame(tick); }
+  }
+  function detach(el){ layers.delete(el); }
+  function tick(){
+    if(layers.size === 0){ running = false; return; }
+    const t = performance.now();
+    for(const el of layers){
+      if(!el.isConnected){ layers.delete(el); continue; }
+      const frames = +(el.dataset.frames || 0);
+      const cols   = +(el.dataset.cols   || 1);
+      const rows   = +(el.dataset.rows   || 1);
+      const fps    = +(el.dataset.fps    || 12);
+      if(frames < 2 || fps < 1) continue;
+      const idx = Math.floor(t * fps / 1000) % frames;
+      const col = idx % cols;
+      const row = Math.floor(idx / cols);
+      // Когда атлас масштабирован до cols×rows размеров элемента,
+      // background-position в процентах — это доля «свободного хода»
+      // фона внутри контейнера. Для cols столбцов свободный ход по X
+      // делится на (cols-1) шагов.
+      const bx = cols > 1 ? (col * 100 / (cols - 1)) : 0;
+      const by = rows > 1 ? (row * 100 / (rows - 1)) : 0;
+      el.style.backgroundPosition = bx + "% " + by + "%";
+    }
+    requestAnimationFrame(tick);
+  }
+  return { attach, detach };
+})();
+window.DecoAnim = DecoAnim;
+
 /* ---------------- State ---------------- */
 const state = {
   user: null,
@@ -2784,6 +2831,203 @@ function makeAI(difficulty, rand){
     }
   };
 }
+
+/* ---------------- Decorations ----------------
+   UI для покупки и выбора украшений аватара. Каталог и состояние
+   (owned / selected / coins) берём из /api/decorations; покупка и выбор —
+   POST-ручки с query-параметром id. Сервер — единственный авторитет:
+   клиентская сумма монет никогда не передаётся, цену и валидность id
+   сервер проверяет сам.
+
+   Почему не рисуем каталог из захардкоженного списка: добавление нового
+   украшения должно сводиться к правке server.js (и файлы ассетов), без
+   обновления клиента. */
+const Decorations = (function(){
+  let catalog = null;
+  let owned = [];
+  let selected = null;
+  const modal = $("decorations-modal");
+  const list  = $("decorations-list");
+
+  async function open(){
+    modal.classList.remove("hidden");
+    await refresh();
+  }
+  function close(){ modal.classList.add("hidden"); }
+
+  async function refresh(){
+    try{
+      const r = await fetch("/api/decorations", { credentials: "same-origin" });
+      if(!r.ok){ renderError(); return; }
+      const j = await r.json();
+      catalog  = Array.isArray(j.catalog) ? j.catalog : [];
+      owned    = Array.isArray(j.owned)   ? j.owned   : [];
+      selected = j.selected || null;
+      if(typeof j.coins === "number") Wallet.set(j.coins, 0);
+      render();
+    }catch(_){ renderError(); }
+  }
+
+  function renderError(){
+    list.innerHTML = "";
+    const msg = document.createElement("div");
+    msg.className = "muted";
+    msg.style.textAlign = "center";
+    msg.style.padding = "16px";
+    msg.textContent = "—";
+    list.appendChild(msg);
+  }
+
+  function render(){
+    list.innerHTML = "";
+    list.appendChild(rowNone());
+    for(const d of catalog) list.appendChild(rowDeco(d));
+  }
+
+  function rowNone(){
+    const row = document.createElement("div");
+    row.className = "deco-row";
+    if(!selected) row.classList.add("is-selected");
+    row.setAttribute("role", "listitem");
+    row.tabIndex = 0;
+
+    const thumb = document.createElement("div");
+    thumb.className = "deco-thumb";
+
+    const info = document.createElement("div");
+    info.className = "deco-info";
+    const name = document.createElement("div");
+    name.className = "deco-name";
+    name.textContent = I18n.t("deco.none");
+    info.appendChild(name);
+
+    const radio = document.createElement("div");
+    radio.className = "deco-radio";
+
+    row.append(thumb, info, radio);
+    const activate = ()=>{ if(selected !== null) select(null); };
+    row.addEventListener("click", activate);
+    row.addEventListener("keydown", (e)=>{ if(e.key === "Enter" || e.key === " "){ e.preventDefault(); activate(); } });
+    return row;
+  }
+
+  function rowDeco(d){
+    const row = document.createElement("div");
+    row.className = "deco-row";
+    const isOwned = owned.indexOf(d.id) >= 0;
+    const isSel   = selected === d.id;
+    if(isSel) row.classList.add("is-selected");
+    row.setAttribute("role", "listitem");
+
+    const thumb = document.createElement("div");
+    thumb.className = "deco-thumb";
+    // Миниатюра — просто пустой кружок с анимированным украшением поверх.
+    Auth.attachDecoration(thumb, d);
+
+    const info = document.createElement("div");
+    info.className = "deco-info";
+    const name = document.createElement("div");
+    name.className = "deco-name";
+    name.textContent = I18n.t("deco.name_" + d.id);
+    info.appendChild(name);
+    const sub = document.createElement("div");
+    sub.className = "deco-sub";
+    if(!isOwned){
+      const coinImg = document.createElement("img");
+      coinImg.className = "coin";
+      coinImg.src = "assets/coin.gif";
+      coinImg.alt = "";
+      coinImg.setAttribute("aria-hidden", "true");
+      coinImg.width = 14; coinImg.height = 14;
+      const price = document.createElement("span");
+      price.textContent = String(d.price | 0);
+      sub.append(coinImg, price);
+    }else{
+      sub.textContent = I18n.t(isSel ? "deco.selected" : "deco.owned");
+    }
+    info.appendChild(sub);
+
+    let action;
+    if(!isOwned){
+      action = document.createElement("button");
+      action.className = "btn btn-primary";
+      action.textContent = I18n.t("deco.buy");
+      action.addEventListener("click", (e)=>{ e.stopPropagation(); buy(d, action); });
+    }else if(isSel){
+      action = document.createElement("div");
+      action.className = "deco-radio";
+    }else{
+      action = document.createElement("button");
+      action.className = "btn btn-ghost";
+      action.textContent = I18n.t("deco.select");
+      action.addEventListener("click", (e)=>{ e.stopPropagation(); select(d.id); });
+    }
+
+    row.append(thumb, info, action);
+    // Клик по всей строке купленного украшения — тоже выбор (как в примере).
+    if(isOwned && !isSel){
+      row.addEventListener("click", ()=> select(d.id));
+    }
+    return row;
+  }
+
+  async function buy(d, btnEl){
+    const price = d.price | 0;
+    if(btnEl) btnEl.disabled = true;
+    try{
+      const r = await fetch("/api/decorations/buy?id=" + encodeURIComponent(d.id), {
+        method: "POST",
+        credentials: "same-origin"
+      });
+      const j = await r.json().catch(()=>({}));
+      if(r.status === 402){
+        if(btnEl){
+          btnEl.disabled = false;
+          const orig = btnEl.textContent;
+          btnEl.textContent = I18n.t("deco.insufficient");
+          setTimeout(()=>{ btnEl.textContent = orig; }, 1500);
+        }
+        return;
+      }
+      if(!r.ok){ if(btnEl) btnEl.disabled = false; return; }
+      if(typeof j.coins === "number") Wallet.set(j.coins, -price);
+      owned = Array.isArray(j.owned) ? j.owned : owned;
+      render();
+    }catch(_){ if(btnEl) btnEl.disabled = false; }
+  }
+
+  async function select(id){
+    try{
+      const url = "/api/decorations/select" + (id == null ? "" : ("?id=" + encodeURIComponent(id)));
+      const r = await fetch(url, { method: "POST", credentials: "same-origin" });
+      if(!r.ok) return;
+      const j = await r.json();
+      selected = j.selected || null;
+      // Синхронизируем state.user и перерисовываем все видимые аватары.
+      if(state.user){
+        state.user.decoration = j.decoration || null;
+        Auth.renderAvatarInto($("user-avatar"), state.user);
+        if(!screens.game.classList.contains("hidden")) refreshLocalizedDynamicUI();
+      }
+      render();
+    }catch(_){}
+  }
+
+  return { open, close };
+})();
+
+$("btn-decorations").addEventListener("click", (e)=>{
+  e.stopPropagation();
+  closeUserPopup();
+  Decorations.open();
+});
+$("btn-decorations-close").addEventListener("click", Decorations.close);
+$("decorations-modal").addEventListener("click", (e)=>{
+  if(e.target.id === "decorations-modal") Decorations.close();
+});
+document.addEventListener("keydown", (e)=>{
+  if(e.key === "Escape" && !$("decorations-modal").classList.contains("hidden")) Decorations.close();
+});
 
 /* ---------------- Boot ---------------- */
 resizeCanvas();
