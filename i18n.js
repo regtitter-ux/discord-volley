@@ -47,7 +47,7 @@
       "game.home":      "В меню",
       "game.pause":     "Пауза",
       "game.resume":    "Продолжить",
-      "game.replay":    "Играть заново",
+      "game.replay":    "Играть снова",
       "game.quit":      "В меню",
       "game.victory":   "Победа!",
       "game.defeat":    "Поражение",

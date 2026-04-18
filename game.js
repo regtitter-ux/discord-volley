@@ -945,8 +945,12 @@ $("btn-replay").addEventListener("click", ()=>{
     state.stakes = null;
     updateStakesHud();
     requestStakes(state.session.matchId);
+    Game.start();
+    return;
   }
-  Game.start();
+  // В онлайне «повтор» = выйти из текущего матча и сразу встать в очередь.
+  quitToMenu();
+  startMatchmaking();
 });
 function quitToMenu(){
   // Если мы в онлайне — корректно уведомим сервер через {type:"leave"},
@@ -1355,8 +1359,8 @@ const Game = (function(){
     overlayTitle.textContent = I18n.t(winnerSide===1 ? "game.victory" : "game.defeat");
     const name = winnerSide===1 ? ($("hud-name-p1").textContent) : ($("hud-name-p2").textContent);
     overlaySub.textContent = name + " — " + score1 + " : " + score2;
-    // В онлайне повтор без пары невозможен — скрываем «Играть заново».
-    $("btn-replay").style.display = state.mode === "bot" ? "" : "none";
+    // Повтор доступен всегда: в боте — рестарт, в онлайне — в очередь.
+    $("btn-replay").style.display = "";
     overlay.classList.remove("hidden");
     // Drop any keys the user was still holding so players don't keep accelerating.
     keys.left = keys.right = keys.jump = false;
@@ -1627,8 +1631,8 @@ const Game = (function(){
     overlayTitle.textContent = I18n.t(winnerSide === 1 ? "game.victory" : "game.defeat");
     const name = winnerSide === 1 ? ($("hud-name-p1").textContent) : ($("hud-name-p2").textContent);
     overlaySub.textContent = name + " — " + score1 + " : " + score2;
-    // В онлайне «Играть заново» без пары бессмысленно — выходим в меню.
-    $("btn-replay").style.display = "none";
+    // «Играть заново» в онлайне = выйти из матча и встать в новую очередь.
+    $("btn-replay").style.display = "";
     overlay.classList.remove("hidden");
     keys.left = keys.right = keys.jump = false;
     if(winnerSide === 1){
@@ -1652,7 +1656,7 @@ const Game = (function(){
     lastWinnerSide = 1;
     overlayTitle.textContent = I18n.t("game.victory");
     overlaySub.textContent = I18n.t("game.opponent_left");
-    $("btn-replay").style.display = "none";
+    $("btn-replay").style.display = "";
     overlay.classList.remove("hidden");
     keys.left = keys.right = keys.jump = false;
     sfx.win();
