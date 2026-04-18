@@ -7,3 +7,8 @@ Thumbs.db
 .vscode/
 .idea/
 data/
+data-test/
+.omc/state/
+.omc/logs/
+playwright-report/
+test-results/

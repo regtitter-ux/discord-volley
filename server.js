@@ -196,6 +196,24 @@ app.post("/auth/logout", (req, res) => {
   res.json({ ok: true });
 });
 
+// Dev-only login shortcut для E2E-тестов. Подписывает поддельную session-
+// куку без Discord OAuth. Никогда не активен в проде: отключён, если
+// NODE_ENV==="production" ИЛИ если не выставлен DV_DEV_LOGIN=1, так что
+// даже случайный запуск с NODE_ENV!=production на публичном узле без явной
+// опт-ин переменной его не откроет.
+if (NODE_ENV !== "production" && process.env.DV_DEV_LOGIN === "1"){
+  app.get("/dev/login", (req, res) => {
+    const id   = String(req.query.id || "").slice(0, 32) || ("t-" + crypto.randomBytes(4).toString("hex"));
+    const name = String(req.query.name || "").slice(0, 32) || id;
+    const user = {
+      id, username: name, global_name: name, avatar_url: null, iat: Date.now()
+    };
+    res.cookie(SESSION_COOKIE, JSON.stringify(user), sessionCookieOpts);
+    res.json({ ok: true, user });
+  });
+  console.log("[dev] /dev/login enabled (DV_DEV_LOGIN=1)");
+}
+
 /* ---------- Build version (cache-busting / auto-reload) ---------- */
 
 app.get("/api/version", (req, res) => {
