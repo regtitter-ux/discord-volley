@@ -2539,7 +2539,7 @@ const Game = (function(){
       _ballNormalGrad = null, _ballFlashGrad = null;
 
   const BALL_TEX = new Image();
-  BALL_TEX.src = "assets/volleyball.svg";
+  BALL_TEX.src = "assets/volleyball.png";
 
   function skyGrad(){
     if(_skyGrad) return _skyGrad;
