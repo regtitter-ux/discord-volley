@@ -227,13 +227,32 @@ function loadLeaderboard(){
 }
 const LB = loadLeaderboard();
 
+// Async + atomic. writeFileSync блокировал event loop на весь JSON-дамп
+// (у тысяч юзеров это десятки мс). Пишем во временный файл и атомарно
+// переименовываем — если процесс упадёт посреди записи, LB_PATH останется
+// консистентным. _lbDirty сигнализирует «пока писали, прилетели новые
+// апдейты» — тогда запускаем ещё один проход.
 let _lbSaveTimer = null;
+let _lbWriting   = false;
+let _lbDirty     = false;
+async function _lbFlush(){
+  _lbWriting = true;
+  _lbDirty   = false;
+  const snap = JSON.stringify(LB);
+  const tmp  = LB_PATH + ".tmp";
+  try {
+    await fs.promises.writeFile(tmp, snap, "utf8");
+    await fs.promises.rename(tmp, LB_PATH);
+  } catch(e){ console.error("[lb] write failed:", e); }
+  finally { _lbWriting = false; }
+  if (_lbDirty) saveLeaderboardDebounced();
+}
 function saveLeaderboardDebounced(){
-  if (_lbSaveTimer) return;
+  _lbDirty = true;
+  if (_lbSaveTimer || _lbWriting) return;
   _lbSaveTimer = setTimeout(() => {
     _lbSaveTimer = null;
-    try { fs.writeFileSync(LB_PATH, JSON.stringify(LB), "utf8"); }
-    catch(e){ console.error("[lb] write failed:", e); }
+    _lbFlush();
   }, 500);
 }
 
@@ -286,10 +305,37 @@ function rollStakes(){
   };
 }
 
+const MATCH_STAKES_TTL_MS = 15 * 60 * 1000;
 function registerStakes(matchId, stakes){
+  stakes.createdAt = Date.now();
   matchStakes.set(matchId, stakes);
-  setTimeout(()=> matchStakes.delete(matchId), 15 * 60 * 1000);
 }
+// Один общий sweep вместо setTimeout на каждую ставку. 10k setTimeout'ов
+// в heap — это 10k таймеров + их GC, причём каждый создаёт замыкание на
+// matchId. Периодическая чистка раз в минуту дешевле на порядок.
+setInterval(() => {
+  const cutoff = Date.now() - MATCH_STAKES_TTL_MS;
+  for (const [k, v] of matchStakes){
+    if ((v.createdAt || 0) < cutoff) matchStakes.delete(k);
+  }
+}, 60 * 1000).unref();
+
+// userRates растёт линейно по числу уникальных юзеров за время аптайма и
+// никогда не освобождается. Раз в 5 минут выкидываем записи, где последняя
+// активность старше часа — кулдауны за это время всё равно истекли.
+const USER_RATES_TTL_MS = 60 * 60 * 1000;
+setInterval(() => {
+  const cutoff = Date.now() - USER_RATES_TTL_MS;
+  for (const [id, rec] of userRates){
+    let latest = rec._lastMatchWinAt || 0;
+    for (const k of Object.keys(rec)){
+      if (k.startsWith("_")) continue;
+      const st = rec[k];
+      if (st && st.lastAt > latest) latest = st.lastAt;
+    }
+    if (latest < cutoff) userRates.delete(id);
+  }
+}, 5 * 60 * 1000).unref();
 
 function applyMatchOutcome(ws, matchId, outcome){
   const st = matchStakes.get(matchId);
@@ -487,17 +533,55 @@ function authUserFromCookie(req){
 let waiting = null;        // WebSocket или null
 const QUEUE_TIMEOUT_MS = 30000;
 
-// Счётчик активных авторизованных соединений. Использует внутреннее
-// состояние wss.clients, но мы фильтруем по ws.user (анон сюда не доходит
-// — мы закрываем соединение при отсутствии cookie) и readyState=1.
-function onlineCount(){
-  let n = 0;
-  wss.clients.forEach(c => { if (c.user && c.readyState === 1) n++; });
-  return n;
+// Счётчик активных авторизованных соединений. Держим как число с инкрементом
+// на connection (после успеха auth) и декрементом на close — каждый вызов
+// онлайна больше не O(clients). broadcastStats шёл на каждый connect/close,
+// при 10k клиентах это быстрые квадратичные всплески: дросселим до 1 раза/2с
+// через leading-edge throttle с trailing-хвостом.
+let _online = 0;
+function onlineCount(){ return _online; }
+
+const STATS_INTERVAL_MS = 2000;
+let _statsTimer   = null;
+let _statsPending = false;
+function _doBroadcastStats(){
+  const msg = JSON.stringify({ type: "stats", online: _online });
+  wss.clients.forEach(c => { if (c.readyState === 1) { try { c.send(msg); } catch {} } });
 }
 function broadcastStats(){
-  const msg = JSON.stringify({ type: "stats", online: onlineCount() });
-  wss.clients.forEach(c => { if (c.readyState === 1) { try { c.send(msg); } catch {} } });
+  if (_statsTimer){ _statsPending = true; return; }
+  _doBroadcastStats();
+  _statsTimer = setTimeout(() => {
+    _statsTimer = null;
+    if (_statsPending){ _statsPending = false; broadcastStats(); }
+  }, STATS_INTERVAL_MS);
+}
+
+// Раз в 5с выкидываем клиентов с зависшим буфером отправки: если мы успели
+// запушить >2МБ в сокет, значит клиент либо мёртв, либо не успевает читать —
+// держать память процесса ради него опасно при 10k коннектов.
+const WS_STUCK_BYTES = 2 * 1024 * 1024;
+setInterval(() => {
+  wss.clients.forEach(c => {
+    if (c.readyState === 1 && c.bufferedAmount > WS_STUCK_BYTES){
+      try { c.terminate(); } catch {}
+    }
+  });
+}, 5000).unref();
+
+// Token bucket на входящие сообщения — 120 msg/s с бёрстом 60. Защищает
+// relay и switch от флуда одним клиентом. Сверх бюджета — тихо дропаем
+// (ответ об ошибке сам по себе стоил бы ресурсов).
+const MSG_RATE_PER_SEC = 120;
+const MSG_BURST        = 60;
+function takeToken(ws){
+  const now = Date.now();
+  const dt  = (now - ws._tokensT) / 1000;
+  ws._tokensT = now;
+  ws._tokens  = Math.min(MSG_BURST, (ws._tokens || 0) + dt * MSG_RATE_PER_SEC);
+  if (ws._tokens < 1) return false;
+  ws._tokens--;
+  return true;
 }
 
 function safeUser(u){
@@ -510,10 +594,13 @@ function safeUser(u){
   };
 }
 
+const WS_BACKPRESSURE_DROP = 1 * 1024 * 1024;
 function send(ws, obj){
-  if (ws && ws.readyState === 1) {
-    try { ws.send(JSON.stringify(obj)); } catch {}
-  }
+  if (!ws || ws.readyState !== 1) return;
+  // Не забиваем сокет, если клиент уже отстаёт: дальнейший push только
+  // раздувает буфер процесса. terminate отдан фоновому sweep'у.
+  if (ws.bufferedAmount > WS_BACKPRESSURE_DROP) return;
+  try { ws.send(JSON.stringify(obj)); } catch {}
 }
 
 function clearQueue(ws){
@@ -588,11 +675,17 @@ wss.on("connection", (ws, req) => {
   ws.user = user;
   ws.peer = null;
   ws.roomId = null;
+  ws._tokens  = MSG_BURST;
+  ws._tokensT = Date.now();
+  _online++;
 
   send(ws, { type: "hello", user: safeUser(user), online: onlineCount(), coins: userCoins(user.id), trophies: userTrophies(user.id) });
   broadcastStats();
 
   ws.on("message", (raw) => {
+    if (!takeToken(ws)) return;
+    // Сверхгабаритные фреймы отрезаем по сырому размеру ещё до JSON.parse.
+    if (raw && raw.length > 8192) return;
     let msg;
     try { msg = JSON.parse(raw); } catch { return; }
     if (!msg || typeof msg.type !== "string") return;
@@ -655,23 +748,28 @@ wss.on("connection", (ws, req) => {
         if (res) send(ws, { type: "wallet", coins: res.coins, delta: res.delta, kind });
         break;
       }
-      case "relay":
-        // relay-payload прозрачно отдаём сопернику. Ограничение размера —
-        // 4KB на сообщение, чтобы не положить рилей флудом.
-        if (ws.peer && ws.peer.readyState === 1) {
-          const payload = msg.payload;
-          try {
-            const str = JSON.stringify(payload || {});
-            if (str.length < 4096) {
-              ws.peer.send(JSON.stringify({ type: "peer", payload }));
-            }
-          } catch {}
-        }
+      case "relay": {
+        // Горячий путь — 30 Гц на матч, при 10k матчей это ~600k msg/s
+        // через всех пиров. Минимизируем работу: один JSON.stringify
+        // итогового пакета (а не сначала payload отдельно), отсечка по длине
+        // уже сериализованной строки (4KB), и дроп, если у пира забит буфер
+        // (снапшот — идемпотентный, следующий долетит через 33 мс).
+        const peer = ws.peer;
+        if (!peer || peer.readyState !== 1) break;
+        if (peer.bufferedAmount > WS_BACKPRESSURE_DROP) break;
+        const payload = msg.payload;
+        if (!payload) break;
+        let out;
+        try { out = JSON.stringify({ type: "peer", payload }); } catch { break; }
+        if (out.length >= 4096) break;
+        try { peer.send(out); } catch {}
         break;
+      }
     }
   });
 
   ws.on("close", () => {
+    _online--;
     clearQueue(ws);
     leaveRoom(ws, "disconnect");
     // Счётчик онлайна изменился — уведомим всех подключённых клиентов.
