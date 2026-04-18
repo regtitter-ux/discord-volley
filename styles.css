@@ -177,7 +177,10 @@ body.is-touch .lb-wins .lb-trophy-ico{filter:none}
 /* С активным украшением сам аватар остаётся круглым (img тоже clipped
    по border-radius выше), а overflow снимаем — чтобы нимб/звёзды
    могли выходить за рамку. */
-.avatar.has-deco{overflow:visible}
+/* has-deco применяется не только к .avatar, но и к .lb-avatar, .deco-thumb
+   и другим контейнерам. Без position:relative слой .avatar-deco всплывает
+   к viewport-предку и рисуется 600%×1000% на весь экран. */
+.has-deco{position:relative;overflow:visible}
 .avatar-deco{
   position:absolute;inset:-18%;
   pointer-events:none;z-index:2;
