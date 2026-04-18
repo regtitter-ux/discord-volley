@@ -1,0 +1,95 @@
+{
+  "version": "1",
+  "task": "Работать по .omc/plans/night.md: расширять серверные/E2E тесты и закрывать найденные дефекты. npm test + npm run test:e2e зелёные на каждой итерации. Локальные коммиты; без push.",
+  "stories": [
+    {
+      "id": "US-001",
+      "title": "Integration-test: форфейт-победитель не теряет трофеи после leave",
+      "priority": 1,
+      "passes": false,
+      "acceptanceCriteria": [
+        "Файл tests/server-leave.test.js существует и использует реальный WebSocketServer (без UI).",
+        "Поднимает server.js в отдельном child-процессе на свободном порту с DV_DEV_LOGIN=1 и dummy secrets, либо конструирует приложение через module-require и слушает 0.",
+        "Тест: два клиента стакутся через queue → получают matched → хост шлёт match_win → гость шлёт leave → хост получает peer_left → хост шлёт leave.",
+        "После всего: у хоста trophies delta == +stakes.win, у гостя trophies delta == -stakes.loss, и нет ни одного второго trophies-фрейма у хоста.",
+        "npm test зелёный."
+      ]
+    },
+    {
+      "id": "US-002",
+      "title": "Integration-test: leave до match_win — гость получает -loss ровно один раз",
+      "priority": 2,
+      "passes": false,
+      "acceptanceCriteria": [
+        "В том же харнессе tests/server-leave.test.js либо в tests/server-forfeit.test.js: гость уходит по leave до того как хост шлёт match_win.",
+        "Гость получает один trophies-фрейм с delta == -stakes.loss.",
+        "Хост после этого шлёт match_win — получает trophies с delta == +stakes.win.",
+        "Повторный leave/match_loss от гостя не добавляет второго штрафа (нет второго trophies-фрейма у гостя).",
+        "npm test зелёный."
+      ]
+    },
+    {
+      "id": "US-003",
+      "title": "Wallet rate-limit per-match и global cooldown на match.win",
+      "priority": 3,
+      "passes": false,
+      "acceptanceCriteria": [
+        "Файл tests/wallet-limits.test.js использует WS-клиента, стучится в award.",
+        "rally.hit: 300 подряд с 300ms gap → 200 wallet-фреймов, дальше wallet не приходит.",
+        "match.win: два разных matchId у одного пользователя в пределах 30 секунд → второй award без wallet-фрейма (global cooldown).",
+        "match.win: повторный award на тот же matchId → второго wallet-фрейма нет (per-match cap = 1).",
+        "npm test зелёный."
+      ]
+    },
+    {
+      "id": "US-004",
+      "title": "Онлайн-счётчик корректно растёт/падает в рамках одного инстанса",
+      "priority": 4,
+      "passes": false,
+      "acceptanceCriteria": [
+        "Файл tests/online-counter.test.js подключает 3 клиента последовательно к уже запущенному серверу теста.",
+        "Финальный принятый stats-фрейм (или hello.online) у 3-го клиента содержит online >= 3.",
+        "После закрытия всех 3 клиентов ожидаем, что следующий новый клиент видит hello.online == 1.",
+        "Используется STATS_INTERVAL_MS wait < 5 сек (без жёстких sleep; wait-for-message паттерн).",
+        "npm test зелёный."
+      ]
+    },
+    {
+      "id": "US-005",
+      "title": "E2E: canvas не чёрный после 'Играть снова' (online → online)",
+      "priority": 5,
+      "passes": false,
+      "acceptanceCriteria": [
+        "Файл tests/e2e/replay.spec.js использует два browserContext, каждый логинится через /dev/login, оба нажимают на кнопку очереди.",
+        "Проверяется, что оба получают matched (state.mode !== 'bot' на клиенте).",
+        "Один клиент выходит через btn-home, второй через 1s жмёт btn-replay (если оверлей виден). Затем его canvas.width >= 300 AND canvas.height >= 300.",
+        "Тест проходит и на desktop-chrome, и на mobile-chrome проектах Playwright.",
+        "npm run test:e2e зелёный."
+      ]
+    },
+    {
+      "id": "US-006",
+      "title": "resizeCanvas вызывается не чаще ~60Hz даже при быстрых ResizeObserver ивентах",
+      "priority": 6,
+      "passes": false,
+      "acceptanceCriteria": [
+        "В game.js resizeCanvas обёрнут в rAF-throttle (идемпотентный: несколько вызовов за один кадр сливаются в один).",
+        "Тест tests/e2e/resize-throttle.spec.js проверяет, что при искусственных 100 resize-ивентах подряд canvas.width меняется не более одного раза в rAF.",
+        "Поведение при нормальных ресайзах не ломается (canvas получает ненулевой размер).",
+        "npm run test:e2e зелёный."
+      ]
+    },
+    {
+      "id": "US-007",
+      "title": "README: раздел про тесты + Tests/E2E commands",
+      "priority": 7,
+      "passes": false,
+      "acceptanceCriteria": [
+        "README.md содержит раздел '## Tests' с описанием npm test (node:test) и npm run test:e2e (Playwright).",
+        "В разделе указано, что E2E требует DV_DEV_LOGIN=1 и поднимается на порту 18099.",
+        "Указана команда npx playwright install chromium как требование первого запуска.",
+        "В README нет упоминаний несуществующих команд."
+      ]
+    }
+  ]
+}

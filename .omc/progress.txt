@@ -1,0 +1,13 @@
+## Ralph night run progress
+
+### Iteration 1 — start
+- Created prd.json with 7 stories derived from .omc/plans/night.md.
+- Existing baseline: tests/broker.test.js (5 green cases), tests/e2e/smoke.spec.js (2 green on desktop-chrome).
+- Server entry: server.js. Dev login: /dev/login (gated by NODE_ENV!=production && DV_DEV_LOGIN=1).
+- Playwright config boots own server on :18099 with dummy secrets.
+- Starting US-001 (server leave/forfeit integration test).
+
+### Known constraints
+- Node 24.x, Windows. Forward slashes in paths, /dev/null not NUL.
+- Server mutates ./data/ sqlite; tests should use DATA_DIR=./data-test (gitignored).
+- Redis тесты пропускаются, если TEST_REDIS_URL не задан.
