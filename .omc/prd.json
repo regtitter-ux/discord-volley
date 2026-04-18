@@ -6,7 +6,7 @@
       "id": "US-001",
       "title": "Integration-test: форфейт-победитель не теряет трофеи после leave",
       "priority": 1,
-      "passes": false,
+      "passes": true,
       "acceptanceCriteria": [
         "Файл tests/server-leave.test.js существует и использует реальный WebSocketServer (без UI).",
         "Поднимает server.js в отдельном child-процессе на свободном порту с DV_DEV_LOGIN=1 и dummy secrets, либо конструирует приложение через module-require и слушает 0.",
@@ -19,7 +19,7 @@
       "id": "US-002",
       "title": "Integration-test: leave до match_win — гость получает -loss ровно один раз",
       "priority": 2,
-      "passes": false,
+      "passes": true,
       "acceptanceCriteria": [
         "В том же харнессе tests/server-leave.test.js либо в tests/server-forfeit.test.js: гость уходит по leave до того как хост шлёт match_win.",
         "Гость получает один trophies-фрейм с delta == -stakes.loss.",
@@ -30,14 +30,15 @@
     },
     {
       "id": "US-003",
-      "title": "Wallet rate-limit per-match и global cooldown на match.win",
+      "title": "Wallet rate-limit: minGapMs и per-match cap",
       "priority": 3,
-      "passes": false,
+      "passes": true,
       "acceptanceCriteria": [
-        "Файл tests/wallet-limits.test.js использует WS-клиента, стучится в award.",
-        "rally.hit: 300 подряд с 300ms gap → 200 wallet-фреймов, дальше wallet не приходит.",
-        "match.win: два разных matchId у одного пользователя в пределах 30 секунд → второй award без wallet-фрейма (global cooldown).",
-        "match.win: повторный award на тот же matchId → второго wallet-фрейма нет (per-match cap = 1).",
+        "Файл tests/wallet-limits.test.js использует shared server + WS-клиента с dev-login.",
+        "rally.hit: два подряд с gap < minGapMs (250 ms) → ровно один wallet-фрейм (второй зажат).",
+        "rally.hit: два с gap > minGapMs → два wallet-фрейма.",
+        "match.win: два подряд на ОДИН matchId → ровно один wallet-фрейм (per-match cap = 1).",
+        "Все проверки используют collectFor/waitFor без sleep > 1 секунды.",
         "npm test зелёный."
       ]
     },

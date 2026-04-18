@@ -24,6 +24,13 @@ async function getFreePort(){
 // готовности, а не HTTP-polling (быстрее и честнее).
 async function startServer(extraEnv = {}){
   const port = await getFreePort();
+  // Уникальный DATA_DIR на каждый startServer() — иначе два параллельно
+  // бегущих интеграционных файла упираются в "database is locked" на общей
+  // sqlite (node:test дефолтно параллелит файлы).
+  const dataDir = path.join(
+    ROOT, "data-test",
+    `${process.pid}-${port}-${Date.now().toString(36)}`
+  );
   const child = spawn(
     process.execPath,
     ["--experimental-sqlite", "server.js"],
@@ -38,7 +45,7 @@ async function startServer(extraEnv = {}){
         DISCORD_CLIENT_SECRET: "test-secret",
         SESSION_SECRET: "test-session-secret",
         PUBLIC_URL: `http://localhost:${port}`,
-        DATA_DIR: path.join(ROOT, "data-test"),
+        DATA_DIR: dataDir,
         ...extraEnv
       },
       stdio: ["ignore", "pipe", "pipe"]
