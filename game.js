@@ -2360,6 +2360,9 @@ const Game = (function(){
       _backdropGlow1 = null, _backdropGlow2 = null, _netPostsGrad = null,
       _ballNormalGrad = null, _ballFlashGrad = null;
 
+  const BALL_TEX = new Image();
+  BALL_TEX.src = "assets/volleyball.svg";
+
   function skyGrad(){
     if(_skyGrad) return _skyGrad;
     // Discord dark-mode feel: near-black at top fading into the "chat panel" tone.
@@ -2563,24 +2566,20 @@ const Game = (function(){
     ctx.rotate(-ang);
     ctx.rotate(ball.renderAngle);
 
-    // Radial gradient: bright highlight offset toward upper-left
-    ctx.fillStyle = hitFlash > 0 ? ballFlashGrad() : ballNormalGrad();
-    ctx.beginPath(); ctx.arc(0, 0, ball.r, 0, Math.PI*2); ctx.fill();
-
-    // Seam lines — two sweeping arcs to read as a volleyball
-    ctx.strokeStyle = "rgba(120,125,135,0.75)";
-    ctx.lineWidth = 2;
-    ctx.beginPath(); ctx.arc(0, 0, ball.r*0.62, -0.4, 1.2); ctx.stroke();
-    ctx.beginPath(); ctx.arc(0, 0, ball.r*0.62, Math.PI-0.4, Math.PI+1.2); ctx.stroke();
-
-    // Outer rim
-    ctx.strokeStyle = "rgba(80,85,95,0.45)";
-    ctx.lineWidth = 1.5;
-    ctx.beginPath(); ctx.arc(0, 0, ball.r - 1, 0, Math.PI*2); ctx.stroke();
-
-    // Specular dot
-    ctx.fillStyle = "rgba(255,255,255,0.65)";
-    ctx.beginPath(); ctx.arc(-ball.r*0.4, -ball.r*0.5, ball.r*0.15, 0, Math.PI*2); ctx.fill();
+    if(BALL_TEX.complete && BALL_TEX.naturalWidth){
+      ctx.drawImage(BALL_TEX, -ball.r, -ball.r, ball.r*2, ball.r*2);
+      if(hitFlash > 0){
+        ctx.save();
+        ctx.globalCompositeOperation = "lighter";
+        ctx.globalAlpha = Math.min(0.55, hitFlash * 3);
+        ctx.fillStyle = "#fff7c2";
+        ctx.beginPath(); ctx.arc(0, 0, ball.r, 0, Math.PI*2); ctx.fill();
+        ctx.restore();
+      }
+    } else {
+      ctx.fillStyle = hitFlash > 0 ? ballFlashGrad() : ballNormalGrad();
+      ctx.beginPath(); ctx.arc(0, 0, ball.r, 0, Math.PI*2); ctx.fill();
+    }
 
     ctx.restore();
   }
