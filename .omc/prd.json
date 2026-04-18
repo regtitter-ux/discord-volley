@@ -84,7 +84,7 @@
       "id": "US-007",
       "title": "README: раздел про тесты + Tests/E2E commands",
       "priority": 7,
-      "passes": false,
+      "passes": true,
       "acceptanceCriteria": [
         "README.md содержит раздел '## Tests' с описанием npm test (node:test) и npm run test:e2e (Playwright).",
         "В разделе указано, что E2E требует DV_DEV_LOGIN=1 и поднимается на порту 18099.",

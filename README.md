@@ -34,6 +34,41 @@ python -m http.server 8080
 - `alpha:false` у контекста + плоская заливка — минимум перерисовок.
 - Letterbox-масштабирование логического мира 1000×500 → физика одинакова на любом экране.
 
+## Tests
+
+Два независимых слоя.
+
+### Unit / интеграция (node:test)
+
+```
+npm test
+```
+
+Запускает `node --test "tests/*.test.js"` против локального harness, который
+поднимает настоящий `server.js` в child-процессе на свободном порту с
+`DV_DEV_LOGIN=1` и уникальным `DATA_DIR` на прогон. Тесты говорят с сервером
+по WebSocket, без браузера.
+
+Покрывает: broker.claimOutcome (один win на матч), leave/форфейт-трофеи,
+wallet rate-limit (minGapMs + per-match cap), queue_timeout regression,
+Play-Again race (leave→queue без cancel), online-counter broadcast.
+
+### E2E (Playwright)
+
+```
+npx playwright install chromium    # первый запуск
+npm run test:e2e
+```
+
+Playwright сам поднимает `server.js` на порту 18099 (через `webServer` в
+`playwright.config.js`) с `DV_DEV_LOGIN=1`, `QUEUE_TIMEOUT_MS=5000` и
+прочими dev-secrets. Проекты: `desktop-chrome`, `mobile-chrome` (Pixel 7).
+`workers: 1` — замокать PvP-очередь двумя A/B-парами накрест нельзя.
+
+Покрывает: загрузку UI, запуск бот-матча, replay-сценарий (два контекста
+→ matched → один уходит → второй жмёт «Играть снова» → canvas получает
+размеры), throttle resizeCanvas под залпом ResizeObserver-событий.
+
 ## Структура
 
 ```
