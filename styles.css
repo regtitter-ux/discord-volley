@@ -165,8 +165,7 @@ body.is-touch .overlay{background:rgba(0,0,0,.72)}
 /* filter:drop-shadow на мобильных — второй по тяжести эффект после blur, к тому
    же висит на каждой иконке монет/кубков. В топе и HUD отключаем ради FPS. */
 body.is-touch .wallet .coin,
-body.is-touch .lb-wins .lb-trophy-ico,
-body.is-touch .hud-stakes .trophy-ico{filter:none}
+body.is-touch .lb-wins .lb-trophy-ico{filter:none}
 .user-meta{min-width:0}
 .user-name{font-weight:600;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;max-width:220px}
 .user-status{font-size:12px;color:var(--muted);display:flex;align-items:center;gap:6px}
@@ -257,14 +256,6 @@ body.is-touch .hud-stakes .trophy-ico{filter:none}
 .hud-score.pulse{animation:hud-score-pulse .45s ease}
 .hud-mid{display:flex;flex-direction:column;align-items:center;gap:2px;padding:0 8px;border-left:1px solid #3a3c43;border-right:1px solid #3a3c43}
 .hud-diff{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;font-weight:700}
-/* Ставки матча: компактный pill под HUD, центрованный. Вне самого HUD,
-   чтобы не тянуть основной бейдж и оставить приоритет за именем+счётом. */
-.hud-stakes{position:absolute;top:calc(10px + var(--safe-top) + 58px);left:50%;transform:translateX(-50%);display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums;line-height:1;background:rgba(30,31,34,.72);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);padding:3px 9px;border-radius:999px;border:1px solid rgba(255,255,255,.05);pointer-events:none;z-index:4}
-.hud-stakes[hidden]{display:none}
-.hud-stakes .trophy-ico{filter:drop-shadow(0 1px 2px rgba(0,0,0,.35))}
-.hud-stakes-win{color:#ffd34a}
-.hud-stakes-loss{color:#f87171}
-.hud-stakes-sep{color:var(--muted);font-weight:600;margin:0 1px}
 .wallet-trophies .wallet-value{color:#ffd34a}
 .trophy-ico{flex-shrink:0;display:inline-block}
 
@@ -309,7 +300,6 @@ body.is-touch #cv{height:calc(100% - 84px - var(--safe-bot))}
   .hud-name{max-width:68px;font-size:11px}
   .hud-score{font-size:17px}
   .hud-trophies{font-size:10px}
-  .hud-stakes{font-size:9px;padding:2px 7px;top:calc(10px + var(--safe-top) + 52px)}
   .tbtn-pill{width:54px;height:54px;font-size:22px}
 }
 @media (max-height:420px){
@@ -322,7 +312,6 @@ body.is-touch #cv{height:calc(100% - 84px - var(--safe-bot))}
   .hud-name{max-width:56px}
   .hud-score{font-size:15px}
   .hud-trophies{font-size:10px}
-  .hud-stakes{font-size:9px;padding:2px 6px;top:calc(6px + var(--safe-top) + 44px)}
   .avatar-sm{width:26px;height:26px;font-size:11px}
 }
 

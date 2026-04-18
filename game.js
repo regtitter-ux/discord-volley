@@ -215,22 +215,6 @@ Trophies.onChange((delta)=>{
   if(delta) flashTrophyDelta(delta);
 });
 
-/* ---- Stakes HUD (during match) ---- */
-const hudStakesEl     = $("hud-stakes");
-const hudStakesWinEl  = $("hud-stakes-win");
-const hudStakesLossEl = $("hud-stakes-loss");
-function updateStakesHud(){
-  if(!hudStakesEl) return;
-  const s = state.stakes;
-  if(s && s.win && s.loss){
-    if(hudStakesWinEl)  hudStakesWinEl.textContent  = "+" + s.win;
-    if(hudStakesLossEl) hudStakesLossEl.textContent = "−" + s.loss;
-    hudStakesEl.hidden = false;
-  } else {
-    hudStakesEl.hidden = true;
-  }
-}
-
 /* ---- Trophy balance per-player HUD ----
    Под именем у каждого игрока — его баланс кубков (оба жёлтые). У p1
    берём из Trophies (локальный источник истины, обновляется от wallet
@@ -766,7 +750,6 @@ function onServerMessage(msg){
           win:  msg.win  | 0,
           loss: msg.loss | 0
         };
-        updateStakesHud();
       }
       break;
     case "trophies":
@@ -904,7 +887,6 @@ function startOnlineMatch(role, opponent){
   if(state.stakes && state.stakes.matchId){
     state.session = { matchId: state.stakes.matchId, startedAt: Date.now(), seq: 0 };
   }
-  updateStakesHud();
   // Нормализуем пришедшего с сервера пользователя — добиваем color по id,
   // чтобы fallback-круг оппонента был стабильно окрашен, а не серо-дефолтным.
   state.opponent = Auth.normalize(opponent) || opponent;
@@ -1117,7 +1099,6 @@ $("btn-replay").addEventListener("click", ()=>{
   if(state.mode === "bot"){
     state.session = { matchId: "b-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2,8), startedAt: Date.now(), seq: 0 };
     state.stakes = null;
-    updateStakesHud();
     requestStakes(state.session.matchId);
     Game.start();
     return;
@@ -1137,7 +1118,6 @@ function quitToMenu(){
   state.opponent = null;
   state.stakes = null;
   state.session = null;
-  updateStakesHud();
   Game.stop();
   show("menu");
   // На случай, если за матч изменились трофеи — перерисовать топ сразу.
