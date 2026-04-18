@@ -318,13 +318,51 @@ body.is-touch #cv{height:calc(100% - 84px - var(--safe-bot))}
 /* Overlay */
 .overlay{position:absolute;inset:0;background:rgba(0,0,0,.55);display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px);-webkit-backdrop-filter:blur(4px);padding:20px;animation:overlay-in .22s ease}
 .overlay.hidden{display:none}
-.overlay-box{background:var(--bg-2);border-radius:var(--radius-lg);padding:24px;max-width:380px;width:100%;text-align:center;box-shadow:var(--shadow);animation:overlay-box-in .28s cubic-bezier(.2,.8,.2,1)}
-.overlay-box h3{font-size:22px;margin-bottom:6px;word-break:break-word;overflow-wrap:anywhere}
-#overlay-sub{word-break:break-word;overflow-wrap:anywhere}
+.overlay-box{position:relative;background:var(--bg-2);border-radius:var(--radius-lg);padding:28px 24px 22px;max-width:400px;width:100%;text-align:center;box-shadow:var(--shadow);animation:overlay-box-in .32s cubic-bezier(.2,.8,.2,1);overflow:hidden}
+.overlay-box::before{content:"";position:absolute;inset:0 0 auto 0;height:4px;background:linear-gradient(90deg,transparent,var(--blurple),transparent);opacity:.6}
+.overlay-box.is-win::before{background:linear-gradient(90deg,transparent,#ffd34a,#22c55e,#ffd34a,transparent);opacity:.9}
+.overlay-box.is-loss::before{background:linear-gradient(90deg,transparent,#64748b,transparent);opacity:.5}
+.overlay-icon{display:none;width:64px;height:64px;margin:0 auto 10px;border-radius:50%;align-items:center;justify-content:center;background:radial-gradient(circle,rgba(255,211,74,.25),rgba(255,211,74,0) 70%);animation:overlay-icon-in .5s cubic-bezier(.2,.8,.2,1) .08s both}
+.overlay-box.is-win .overlay-icon{display:flex}
+.overlay-icon img{filter:drop-shadow(0 4px 12px rgba(255,211,74,.6))}
+.overlay-box h3{font-size:26px;font-weight:800;margin-bottom:8px;letter-spacing:.3px;word-break:break-word;overflow-wrap:anywhere}
+.overlay-box.is-win h3{color:#ffd34a;text-shadow:0 2px 16px rgba(255,211,74,.35)}
+.overlay-box.is-loss h3{color:#e5e7eb}
+.overlay-score{display:flex;align-items:baseline;justify-content:center;gap:10px;margin:4px 0 8px;font-size:38px;font-weight:800;font-variant-numeric:tabular-nums;line-height:1;letter-spacing:.5px}
+.overlay-score[hidden]{display:none}
+.overlay-score-val{min-width:.8em;color:var(--text);transition:color .2s ease}
+.overlay-score-sep{color:var(--muted);font-weight:600;font-size:28px}
+.overlay-box.is-win #overlay-score-p1{color:#22c55e}
+.overlay-box.is-loss #overlay-score-p2{color:#f87171}
+#overlay-sub{margin-top:2px;font-size:14px;word-break:break-word;overflow-wrap:anywhere}
+.overlay-reward{display:inline-flex;align-items:center;gap:6px;margin-top:14px;padding:7px 14px;border-radius:999px;background:rgba(255,211,74,.12);border:1px solid rgba(255,211,74,.3);font-weight:700;font-size:15px;font-variant-numeric:tabular-nums;color:#ffd34a;animation:overlay-reward-in .45s cubic-bezier(.2,1.4,.4,1) .35s both}
+.overlay-reward[hidden]{display:none}
+.overlay-reward.is-loss{background:rgba(248,113,113,.1);border-color:rgba(248,113,113,.28);color:#f87171}
+.overlay-reward-ico{flex-shrink:0}
+.overlay-reward.is-loss .overlay-reward-ico{filter:hue-rotate(-40deg) saturate(.5) brightness(.95)}
 .overlay-buttons{display:flex;gap:10px;margin-top:18px}
 .overlay-buttons .btn{flex:1}
 @keyframes overlay-in{from{opacity:0}to{opacity:1}}
-@keyframes overlay-box-in{from{opacity:0;transform:scale(.9) translateY(8px)}to{opacity:1;transform:none}}
+@keyframes overlay-box-in{from{opacity:0;transform:scale(.92) translateY(10px)}to{opacity:1;transform:none}}
+@keyframes overlay-icon-in{from{opacity:0;transform:scale(.5)}to{opacity:1;transform:scale(1)}}
+@keyframes overlay-reward-in{from{opacity:0;transform:scale(.6)}to{opacity:1;transform:scale(1)}}
+@media (max-width:720px){
+  .overlay-box{padding:22px 18px 18px;max-width:340px}
+  .overlay-box h3{font-size:22px}
+  .overlay-score{font-size:32px;gap:8px}
+  .overlay-score-sep{font-size:24px}
+}
+@media (max-height:420px){
+  .overlay-box{padding:16px 18px 14px;max-width:360px}
+  .overlay-icon{width:44px;height:44px;margin-bottom:6px}
+  .overlay-icon img{width:32px;height:32px}
+  .overlay-box h3{font-size:20px;margin-bottom:4px}
+  .overlay-score{font-size:26px;margin:2px 0 4px}
+  .overlay-score-sep{font-size:20px}
+  #overlay-sub{font-size:12px}
+  .overlay-reward{margin-top:8px;padding:5px 11px;font-size:13px}
+  .overlay-buttons{margin-top:10px}
+}
 
 /* Rotate-hint DOM оставлен в разметке, но без триггеров: в портрете
    приложение продолжает работать (contain-fit + центрированные тач-

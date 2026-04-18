@@ -167,11 +167,23 @@
       </div>
     </div>
 
-    <!-- Pause / end overlay -->
+    <!-- End-of-match overlay -->
     <div class="overlay hidden" id="overlay">
-      <div class="overlay-box">
+      <div class="overlay-box" id="overlay-box">
+        <div class="overlay-icon" id="overlay-icon" aria-hidden="true">
+          <img src="assets/trophy.svg" width="48" height="48" alt="" decoding="async">
+        </div>
         <h3 id="overlay-title">Пауза</h3>
+        <div class="overlay-score" id="overlay-score" hidden>
+          <span class="overlay-score-val" id="overlay-score-p1">0</span>
+          <span class="overlay-score-sep">:</span>
+          <span class="overlay-score-val" id="overlay-score-p2">0</span>
+        </div>
         <p id="overlay-sub" class="muted"></p>
+        <div class="overlay-reward" id="overlay-reward" hidden>
+          <img class="overlay-reward-ico" src="assets/trophy.svg" width="16" height="16" alt="" aria-hidden="true" decoding="async">
+          <span class="overlay-reward-val" id="overlay-reward-val">+0</span>
+        </div>
         <div class="overlay-buttons">
           <button class="btn btn-primary" id="btn-replay" data-i18n="game.replay">Играть заново</button>
           <button class="btn btn-ghost"   id="btn-quit"   data-i18n="game.quit">В меню</button>

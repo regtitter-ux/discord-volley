@@ -1091,8 +1091,55 @@ setInterval(relayInputIfGuest, 33);
 
 /* ---------------- Pause & overlay ---------------- */
 const overlay = $("overlay");
+const overlayBox = $("overlay-box");
 const overlayTitle = $("overlay-title");
 const overlaySub = $("overlay-sub");
+const overlayScore = $("overlay-score");
+const overlayScoreP1 = $("overlay-score-p1");
+const overlayScoreP2 = $("overlay-score-p2");
+const overlayReward = $("overlay-reward");
+const overlayRewardVal = $("overlay-reward-val");
+
+// Заполняет end-match оверлей: заголовок (Victory/Defeat), сетка счёта
+// (своя сторона слева, соперник справа — как в HUD), подзаголовок с именем
+// соперника, pill-реверс трофеев (+win/−loss) как «сюрприз» после матча.
+// winnerSide: 1 — наша сторона победила, 2 — соперник. Для форфейта
+// sub-строка не зависит от счёта, передаётся явно через subOverride.
+function showEndOverlay(winnerSide, s1, s2, subOverride){
+  const isWin = winnerSide === 1;
+  overlayBox.classList.toggle("is-win",  isWin);
+  overlayBox.classList.toggle("is-loss", !isWin);
+  overlayTitle.textContent = I18n.t(isWin ? "game.victory" : "game.defeat");
+  if(typeof s1 === "number" && typeof s2 === "number"){
+    overlayScoreP1.textContent = String(s1);
+    overlayScoreP2.textContent = String(s2);
+    overlayScore.hidden = false;
+  } else {
+    overlayScore.hidden = true;
+  }
+  if(subOverride){
+    overlaySub.textContent = subOverride;
+  } else {
+    const name = isWin ? $("hud-name-p1").textContent : $("hud-name-p2").textContent;
+    overlaySub.textContent = name;
+  }
+  const st = state.stakes;
+  const amount = isWin ? (st && st.win | 0) : -(st && st.loss | 0);
+  if(amount){
+    overlayReward.hidden = false;
+    overlayReward.classList.toggle("is-loss", amount < 0);
+    overlayRewardVal.textContent = (amount > 0 ? "+" : "") + amount;
+  } else {
+    overlayReward.hidden = true;
+  }
+  // Restart reveal animations on each show (overlay reused across matches).
+  overlayBox.style.animation = "none";
+  overlayReward.style.animation = "none";
+  void overlayBox.offsetWidth;
+  overlayBox.style.animation = "";
+  overlayReward.style.animation = "";
+  overlay.classList.remove("hidden");
+}
 $("btn-replay").addEventListener("click", ()=>{
   // Новый матч — свежий matchId + свежие ставки трофеев. Иначе сервер
   // увидит повторный match_win по закрытому matchId и проигнорирует.
@@ -1516,12 +1563,9 @@ const Game = (function(){
     lastWinnerSide = winnerSide;
     // Keep the simulation running in the background (ball/players coast on
     // inertia, backdrop keeps drifting). Only input is gated — see step().
-    overlayTitle.textContent = I18n.t(winnerSide===1 ? "game.victory" : "game.defeat");
-    const name = winnerSide===1 ? ($("hud-name-p1").textContent) : ($("hud-name-p2").textContent);
-    overlaySub.textContent = name + " — " + score1 + " : " + score2;
     // Повтор доступен всегда: в боте — рестарт, в онлайне — в очередь.
     $("btn-replay").style.display = "";
-    overlay.classList.remove("hidden");
+    showEndOverlay(winnerSide, score1, score2);
     // Drop any keys the user was still holding so players don't keep accelerating.
     keys.left = keys.right = keys.jump = false;
     if(winnerSide === 1){
@@ -1782,12 +1826,9 @@ const Game = (function(){
     state.matchOver = true;
     lastWinnerSide = winnerSide;
     // После зеркалирования снапшота гость тоже видит «себя» как сторону 1.
-    overlayTitle.textContent = I18n.t(winnerSide === 1 ? "game.victory" : "game.defeat");
-    const name = winnerSide === 1 ? ($("hud-name-p1").textContent) : ($("hud-name-p2").textContent);
-    overlaySub.textContent = name + " — " + score1 + " : " + score2;
     // «Играть заново» в онлайне = выйти из матча и встать в новую очередь.
     $("btn-replay").style.display = "";
-    overlay.classList.remove("hidden");
+    showEndOverlay(winnerSide, score1, score2);
     keys.left = keys.right = keys.jump = false;
     if(winnerSide === 1){
       sfx.win();
@@ -1808,10 +1849,8 @@ const Game = (function(){
     if(!state.inGame || state.matchOver) return;
     state.matchOver = true;
     lastWinnerSide = 1;
-    overlayTitle.textContent = I18n.t("game.victory");
-    overlaySub.textContent = I18n.t("game.opponent_left");
     $("btn-replay").style.display = "";
-    overlay.classList.remove("hidden");
+    showEndOverlay(1, score1, score2, I18n.t("game.opponent_left"));
     keys.left = keys.right = keys.jump = false;
     sfx.win();
     Wallet.award("match.win", 50);
@@ -2659,15 +2698,14 @@ const Game = (function(){
   }
 
   // Перерисовать тексты overlay после смены языка. Ничего не делает,
-  // если overlay скрыт.
+  // если overlay скрыт. На форфейте подзаголовок — локализованный, и
+  // showEndOverlay перезапишет его по lastWinnerSide — для форфейта уже
+  // нет точного признака, поэтому просто обновим title+name (sub-override
+  // теряется на смену языка — редкий кейс, не стоит того).
   function refreshOverlay(){
     if(overlay.classList.contains("hidden")) return;
     if(state.matchOver){
-      overlayTitle.textContent = I18n.t(lastWinnerSide === 1 ? "game.victory" : "game.defeat");
-      const name = lastWinnerSide === 1
-        ? $("hud-name-p1").textContent
-        : $("hud-name-p2").textContent;
-      overlaySub.textContent = name + " — " + score1 + " : " + score2;
+      showEndOverlay(lastWinnerSide, score1, score2);
     }
   }
 
