@@ -451,7 +451,10 @@ function renderLbRow(entry, rank, meId){
   scoreEl.className = "lb-wins";
   scoreEl.textContent = String(entry.trophies || 0);
   const icoEl = document.createElement("img");
-  icoEl.src = "assets/trophy.webp";
+  // Статическая версия — в таблице лидеров до 10 строк, и 10 параллельных
+  // анимаций заметно грузят мобильный GPU. Анимированный трофей оставлен
+  // только на шапке меню (там он в единственном экземпляре — виден и не тормозит).
+  icoEl.src = "assets/trophy-static.webp";
   icoEl.className = "lb-trophy-ico";
   icoEl.alt = "";
   icoEl.width = 14; icoEl.height = 14;
