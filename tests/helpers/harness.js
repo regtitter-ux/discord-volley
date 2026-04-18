@@ -163,8 +163,10 @@ async function openClient(baseUrl, cookie, userId){
   });
   const client = new TestClient(ws, userId);
   // hello всегда приходит первым — дождёмся, чтобы все waitFor видели
-  // актуальный received-буфер.
-  await client.waitFor("hello", 3000);
+  // актуальный received-буфер. 8с запас: под полным npm test (node:test
+  // параллелит файлы) несколько child-серверов соревнуются за CPU/диск,
+  // и фрейм hello иногда доезжает позже дефолтных 3с.
+  await client.waitFor("hello", 8000);
   return client;
 }
 
