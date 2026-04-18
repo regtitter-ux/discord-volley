@@ -21,15 +21,18 @@ async function canvasSize(page){
   });
 }
 
-test("replay после peer_left: canvas не чёрный и screen-game виден", async ({ browser }) => {
+test("replay после peer_left: canvas не чёрный и screen-game виден", async ({ browser }, testInfo) => {
   const ctxA = await browser.newContext();
   const ctxB = await browser.newContext();
   const pageA = await ctxA.newPage();
   const pageB = await ctxB.newPage();
 
-  // Дев-логин в каждом контексте (свои cookies).
-  await devLogin(pageA, "e2e-replay-a");
-  await devLogin(pageB, "e2e-replay-b");
+  // Дев-логин с уникальным userId на проект (desktop-chrome/mobile-chrome):
+  // иначе параллельные прогоны кладут в один сервер клиентов с совпадающим
+  // userId — и "A" из desktop может запариться с "A" из mobile вместо B.
+  const tag = String(testInfo.project.name).replace(/[^a-z0-9]/gi, "-");
+  await devLogin(pageA, `e2e-replay-a-${tag}`);
+  await devLogin(pageB, `e2e-replay-b-${tag}`);
 
   await pageA.goto("/");
   await pageB.goto("/");
@@ -46,21 +49,27 @@ test("replay после peer_left: canvas не чёрный и screen-game ви�
   await expect(pageA.locator("#screen-game")).not.toHaveClass(/hidden/, { timeout: 10_000 });
   await expect(pageB.locator("#screen-game")).not.toHaveClass(/hidden/, { timeout: 10_000 });
 
-  // Оба должны быть в ОНЛАЙНЕ, не в боте (state.mode из замыкания через window hook).
-  const modeA = await pageA.evaluate(() => (window.__dvState || {}).mode);
-  const modeB = await pageB.evaluate(() => (window.__dvState || {}).mode);
-  expect(modeA).not.toBe("bot");
-  expect(modeB).not.toBe("bot");
+  // Ждём, пока обе стороны пропишут mode не-бот (может задержаться на 1-2
+  // кадра относительно screen-game.classList). Параллельные прогоны
+  // другого .spec на том же webServer иногда замедляют эту трассу.
+  await expect.poll(async () => {
+    const mA = await pageA.evaluate(() => (window.__dvState || {}).mode);
+    const mB = await pageB.evaluate(() => (window.__dvState || {}).mode);
+    return mA !== "bot" && mB !== "bot" ? "online" : `${mA}/${mB}`;
+  }, { timeout: 10_000 }).toBe("online");
 
-  // Пауза, чтобы у сервера точно успел прийти matched (ставки/opp). Короткая.
-  await pageA.waitForTimeout(300);
+  // Ждём state.inGame у B — это сигнал, что Game.start() уже прописал
+  // состояние и onPeerLeft сможет уйти в ветку endByForfeit.
+  await expect.poll(async () => {
+    return await pageB.evaluate(() => !!(window.__dvState || {}).inGame);
+  }, { timeout: 5_000 }).toBe(true);
 
   // A уходит в меню через btn-home → сервер рассылает peer_left → у B
   // срабатывает endByForfeit и показывает end-match оверлей с btn-replay.
   await pageA.locator("#btn-home").click();
 
   // B видит оверлей с кнопкой replay.
-  await expect(pageB.locator("#overlay")).not.toHaveClass(/hidden/, { timeout: 5_000 });
+  await expect(pageB.locator("#overlay")).not.toHaveClass(/hidden/, { timeout: 10_000 });
   await expect(pageB.locator("#btn-replay")).toBeVisible();
 
   // Выдержка в 1 секунду — как в acceptance criteria.
@@ -68,16 +77,15 @@ test("replay после peer_left: canvas не чёрный и screen-game ви�
   await pageB.locator("#btn-replay").click();
 
   // После replay: B делает quitToMenu → startMatchmaking. Пары нет, и через
-  // QUEUE_TIMEOUT_MS=1500мс сервер шлёт queue_timeout → клиент падает в
-  // бот-матч → show("game") + resizeCanvas. Ждём пока canvas не получит
-  // боевой размер (>=300×300).
+  // QUEUE_TIMEOUT_MS сервер шлёт queue_timeout → клиент падает в бот-матч
+  // → show("game") + resizeCanvas. Сначала дождёмся, что B снова на
+  // screen-game (после quitToMenu→show("menu") это не мгновенно), затем
+  // что canvas уехал в реальный размер.
+  await expect(pageB.locator("#screen-game")).not.toHaveClass(/hidden/, { timeout: 10_000 });
   await expect.poll(async () => {
     const s = await canvasSize(pageB);
     return s ? Math.min(s.w, s.h) : 0;
   }, { timeout: 10_000, intervals: [150, 250, 500, 1000] }).toBeGreaterThanOrEqual(300);
-
-  // screen-game не скрылся — канвас живой.
-  await expect(pageB.locator("#screen-game")).not.toHaveClass(/hidden/);
 
   await ctxA.close();
   await ctxB.close();

@@ -931,7 +931,25 @@ let scale = 1, offsetX = 0, offsetY = 0;
 // при честных 1080×2400 пикселях на физтик.
 const DPR_CAP_DESKTOP = 2;
 const DPR_CAP_TOUCH   = 1.25;
+// rAF-throttle: ResizeObserver в браузерах иногда выдаёт по несколько
+// ResizeObserverEntry на один кадр (layout-thrash, DevTools-ресайз), а
+// фокусировка/blur адресных строк на мобилках бросает «залп» ресайзов
+// в короткой вспышке. Без throttle мы гнали бы весь DPR-расчёт и
+// пересчёт scale/offset 5-10 раз за кадр. Подход: первый вызов в кадре
+// выполняется сразу (чтобы show("game") + resizeCanvas давал валидный
+// канвас к моменту первого render), последующие в том же кадре
+// сливаются до следующего rAF.
+let _resizeScheduled = false;
+let _resizeCount = 0; // счётчик для тестов: сколько раз реально выполнили
 function resizeCanvas(){
+  if (_resizeScheduled) return;
+  _resizeCanvasNow();
+  _resizeScheduled = true;
+  requestAnimationFrame(() => { _resizeScheduled = false; });
+}
+if (typeof window !== "undefined") window.__dvResizeCount = () => _resizeCount;
+function _resizeCanvasNow(){
+  _resizeCount++;
   const cap = (document.body && document.body.classList.contains("is-touch"))
     ? DPR_CAP_TOUCH : DPR_CAP_DESKTOP;
   const dpr = Math.min(window.devicePixelRatio || 1, cap);

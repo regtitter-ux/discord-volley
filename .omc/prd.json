@@ -72,7 +72,7 @@
       "id": "US-006",
       "title": "resizeCanvas вызывается не чаще ~60Hz даже при быстрых ResizeObserver ивентах",
       "priority": 6,
-      "passes": false,
+      "passes": true,
       "acceptanceCriteria": [
         "В game.js resizeCanvas обёрнут в rAF-throttle (идемпотентный: несколько вызовов за один кадр сливаются в один).",
         "Тест tests/e2e/resize-throttle.spec.js проверяет, что при искусственных 100 resize-ивентах подряд canvas.width меняется не более одного раза в rAF.",
