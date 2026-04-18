@@ -237,7 +237,7 @@ function ensureUser(user){ return DB.ensureUser(user); }
    матч и не перезапросил). */
 const TROPHY_WIN_MIN  = 20, TROPHY_WIN_MAX  = 35;
 const TROPHY_LOSS_MIN = 25, TROPHY_LOSS_MAX = 40;
-const matchStakes = new Map();
+const MATCH_STAKES_TTL_MS = 15 * 60 * 1000;
 
 function randInt(min, max){ return min + Math.floor(Math.random() * (max - min + 1)); }
 
@@ -250,24 +250,13 @@ function rollStakes(){
   };
 }
 
-const MATCH_STAKES_TTL_MS = 15 * 60 * 1000;
-function registerStakes(matchId, stakes){
-  stakes.createdAt = Date.now();
-  matchStakes.set(matchId, stakes);
-}
-// Один общий sweep вместо setTimeout на каждую ставку. 10k setTimeout'ов
-// в heap — это 10k таймеров + их GC, причём каждый создаёт замыкание на
-// matchId. Периодическая чистка раз в минуту дешевле на порядок.
-setInterval(() => {
-  const cutoff = Date.now() - MATCH_STAKES_TTL_MS;
-  for (const [k, v] of matchStakes){
-    if ((v.createdAt || 0) < cutoff) matchStakes.delete(k);
-  }
-}, 60 * 1000).unref();
-
 // userRates растёт линейно по числу уникальных юзеров за время аптайма и
 // никогда не освобождается. Раз в 5 минут выкидываем записи, где последняя
 // активность старше часа — кулдауны за это время всё равно истекли.
+// В multi-instance режиме userRates per-instance: это ок, т.к. ws-сессия
+// клиента держится одним инстансом, и все award'ы одного матча приходят
+// туда же. Суммарный кап по match.win защищён global-cooldown'ом 30с
+// (приближение, а не строгая гарантия через Redis — сознательный trade-off).
 const USER_RATES_TTL_MS = 60 * 60 * 1000;
 setInterval(() => {
   const cutoff = Date.now() - USER_RATES_TTL_MS;
@@ -282,20 +271,15 @@ setInterval(() => {
   }
 }, 5 * 60 * 1000).unref();
 
-function applyMatchOutcome(ws, matchId, outcome){
-  const st = matchStakes.get(matchId);
-  if (!st) return null;
-  if (outcome === "win") {
-    if (st.winnerReportedBy) return null;
-    st.winnerReportedBy = ws.user.id;
-  } else {
-    if (st.loserReportedBy) return null;
-    st.loserReportedBy = ws.user.id;
-  }
-  const delta = outcome === "win" ? st.win : -st.loss;
-  const total = DB.addTrophies(ws.user, delta);
-  console.log(`[lb] ${outcome} ${ws.user.id} Δ${delta} → ${total}`);
-  return { total, delta };
+// Атомарный claim через broker: под Redis это Lua-скрипт, гарантирующий,
+// что даже два инстанса не смогут выплатить win/loss дважды. Под LocalBroker
+// — обычная проверка поля на in-memory записи.
+async function applyMatchOutcome(userObj, matchId, outcome){
+  const r = await broker.claimOutcome(matchId, userObj.id, outcome);
+  if (!r) return null;
+  const total = DB.addTrophies(userObj, r.delta);
+  console.log(`[lb] ${outcome} ${userObj.id} Δ${r.delta} → ${total}`);
+  return { total, delta: r.delta };
 }
 
 /* ---------- Server-authoritative wallet ----------
@@ -372,9 +356,10 @@ app.get("/api/leaderboard", (req, res) => {
   });
 });
 
-app.get("/api/stats", (req, res) => {
+app.get("/api/stats", async (req, res) => {
   res.setHeader("Cache-Control", "no-store");
-  res.json({ online: onlineCount() });
+  const online = broker ? await broker.getOnline() : 0;
+  res.json({ online });
 });
 
 /* ---------- Static frontend ---------- */
@@ -421,6 +406,13 @@ app.get("*", (req, res, next) => {
 const httpServer = http.createServer(app);
 const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
 
+// Broker — абстракция над (local | redis). Инициализируется в startup
+// async IIFE ниже. Все multi-instance примитивы (очередь, relay, stakes,
+// online-counter) идут через него; под капотом либо in-memory, либо Redis.
+const { createBroker } = require("./broker");
+let broker = null;
+let INSTANCE_ID = crypto.randomBytes(6).toString("hex");
+
 // Разбор cookie + проверка HMAC-подписи тем же секретом, что и Express.
 const cookieLib       = require("cookie");
 const cookieSignature = require("cookie-signature");
@@ -439,30 +431,26 @@ function authUserFromCookie(req){
   } catch { return null; }
 }
 
-let waiting = null;        // WebSocket или null
 const QUEUE_TIMEOUT_MS = 30000;
 
-// Счётчик активных авторизованных соединений. Держим как число с инкрементом
-// на connection (после успеха auth) и декрементом на close — каждый вызов
-// онлайна больше не O(clients). broadcastStats шёл на каждый connect/close,
-// при 10k клиентах это быстрые квадратичные всплески: дросселим до 1 раза/2с
-// через leading-edge throttle с trailing-хвостом.
-let _online = 0;
-function onlineCount(){ return _online; }
-
+// stats broadcast — throttle 1 раз в 2с, leading-edge + trailing tail.
+// Под Redis-брокером счётчик онлайна общий; пульс публикуется каждым
+// инстансом в дружественный dv:stats канал, и каждый локально фанаутит
+// в свои wss.clients. В local-режиме работает идентично.
 const STATS_INTERVAL_MS = 2000;
 let _statsTimer   = null;
 let _statsPending = false;
+let _lastStatsTotal = 0;
 function _doBroadcastStats(){
-  const msg = JSON.stringify({ type: "stats", online: _online });
+  const msg = JSON.stringify({ type: "stats", online: _lastStatsTotal });
   wss.clients.forEach(c => { if (c.readyState === 1) { try { c.send(msg); } catch {} } });
 }
-function broadcastStats(){
+function scheduleStatsBroadcast(){
   if (_statsTimer){ _statsPending = true; return; }
   _doBroadcastStats();
   _statsTimer = setTimeout(() => {
     _statsTimer = null;
-    if (_statsPending){ _statsPending = false; broadcastStats(); }
+    if (_statsPending){ _statsPending = false; scheduleStatsBroadcast(); }
   }, STATS_INTERVAL_MS);
 }
 
@@ -512,86 +500,150 @@ function send(ws, obj){
   try { ws.send(JSON.stringify(obj)); } catch {}
 }
 
-function clearQueue(ws){
-  if (waiting === ws) {
-    waiting = null;
-    if (ws._queueTimer) { clearTimeout(ws._queueTimer); ws._queueTimer = null; }
+async function clearQueue(ws){
+  if (ws._inQueue){
+    ws._inQueue = false;
+    await broker.dequeue(ws._client);
   }
+  if (ws._queueTimer){ clearTimeout(ws._queueTimer); ws._queueTimer = null; }
 }
 
-function pair(host, guest){
-  clearQueue(host);
-  clearQueue(guest);
+// Локальный pair: оба клиента на этом инстансе. host — тот, что ждал,
+// guest — тот, что только что подошёл и заключил пару.
+async function pairLocal(host, guest){
   const roomId  = crypto.randomBytes(6).toString("hex");
   const matchId = "pm-" + crypto.randomBytes(8).toString("hex");
   const stakes  = rollStakes();
-  registerStakes(matchId, stakes);
-  host.peer  = guest; guest.peer = host;
+  await broker.setStakes(matchId, stakes, MATCH_STAKES_TTL_MS);
   host.role  = "host"; guest.role = "guest";
   host.roomId = guest.roomId = roomId;
   host.activeMatchId = guest.activeMatchId = matchId;
+  await broker.joinRoom(roomId, host._client);
+  await broker.joinRoom(roomId, guest._client);
   const stakesMsg = { win: stakes.win, loss: stakes.loss };
   send(host,  { type: "matched", role: "host",  room: roomId, matchId, stakes: stakesMsg, opponent: safeUser(guest.user) });
   send(guest, { type: "matched", role: "guest", room: roomId, matchId, stakes: stakesMsg, opponent: safeUser(host.user)  });
   console.log(`[ws] matched host=${host.user.id} guest=${guest.user.id} room=${roomId} match=${matchId} stakes=+${stakes.win}/-${stakes.loss}`);
 }
 
-function onQueue(ws){
-  if (ws.peer) return; // уже в матче — игнорируем повторный queue
-  if (waiting && waiting !== ws && waiting.readyState === 1) {
-    pair(waiting, ws);
+// Cross-instance pair: нас забрали из очереди на другом инстансе. Пришло
+// сообщение в наш dv:inst:<id> канал. Мы — host (ждали в очереди).
+async function onRemotePair(info){
+  const host = broker.clients.get(info.hostWsId);
+  if (!host || host.ws.readyState !== 1) return;
+  host.ws.role = "host";
+  host.ws.roomId = info.roomId;
+  host.ws.activeMatchId = info.matchId;
+  await broker.joinRoom(info.roomId, host);
+  const stakesMsg = { win: info.stakes.win, loss: info.stakes.loss };
+  send(host.ws, { type: "matched", role: "host", room: info.roomId, matchId: info.matchId, stakes: stakesMsg, opponent: info.guestUser });
+  console.log(`[ws] remote-matched host=${host.ws.user.id} room=${info.roomId} match=${info.matchId}`);
+}
+
+async function onQueue(ws){
+  if (ws.roomId) return; // уже в матче — игнорируем повторный queue
+  if (ws._inQueue) return;
+
+  const res = await broker.enqueue(ws._client);
+  if (res && res.kind === "local"){
+    const partner = res.partner.ws; // client wraps ws
+    if (partner && partner.readyState === 1){
+      await pairLocal(partner, ws);
+    }
     return;
   }
-  waiting = ws;
+  if (res && res.kind === "remote"){
+    // Партнёр на другом инстансе — мы guest, он host. Сгенерим общие
+    // идентификаторы и отправим pair туда.
+    const roomId  = crypto.randomBytes(6).toString("hex");
+    const matchId = "pm-" + crypto.randomBytes(8).toString("hex");
+    const stakes  = rollStakes();
+    await broker.setStakes(matchId, stakes, MATCH_STAKES_TTL_MS);
+    ws.role = "guest";
+    ws.roomId = roomId;
+    ws.activeMatchId = matchId;
+    await broker.joinRoom(roomId, ws._client);
+    const stakesMsg = { win: stakes.win, loss: stakes.loss };
+    send(ws, { type: "matched", role: "guest", room: roomId, matchId, stakes: stakesMsg, opponent: { id: res.partner.userId } });
+    await broker.publishPair(res.partner.instance, {
+      hostWsId:  res.partner.wsId,
+      guestUser: safeUser(ws.user),
+      roomId, matchId,
+      stakes: { win: stakes.win, loss: stakes.loss }
+    });
+    console.log(`[ws] cross-instance matched guest=${ws.user.id} room=${roomId} match=${matchId}`);
+    return;
+  }
+  // null → нас поставили в очередь, ждём.
+  ws._inQueue = true;
   if (ws._queueTimer) clearTimeout(ws._queueTimer);
-  ws._queueTimer = setTimeout(() => {
-    if (waiting === ws) {
-      waiting = null;
+  ws._queueTimer = setTimeout(async () => {
+    ws._queueTimer = null;
+    if (ws._inQueue){
+      ws._inQueue = false;
+      await broker.dequeue(ws._client);
       send(ws, { type: "queue_timeout" });
     }
   }, QUEUE_TIMEOUT_MS);
 }
 
-function leaveRoom(ws, reason){
-  const peer = ws.peer;
+async function leaveRoom(ws, reason){
   // Анти-ренакт: уходящий из активного матча автоматически получает
   // поражение (−loss трофеев). Только если матч ещё не закрыт и исход
   // от этого юзера ещё не пришёл. Cancel в лобби (до pair) не достигает
   // этой ветки — activeMatchId там не выставлен.
   const mid = ws.activeMatchId;
-  if (mid && reason !== "cancel") {
-    const st = matchStakes.get(mid);
-    if (st && !st.loserReportedBy && !st.winnerReportedBy){
-      const res = applyMatchOutcome(ws, mid, "loss");
-      if (res) send(ws, { type: "trophies", total: res.total, delta: res.delta });
-    }
+  if (mid && reason !== "cancel"){
+    const res = await applyMatchOutcome(ws.user, mid, "loss");
+    if (res) send(ws, { type: "trophies", total: res.total, delta: res.delta });
   }
+  const roomId = ws.roomId;
   ws.activeMatchId = null;
-  if (peer) {
-    peer.peer = null;
-    send(peer, { type: "peer_left", reason: reason || "disconnect" });
-  }
-  ws.peer = null;
   ws.roomId = null;
+  if (roomId){
+    // Уведомим пира (где бы он ни был) «control»-фреймом через publishRoom.
+    // В local-режиме это прямой send, в Redis-режиме — publish по каналу.
+    const frame = JSON.stringify({ type: "peer_left", reason: reason || "disconnect" });
+    broker.publishRoom(roomId, ws.wsId, frame);
+    await broker.leaveRoom(roomId, ws._client);
+  }
 }
 
-wss.on("connection", (ws, req) => {
+wss.on("connection", async (ws, req) => {
   const user = authUserFromCookie(req);
   if (!user) {
     try { ws.close(4401, "unauthorized"); } catch {}
     return;
   }
-  ws.user = user;
-  ws.peer = null;
-  ws.roomId = null;
-  ws._tokens  = MSG_BURST;
-  ws._tokensT = Date.now();
-  _online++;
+  ws.user          = user;
+  ws.roomId        = null;
+  ws.activeMatchId = null;
+  ws._tokens       = MSG_BURST;
+  ws._tokensT      = Date.now();
+  // wsId — стабильный идентификатор клиента на время жизни WebSocket-коннекта,
+  // общий для всех инстансов через Redis. В local-режиме тоже нужен:
+  // publishRoom использует его как senderId, чтобы не отправлять эхо себе.
+  ws.wsId    = broker.generateWsId();
+  ws._client = {
+    wsId:   ws.wsId,
+    userId: user.id,
+    ws,
+    // sendRaw — горячий путь доставки уже сериализованного фрейма (снапшот
+    // 30 Гц). Проверки readyState/bufferedAmount здесь обязательны, потому
+    // что broker.publishRoom зовёт sendRaw без собственных проверок.
+    sendRaw: (frame) => {
+      if (ws.readyState !== 1) return;
+      if (ws.bufferedAmount > WS_BACKPRESSURE_DROP) return;
+      try { ws.send(frame); } catch {}
+    }
+  };
+  broker.registerClient(ws._client);
+  _lastStatsTotal = await broker.incrOnline();
 
-  send(ws, { type: "hello", user: safeUser(user), online: onlineCount(), coins: userCoins(user.id), trophies: userTrophies(user.id) });
-  broadcastStats();
+  send(ws, { type: "hello", user: safeUser(user), online: _lastStatsTotal, coins: userCoins(user.id), trophies: userTrophies(user.id) });
+  scheduleStatsBroadcast();
 
-  ws.on("message", (raw) => {
+  ws.on("message", async (raw) => {
     if (!takeToken(ws)) return;
     // Сверхгабаритные фреймы отрезаем по сырому размеру ещё до JSON.parse.
     if (raw && raw.length > 8192) return;
@@ -601,14 +653,14 @@ wss.on("connection", (ws, req) => {
 
     switch (msg.type) {
       case "queue":
-        onQueue(ws);
+        await onQueue(ws);
         break;
       case "cancel":
-        clearQueue(ws);
-        if (ws.peer) leaveRoom(ws, "cancel");
+        await clearQueue(ws);
+        if (ws.roomId) await leaveRoom(ws, "cancel");
         break;
       case "leave":
-        leaveRoom(ws, "leave");
+        await leaveRoom(ws, "leave");
         break;
       case "match_stakes_request": {
         // Бот-матч: клиент сгенерил matchId локально и просит сервер
@@ -616,10 +668,10 @@ wss.on("connection", (ws, req) => {
         // запись — возвращаем кэш (ре-коннекты, повторный запрос).
         const mid = (typeof msg.matchId === "string") ? msg.matchId.slice(0, 64) : "";
         if (!mid) break;
-        let st = matchStakes.get(mid);
+        let st = await broker.getStakes(mid);
         if (!st){
           st = rollStakes();
-          registerStakes(mid, st);
+          await broker.setStakes(mid, st, MATCH_STAKES_TTL_MS);
         }
         ws.activeMatchId = mid;
         send(ws, { type: "match_stakes", matchId: mid, win: st.win, loss: st.loss });
@@ -631,7 +683,7 @@ wss.on("connection", (ws, req) => {
         // match_win с тем же matchId → no-op.
         const mid = (typeof msg.matchId === "string") ? msg.matchId.slice(0, 64) : (ws.activeMatchId || "");
         if (!mid) break;
-        const res = applyMatchOutcome(ws, mid, "win");
+        const res = await applyMatchOutcome(ws.user, mid, "win");
         if (res) send(ws, { type: "trophies", total: res.total, delta: res.delta });
         break;
       }
@@ -640,7 +692,7 @@ wss.on("connection", (ws, req) => {
         // Повторный match_loss с тем же matchId проигнорируется.
         const mid = (typeof msg.matchId === "string") ? msg.matchId.slice(0, 64) : (ws.activeMatchId || "");
         if (!mid) break;
-        const res = applyMatchOutcome(ws, mid, "loss");
+        const res = await applyMatchOutcome(ws.user, mid, "loss");
         if (res) send(ws, { type: "trophies", total: res.total, delta: res.delta });
         break;
       }
@@ -660,37 +712,53 @@ wss.on("connection", (ws, req) => {
       case "relay": {
         // Горячий путь — 30 Гц на матч, при 10k матчей это ~600k msg/s
         // через всех пиров. Минимизируем работу: один JSON.stringify
-        // итогового пакета (а не сначала payload отдельно), отсечка по длине
-        // уже сериализованной строки (4KB), и дроп, если у пира забит буфер
-        // (снапшот — идемпотентный, следующий долетит через 33 мс).
-        const peer = ws.peer;
-        if (!peer || peer.readyState !== 1) break;
-        if (peer.bufferedAmount > WS_BACKPRESSURE_DROP) break;
+        // итогового пакета, отсечка по длине уже сериализованной строки
+        // (4KB). В local-режиме publishRoom синхронно фанаутит фрейм всем
+        // членам комнаты на этом инстансе; в Redis — PUBLISH на per-room
+        // канале, fire-and-forget (снапшот идемпотентный, следующий
+        // долетит через 33 мс). Свой senderId broker использует, чтобы
+        // не доставлять эхо обратно отправителю.
+        if (!ws.roomId) break;
         const payload = msg.payload;
         if (!payload) break;
         let out;
         try { out = JSON.stringify({ type: "peer", payload }); } catch { break; }
         if (out.length >= 4096) break;
-        try { peer.send(out); } catch {}
+        broker.publishRoom(ws.roomId, ws.wsId, out);
         break;
       }
     }
   });
 
-  ws.on("close", () => {
-    _online--;
-    clearQueue(ws);
-    leaveRoom(ws, "disconnect");
+  ws.on("close", async () => {
+    _lastStatsTotal = await broker.decrOnline();
+    await clearQueue(ws);
+    await leaveRoom(ws, "disconnect");
+    broker.unregisterClient(ws._client);
     // Счётчик онлайна изменился — уведомим всех подключённых клиентов.
-    broadcastStats();
+    scheduleStatsBroadcast();
   });
 
   ws.on("error", () => {});
 });
 
-httpServer.listen(Number(PORT), () => {
-  console.log(`[discord-volley] listening on :${PORT}`);
-  console.log(`[discord-volley] public: ${APP_URL}`);
-  console.log(`[discord-volley] redirect_uri: ${REDIRECT_URI}`);
-  console.log(`[discord-volley] NODE_ENV=${NODE_ENV}`);
+// Брокер инициализируем ДО listen(): wss прицеплен к httpServer, пока он
+// не слушает — upgrade-запросы не приходят, так что обработчик connection
+// не дёрнет ещё-пустой broker. После init регистрируем колбэки для
+// cross-instance pair (нас разбудили через dv:inst:<id>) и stats pulse,
+// и запускаем housekeeping ставок (в Redis-режиме — no-op, там TTL в SET).
+(async () => {
+  broker = await createBroker({ redisUrl: process.env.REDIS_URL, instanceId: INSTANCE_ID });
+  broker.onPairFromPeer(onRemotePair);
+  broker.onStatsUpdate(total => { _lastStatsTotal = total; scheduleStatsBroadcast(); });
+  broker.startHousekeeping(MATCH_STAKES_TTL_MS);
+  httpServer.listen(Number(PORT), () => {
+    console.log(`[discord-volley] listening on :${PORT}`);
+    console.log(`[discord-volley] public: ${APP_URL}`);
+    console.log(`[discord-volley] redirect_uri: ${REDIRECT_URI}`);
+    console.log(`[discord-volley] NODE_ENV=${NODE_ENV} broker=${broker.kind} instance=${INSTANCE_ID}`);
+  });
+})().catch(e => {
+  console.error("[fatal] startup failed:", e);
+  process.exit(1);
 });
