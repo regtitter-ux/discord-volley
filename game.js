@@ -1678,6 +1678,38 @@ const Game = (function(){
     // и тем самым «телепортировал» фигурки обратно в спауны — визуально
     // выглядело как «игрок не двигается».
     if(state.mode === "guest"){
+      // Forward-extrapolation между снапшотами. Без этого гость застывает
+      // на 33мс (интервал snap-broadcast 30Гц) между авторитетными пакетами,
+      // и на слабом интернете это воспринимается как лаг: «прыжок → заморозка
+      // → прыжок». Экстраполируем по последней полученной скорости — ошибка
+      // за 33мс мала (игрок ~10px, мяч ~41px max) и гасится следующим снапшотом.
+      // Коллизий тут нет — авторитет у хоста, просто продвигаем позиции.
+      if(p1){
+        p1.x += p1.vx * dt;
+        if(!p1.onGround){
+          p1.vy += GRAV * dt;
+          p1.y  += p1.vy * dt;
+          if(p1.y + p1.r >= GROUND_Y){ p1.y = GROUND_Y - p1.r; p1.vy = 0; p1.onGround = true; }
+        }
+      }
+      if(p2){
+        p2.x += p2.vx * dt;
+        if(!p2.onGround){
+          p2.vy += GRAV * dt;
+          p2.y  += p2.vy * dt;
+          if(p2.y + p2.r >= GROUND_Y){ p2.y = GROUND_Y - p2.r; p2.vy = 0; p2.onGround = true; }
+        }
+      }
+      if(ball){
+        ball.vy += GRAV * dt;
+        ball.x  += ball.vx * dt;
+        ball.y  += ball.vy * dt;
+        ball.angle += ball.vx * dt * 0.025;
+        // Страховка от визуального «проваливания под землю» между снапшотами,
+        // если мяч как раз в момент удара о землю. Следующий снапшот всё
+        // равно перепишет авторитетную позицию.
+        if(ball.y + ball.r > GROUND_Y){ ball.y = GROUND_Y - ball.r; if(ball.vy > 0) ball.vy = 0; }
+      }
       return;
     }
 
@@ -1822,16 +1854,27 @@ const Game = (function(){
     // хоста гость — p2 (справа), поэтому p1 у нас собираем из s.p2 с
     // отражением x и vx, а p2 — из s.p1. Счёт и сторону подачи тоже
     // меняем местами, иначе при первой подаче мяч уедет не туда.
-    p1.x = WORLD_W - s.p2.x; p1.y = s.p2.y; p1.vx = -s.p2.vx; p1.vy = s.p2.vy; p1.onGround = !!s.p2.g;
-    p2.x = WORLD_W - s.p1.x; p2.y = s.p1.y; p2.vx = -s.p1.vx; p2.vy = s.p1.vy; p2.onGround = !!s.p1.g;
-    ball.x = WORLD_W - s.b.x; ball.y = s.b.y;
+    // prev НЕ ресетим: step-экстраполяция между снапшотами уже подвинула
+    // позицию близко к авторитетной, render-lerp prev→curr по alpha даёт
+    // плавный «мягкий» корректив вместо телепорта. Исключение — крупные
+    // скачки (респаун раунда): если ошибка > CORRECT_SNAP_PX, снапаем prev,
+    // чтобы не получить медленный дрейф через пол-экрана за один кадр.
+    const CORRECT_SNAP_PX = 120;
+    const nx1 = WORLD_W - s.p2.x, ny1 = s.p2.y;
+    const nx2 = WORLD_W - s.p1.x, ny2 = s.p1.y;
+    const nbx = WORLD_W - s.b.x,  nby = s.b.y;
+    const big = (Math.abs(nx1 - p1.x) > CORRECT_SNAP_PX || Math.abs(ny1 - p1.y) > CORRECT_SNAP_PX
+              || Math.abs(nx2 - p2.x) > CORRECT_SNAP_PX || Math.abs(ny2 - p2.y) > CORRECT_SNAP_PX
+              || Math.abs(nbx - ball.x) > CORRECT_SNAP_PX || Math.abs(nby - ball.y) > CORRECT_SNAP_PX);
+    p1.x = nx1; p1.y = ny1; p1.vx = -s.p2.vx; p1.vy = s.p2.vy; p1.onGround = !!s.p2.g;
+    p2.x = nx2; p2.y = ny2; p2.vx = -s.p1.vx; p2.vy = s.p1.vy; p2.onGround = !!s.p1.g;
+    ball.x = nbx; ball.y = nby;
     ball.vx = -s.b.vx; ball.vy = s.b.vy; ball.angle = -s.b.a;
-    // Снапшот — телепорт к авторитетной позиции. Подтягиваем prev к curr,
-    // иначе интерполятор между кадрами нарисовал бы «резиновый» полёт от
-    // старой позиции к новой.
-    p1.prevX = p1.x; p1.prevY = p1.y;
-    p2.prevX = p2.x; p2.prevY = p2.y;
-    ball.prevX = ball.x; ball.prevY = ball.y; ball.prevAngle = ball.angle;
+    if(big){
+      p1.prevX = p1.x; p1.prevY = p1.y;
+      p2.prevX = p2.x; p2.prevY = p2.y;
+      ball.prevX = ball.x; ball.prevY = ball.y; ball.prevAngle = ball.angle;
+    }
     servingSide = s.ss === 1 ? 2 : 1;
     roundOver = !!s.ro;
     const incomingRh = s.rh || 0;
