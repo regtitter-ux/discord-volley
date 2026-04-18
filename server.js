@@ -449,7 +449,9 @@ function authUserFromCookie(req){
   } catch { return null; }
 }
 
-const QUEUE_TIMEOUT_MS = 30000;
+// Таймаут ожидания пары в очереди. В проде 30с, но тесты переопределяют
+// через env QUEUE_TIMEOUT_MS, чтобы проверять regression-сценарии за <1с.
+const QUEUE_TIMEOUT_MS = Number(process.env.QUEUE_TIMEOUT_MS) || 30000;
 
 // stats broadcast — throttle 1 раз в 2с, leading-edge + trailing tail.
 // Под Redis-брокером счётчик онлайна общий; пульс публикуется каждым
@@ -526,6 +528,16 @@ async function clearQueue(ws){
   if (ws._queueTimer){ clearTimeout(ws._queueTimer); ws._queueTimer = null; }
 }
 
+// Локальный сброс таймера + флага, БЕЗ обращения к broker (на момент
+// pairLocal/onRemotePair нас уже достали из очереди — dequeue не нужен, а
+// на Redis он был бы лишним round-trip'ом). Ровно то, что нужно, чтобы
+// отсроченный queue_timeout не выстрелил в середине уже начатого матча.
+function clearQueueTimer(ws){
+  if (!ws) return;
+  if (ws._queueTimer){ clearTimeout(ws._queueTimer); ws._queueTimer = null; }
+  ws._inQueue = false;
+}
+
 // Локальный pair: оба клиента на этом инстансе. host — тот, что ждал,
 // guest — тот, что только что подошёл и заключил пару.
 async function pairLocal(host, guest){
@@ -536,6 +548,13 @@ async function pairLocal(host, guest){
   host.role  = "host"; guest.role = "guest";
   host.roomId = guest.roomId = roomId;
   host.activeMatchId = guest.activeMatchId = matchId;
+  // Критично: хост ждал в очереди — у него стоит _inQueue + _queueTimer.
+  // Без сброса через QUEUE_TIMEOUT_MS (30с) таймер сработает прямо посреди
+  // живого матча, увидит _inQueue=true и отправит хосту {type:"queue_timeout"}.
+  // Клиент воспримет это как «не нашли пару» и запустит startBotMatch поверх
+  // активного PvP-матча (→ бот у хоста, зависшая картинка у гостя).
+  clearQueueTimer(host);
+  clearQueueTimer(guest);
   await broker.joinRoom(roomId, host._client);
   await broker.joinRoom(roomId, guest._client);
   const stakesMsg = { win: stakes.win, loss: stakes.loss };
@@ -552,6 +571,9 @@ async function onRemotePair(info){
   host.ws.role = "host";
   host.ws.roomId = info.roomId;
   host.ws.activeMatchId = info.matchId;
+  // Тот же хазард, что и в pairLocal: у ждавшего хоста висит _queueTimer,
+  // который без сброса через 30с рубит живой матч через queue_timeout.
+  clearQueueTimer(host.ws);
   await broker.joinRoom(info.roomId, host);
   const stakesMsg = { win: info.stakes.win, loss: info.stakes.loss };
   send(host.ws, { type: "matched", role: "host", room: info.roomId, matchId: info.matchId, stakes: stakesMsg, opponent: info.guestUser });
