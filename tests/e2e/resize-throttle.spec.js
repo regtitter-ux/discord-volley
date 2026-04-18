@@ -27,23 +27,14 @@ test("resizeCanvas rAF-throttle: 100 вызовов в одном кадре = 1
     return window.__dvResizeCount();
   });
 
-  // Бомбим 100 прямых вызовов resizeCanvas синхронно (через reflection из
-  // модульной области — недоступно; дёргаем через ResizeObserver/resize
-  // событие. Но свободнее: эмулируем realistic залп через dispatchEvent
-  // window-resize и ручные прямые вызовы, если доступны).
-  // В проде фаст-путь — это ResizeObserver(canvas), который мы эмулируем
-  // просто форсированной сменой style canvas'а: observer выстрелит
-  // одним или двумя callback'ами, но все в одном кадре.
+  // 100 синхронных window.resize — слушатель на 'resize' внутри game.js
+  // вызывает resizeCanvas 100 раз подряд, и rAF-throttle должен схлопнуть
+  // их в одно реальное исполнение на кадр.
   const delta = await page.evaluate(async () => {
     const before = window.__dvResizeCount();
-    // Берём локальный resizeCanvas через window-событие resize и рАФом
-    // сливаем всё в ОДНОМ кадре: dispatchEvent синхронный, и слушатель
-    // на 'resize' вызовет resizeCanvas 100 раз подряд.
     for (let i = 0; i < 100; i++){
       window.dispatchEvent(new Event("resize"));
     }
-    // Ждём один rAF — throttle должен отработать, и только одно реальное
-    // исполнение добавится к counter'у.
     await new Promise(r => requestAnimationFrame(r));
     await new Promise(r => requestAnimationFrame(r));
     return window.__dvResizeCount() - before;

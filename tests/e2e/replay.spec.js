@@ -7,8 +7,8 @@ const { test, expect } = require("@playwright/test");
 // должен остаться чёрным 0×0 (исторический баг: show("menu") +
 // show("game") в онлайне без ResizeObserver теряли размеры canvas).
 // В этом тесте пара не воссоздаётся (A ушёл), второй уйдёт в бот через
-// queue_timeout=1500мс — важен сам факт, что после replay canvas
-// получает размеры и screen-game не скрыт.
+// QUEUE_TIMEOUT_MS (см. playwright.config.js) — важен сам факт, что
+// после replay canvas получает размеры и screen-game не скрыт.
 async function devLogin(page, id){
   const r = await page.request.get(`/dev/login?id=${id}&name=${encodeURIComponent(id)}`);
   expect(r.ok()).toBeTruthy();
