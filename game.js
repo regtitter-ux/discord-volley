@@ -211,6 +211,7 @@ function flashTrophyDelta(amount){
 renderTrophies();
 Trophies.onChange((delta)=>{
   renderTrophies();
+  renderHudTrophies();
   if(delta) flashTrophyDelta(delta);
 });
 
@@ -227,6 +228,31 @@ function updateStakesHud(){
     hudStakesEl.hidden = false;
   } else {
     hudStakesEl.hidden = true;
+  }
+}
+
+/* ---- Trophy balance per-player HUD ----
+   Под именем у каждого игрока — его баланс кубков (оба жёлтые). У p1
+   берём из Trophies (локальный источник истины, обновляется от wallet
+   сервера). У p2 — из state.opponent.trophies, которое сервер прислал
+   в matched.opponent. В бот-матче у p2 трофей нет — прячем. */
+function renderHudTrophies(){
+  const p1el  = $("hud-trophies-p1");
+  const p1val = $("hud-trophies-val-p1");
+  if(p1el && p1val){
+    p1val.textContent = String(Trophies.get());
+    p1el.hidden = false;
+  }
+  const p2el  = $("hud-trophies-p2");
+  const p2val = $("hud-trophies-val-p2");
+  if(p2el && p2val){
+    const opp = state.opponent;
+    if(state.mode !== "bot" && opp && typeof opp.trophies === "number"){
+      p2val.textContent = String(opp.trophies | 0);
+      p2el.hidden = false;
+    } else {
+      p2el.hidden = true;
+    }
   }
 }
 
@@ -286,6 +312,7 @@ function refreshLocalizedDynamicUI(){
       : userDisplayName(right);
   }
   $("hud-diff").textContent = I18n.t(state.mode === "bot" ? "hud.bot" : "hud.online");
+  renderHudTrophies();
   if(window.Game && typeof Game.refreshOverlay === "function") Game.refreshOverlay();
 }
 

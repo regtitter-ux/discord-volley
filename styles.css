@@ -243,7 +243,11 @@ body.is-touch .hud-stakes .trophy-ico{filter:none}
 
 .hud{position:absolute;top:calc(10px + var(--safe-top));left:50%;transform:translateX(-50%);display:flex;align-items:center;gap:14px;background:rgba(30,31,34,.78);backdrop-filter:blur(8px);-webkit-backdrop-filter:blur(8px);padding:8px 14px;border-radius:999px;max-width:calc(100% - 16px);border:1px solid rgba(255,255,255,.06)}
 .hud-side{display:flex;align-items:center;gap:10px;min-width:0}
+.hud-person{display:flex;flex-direction:column;align-items:flex-start;gap:1px;min-width:0;line-height:1}
+.hud-person-right{align-items:flex-end}
 .hud-name{font-size:12px;font-weight:600;max-width:96px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;color:var(--text)}
+.hud-trophies{display:inline-flex;align-items:center;gap:3px;font-size:11px;font-weight:700;color:#ffd34a;font-variant-numeric:tabular-nums;line-height:1}
+.hud-trophies .trophy-ico{filter:drop-shadow(0 1px 2px rgba(0,0,0,.35))}
 .hud-score{font-size:20px;font-weight:800;min-width:22px;text-align:center;transition:color .15s ease}
 @keyframes hud-score-pulse{
   0%  {transform:scale(1);   color:var(--text)}
@@ -253,7 +257,10 @@ body.is-touch .hud-stakes .trophy-ico{filter:none}
 .hud-score.pulse{animation:hud-score-pulse .45s ease}
 .hud-mid{display:flex;flex-direction:column;align-items:center;gap:2px;padding:0 8px;border-left:1px solid #3a3c43;border-right:1px solid #3a3c43}
 .hud-diff{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;font-weight:700}
-.hud-stakes{display:inline-flex;align-items:center;gap:4px;font-size:11px;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums;line-height:1}
+/* Ставки матча: компактный pill под HUD, центрованный. Вне самого HUD,
+   чтобы не тянуть основной бейдж и оставить приоритет за именем+счётом. */
+.hud-stakes{position:absolute;top:calc(10px + var(--safe-top) + 58px);left:50%;transform:translateX(-50%);display:inline-flex;align-items:center;gap:4px;font-size:10px;font-weight:700;color:var(--text);font-variant-numeric:tabular-nums;line-height:1;background:rgba(30,31,34,.72);backdrop-filter:blur(6px);-webkit-backdrop-filter:blur(6px);padding:3px 9px;border-radius:999px;border:1px solid rgba(255,255,255,.05);pointer-events:none;z-index:4}
+.hud-stakes[hidden]{display:none}
 .hud-stakes .trophy-ico{filter:drop-shadow(0 1px 2px rgba(0,0,0,.35))}
 .hud-stakes-win{color:#ffd34a}
 .hud-stakes-loss{color:#f87171}
@@ -301,6 +308,8 @@ body.is-touch #cv{height:calc(100% - 84px - var(--safe-bot))}
   .hud{padding:6px 10px;gap:10px}
   .hud-name{max-width:68px;font-size:11px}
   .hud-score{font-size:17px}
+  .hud-trophies{font-size:10px}
+  .hud-stakes{font-size:9px;padding:2px 7px;top:calc(10px + var(--safe-top) + 52px)}
   .tbtn-pill{width:54px;height:54px;font-size:22px}
 }
 @media (max-height:420px){
@@ -312,6 +321,8 @@ body.is-touch #cv{height:calc(100% - 84px - var(--safe-bot))}
   .hud{top:calc(6px + var(--safe-top));padding:4px 10px;gap:8px}
   .hud-name{max-width:56px}
   .hud-score{font-size:15px}
+  .hud-trophies{font-size:10px}
+  .hud-stakes{font-size:9px;padding:2px 6px;top:calc(6px + var(--safe-top) + 44px)}
   .avatar-sm{width:26px;height:26px;font-size:11px}
 }
 

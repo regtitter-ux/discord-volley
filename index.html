@@ -127,23 +127,39 @@
     <div class="hud">
       <div class="hud-side hud-left">
         <div class="avatar avatar-sm" id="hud-avatar-p1"></div>
-        <div class="hud-name" id="hud-name-p1">You</div>
+        <div class="hud-person">
+          <div class="hud-name" id="hud-name-p1">You</div>
+          <div class="hud-trophies" id="hud-trophies-p1" hidden>
+            <img class="trophy-ico" src="assets/trophy.svg" width="11" height="11" alt="" aria-hidden="true" decoding="async">
+            <span class="hud-trophies-val" id="hud-trophies-val-p1">0</span>
+          </div>
+        </div>
         <div class="hud-score" id="hud-score-p1">0</div>
       </div>
       <div class="hud-mid">
         <div class="hud-diff" id="hud-diff">Средняя</div>
-        <div class="hud-stakes" id="hud-stakes" hidden>
-          <img class="trophy-ico" src="assets/trophy.svg" width="14" height="14" alt="" aria-hidden="true" decoding="async">
-          <span class="hud-stakes-win"  id="hud-stakes-win">+0</span>
-          <span class="hud-stakes-sep">/</span>
-          <span class="hud-stakes-loss" id="hud-stakes-loss">−0</span>
-        </div>
       </div>
       <div class="hud-side hud-right">
         <div class="hud-score" id="hud-score-p2">0</div>
-        <div class="hud-name" id="hud-name-p2">Bot</div>
+        <div class="hud-person hud-person-right">
+          <div class="hud-name" id="hud-name-p2">Bot</div>
+          <div class="hud-trophies" id="hud-trophies-p2" hidden>
+            <img class="trophy-ico" src="assets/trophy.svg" width="11" height="11" alt="" aria-hidden="true" decoding="async">
+            <span class="hud-trophies-val" id="hud-trophies-val-p2">0</span>
+          </div>
+        </div>
         <div class="avatar avatar-sm" id="hud-avatar-p2"></div>
       </div>
+    </div>
+
+    <!-- Ставки трофеев на матч: +win/-loss. Отдельный pill под HUD,
+         чтобы не перегружать основной бейдж и держать визуальный приоритет
+         за счётом. На мобильных становится компактнее (см. styles.css). -->
+    <div class="hud-stakes" id="hud-stakes" hidden>
+      <img class="trophy-ico" src="assets/trophy.svg" width="12" height="12" alt="" aria-hidden="true" decoding="async">
+      <span class="hud-stakes-win"  id="hud-stakes-win">+0</span>
+      <span class="hud-stakes-sep">/</span>
+      <span class="hud-stakes-loss" id="hud-stakes-loss">−0</span>
     </div>
 
     <!-- Touch controls, shown only on touch devices.

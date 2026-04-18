@@ -510,7 +510,8 @@ function safeUser(u){
     id:          u.id,
     username:    u.username,
     global_name: u.global_name || u.username,
-    avatar_url:  u.avatar_url || null
+    avatar_url:  u.avatar_url || null,
+    trophies:    userTrophies(u.id)
   };
 }
 
