@@ -984,7 +984,7 @@ $("btn-lobby-cancel").addEventListener("click", ()=>{
 });
 
 /* ---------------- Canvas sizing ---------------- */
-const WORLD_W = 1000, WORLD_H = 500;
+const WORLD_W = 1080, WORLD_H = 540;
 let scale = 1, offsetX = 0, offsetY = 0;
 
 // Кап DPR: на 3x-Retina (iPhone) честный рендер в 3× увеличивает площадь
@@ -1305,7 +1305,7 @@ const Game = (function(){
   const JUMP      = 590;   // peak ≈ JUMP²/(2·GRAV) ≈ 139 px (~28% of field)
   const BALL_R    = 17;
   const PLR_R     = 42;    // slightly smaller for more room to maneuver
-  const NET_X     = WORLD_W*0.5, NET_W = 14, NET_H = 138;
+  const NET_X     = WORLD_W*0.5, NET_W = 14, NET_H = 152;
   const GROUND_Y  = WORLD_H - 30;   // ground line; player's feet rest HERE
   const E_WALL    = 0.85;
   const E_NET     = 0.85;
@@ -1778,16 +1778,25 @@ const Game = (function(){
           // Буфер пуст (сетевой дроп/спайк) — форвард-экстраполяция от последнего
           // снапа по его авторитетной скорости. Это fallback; обычно снапшот
           // приходит в пределах SNAP_STEP и мы возвращаемся на интерполяцию.
-          const dtA = Math.max(0, targetT - snapA.recvT);
+          // dtA клампим: на долгом WS-хитче (>300 мс) экстраполяция уносила p2/мяч
+          // за пределы поля по инерции, и приход следующего снапшота давал рывок
+          // на 200+ пикселей обратно. Замораживаем экстраполяцию на разумной
+          // границе — лучше «подвисший» соперник, чем улетевший и прыгающий.
+          const MAX_EXTRAPOLATE = 0.3;
+          const dtA = Math.min(MAX_EXTRAPOLATE, Math.max(0, targetT - snapA.recvT));
           const vx2 = -snapA.s.p1.vx, vy2 = snapA.s.p1.vy;
           const vbx = -snapA.s.b.vx,  vby = snapA.s.b.vy;
           const p2gnd = !!snapA.s.p1.g;
           p2.x = aP2x + vx2 * dtA;
           p2.y = p2gnd ? aP2y : (aP2y + vy2 * dtA + 0.5 * GRAV * dtA * dtA);
+          if(p2.x < p2.r) p2.x = p2.r;
+          if(p2.x > WORLD_W - p2.r) p2.x = WORLD_W - p2.r;
           if(p2.y + p2.r > GROUND_Y) p2.y = GROUND_Y - p2.r;
           ball.x = aBx + vbx * dtA;
           ball.y = aBy + vby * dtA + 0.5 * GRAV * dtA * dtA;
           ball.angle = aBa + vbx * dtA * 0.025;
+          if(ball.x < ball.r) ball.x = ball.r;
+          if(ball.x > WORLD_W - ball.r) ball.x = WORLD_W - ball.r;
           if(ball.y + ball.r > GROUND_Y) ball.y = GROUND_Y - ball.r;
         }
       }
@@ -3071,11 +3080,11 @@ function makeAI(difficulty, rand){
     hard:   { react:0.10, err:12,  jumpX:280, jumpMaxH:170, jumpChance:0.92, homeBias:1.0, moveChance:1.0,  deadzone:6  }
   })[difficulty] || {};
   let t = 0;
-  let target = 750;
+  let target = WORLD_W * 0.75;
   // Must match Game module constants.
   const GRAV     = 1250;
-  const NET_X    = 500;
-  const GROUND_Y = 470;
+  const NET_X    = WORLD_W * 0.5;
+  const GROUND_Y = WORLD_H - 30;
   const PLR_R    = 42;
   // AI aims to strike the ball at its ideal hit zone — just above the player's head.
   const STRIKE_Y = GROUND_Y - PLR_R * 2.4;
@@ -3087,7 +3096,7 @@ function makeAI(difficulty, rand){
     const tFall = (-b + Math.sqrt(D)) / (2*a);
     let x = ball.x + ball.vx * tFall;
     if(x < 0) x = -x;
-    if(x > 1000) x = 2000 - x;
+    if(x > WORLD_W) x = 2 * WORLD_W - x;
     return x;
   }
 
@@ -3102,7 +3111,7 @@ function makeAI(difficulty, rand){
       // AI is always p2 (right side).
       const onMySide = ball.x > NET_X;
       // Home position biased toward the net on higher difficulties
-      const home = 750 - 50*cfg.homeBias;
+      const home = WORLD_W * 0.75 - 50*cfg.homeBias;
       const aim  = onMySide ? target : home;
 
       const out = { left:false, right:false, jump:false };
