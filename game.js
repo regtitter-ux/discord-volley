@@ -2207,14 +2207,19 @@ const Game = (function(){
     //   1) hard snap — только для respawn (big) и катастрофического
     //      дрифта (>P1_HARD_SNAP_PX), это телепорт с ресетом скоростей.
     //   2) EMA-catchup — в штатном режиме плавно подтягиваем предсказание
-    //      к авторитетной позиции по CATCHUP_ALPHA за снапшот, чтобы
-    //      мелкие расхождения не копились до порога и не прорывались
-    //      единичным телепортом. Скорости не трогаем: prediction работает
-    //      на локальных инпутах, остаточная ошибка по скорости скажется
-    //      на позиции и утащится тем же EMA на следующих снапшотах.
+    //      к авторитетной позиции. При высоком RTT prediction стабильно
+    //      убегает на MOVE*RTT/2 пикселей вперёд от снапшота хоста, и
+    //      агрессивный α даёт визуальный «рывок назад» на каждом снапшоте
+    //      (наблюдали ~600 px/s на RTT≈150 мс). Dead-zone P1_DEAD_PX
+    //      убирает постоянное микро-дёрганье при штатном prediction-лаге
+    //      — при жирном drift тянем только избыток сверх dead-zone и
+    //      делаем это мягче (α=0.10): глазу плавно, за ~5 снапшотов
+    //      (~166 мс) мы сходимся. Скорости не трогаем: ошибка по скорости
+    //      скажется на позиции и утащится тем же EMA на следующих снапшотах.
     const CORRECT_SNAP_PX = 120;
     const P1_HARD_SNAP_PX = 400;
-    const P1_CATCHUP_ALPHA = 0.22;
+    const P1_DEAD_PX       = 25;
+    const P1_CATCHUP_ALPHA = 0.10;
     const nx1 = WORLD_W - s.p2.x, ny1 = s.p2.y;
     const nx2 = WORLD_W - s.p1.x, ny2 = s.p1.y;
     const nbx = WORLD_W - s.b.x,  nby = s.b.y;
@@ -2226,11 +2231,14 @@ const Game = (function(){
       _bigSnapCount++;
       p1.x = nx1; p1.y = ny1; p1.vx = -s.p2.vx; p1.vy = s.p2.vy; p1.onGround = !!s.p2.g;
       p1.prevX = p1.x; p1.prevY = p1.y;
-    } else if(p1Drift > 1){
+    } else if(p1Drift > P1_DEAD_PX){
       // prevX/prevY не сбрасываем: render-интерполяция между pre-step и
       // post-snapshot позицией естественно размажет коррекцию на кадр.
-      p1.x += (nx1 - p1.x) * P1_CATCHUP_ALPHA;
-      p1.y += (ny1 - p1.y) * P1_CATCHUP_ALPHA;
+      // Тянем только избыток сверх dead-zone, чтобы в «стабильном» режиме
+      // prediction-лаг не превращался в вечное подтягивание на каждом снапшоте.
+      const excess = (p1Drift - P1_DEAD_PX) / p1Drift;
+      p1.x += (nx1 - p1.x) * P1_CATCHUP_ALPHA * excess;
+      p1.y += (ny1 - p1.y) * P1_CATCHUP_ALPHA * excess;
     }
     p2.vx = -s.p1.vx; p2.vy = s.p1.vy; p2.onGround = !!s.p1.g;
     ball.vx = -s.b.vx; ball.vy = s.b.vy;
