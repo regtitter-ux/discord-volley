@@ -2946,9 +2946,19 @@ const Game = (function(){
     if(!lowQuality && !isTouch){
       const ft = dt * 1000;
       frameTimeAvg = frameTimeAvg * 0.9 + ft * 0.1;
-      if(frameTimeAvg > 22){
+      // Одиночный жирный кадр (>60 мс) — это уже catchup-стутер. На PC в
+      // двух вкладках/браузерах такие хитчи идут каждые пару секунд от
+      // GPU/CPU contention, и если ждать 60 подряд «плохих» кадров (EWMA-
+      // порог), то деградации не произойдёт никогда — хитчи редкие, EWMA
+      // усредняет их до нормы. Накидываем сразу 20 очков: три таких хитча
+      // за короткий период уже переваливают порог и срубают тяжёлый glow/
+      // panels/grid. Мгновенный кап 150 мс = моментальный freeze — такой
+      // единичный кадр сразу включает lowQuality, без ожидания.
+      if(ft > 150){ lowQuality = true; }
+      else if(ft > 60){ slowFrames += 20; if(slowFrames > 40) lowQuality = true; }
+      else if(frameTimeAvg > 22){
         slowFrames++;
-        if(slowFrames > 60) lowQuality = true;
+        if(slowFrames > 40) lowQuality = true;
       } else {
         slowFrames = Math.max(0, slowFrames - 1);
       }
