@@ -6,11 +6,10 @@
 
   const DICT = {
     ru: {
-      "app.title": "Discord Volley",
+      "app.title": "Volleyball Online",
 
       "login.subtitle": "Войдите, чтобы играть под своим аватаром",
       "login.button":   "Войти через Discord",
-      "login.hint":     "Это локальный тестовый режим — аватар генерируется для демонстрации. В продакшне здесь будет OAuth через Discord-бота.",
 
       "menu.status":    "В сети",
       "menu.decorations":"Украшения",
@@ -92,11 +91,10 @@
       "bot.prefix":     "Бот"
     },
     en: {
-      "app.title": "Discord Volley",
+      "app.title": "Volleyball Online",
 
       "login.subtitle": "Sign in to play under your avatar",
       "login.button":   "Sign in with Discord",
-      "login.hint":     "This is a local test mode — the avatar is generated for demo purposes. In production this will be Discord OAuth via a bot.",
 
       "menu.status":    "Online",
       "menu.decorations":"Decorations",
