@@ -1,4 +1,4 @@
-/* Discord Volley — lightweight vanilla canvas game.
+/* Volleyball Online — lightweight vanilla canvas game.
    No frameworks, no build. Fixed-timestep physics @ 120Hz, rendered via rAF. */
 (function(){
 "use strict";
@@ -991,7 +991,7 @@ let scale = 1, offsetX = 0, offsetY = 0;
 // пикселей в 9 раз по сравнению с 1× — это ощутимо бьёт по мобильным
 // iGPU. На десктопе допускаем 2×, на тач-устройствах жёстче — 1.25×,
 // т.к. мобильный GPU под радиальными градиентами/частицами захлёбывается
-// при честных 1080×2400 пикселях на физтик.
+// при честных 1080×2400 пикселях.
 const DPR_CAP_DESKTOP = 2;
 const DPR_CAP_TOUCH   = 1.25;
 // rAF-throttle: ResizeObserver в браузерах иногда выдаёт по несколько
@@ -1710,6 +1710,8 @@ const Game = (function(){
     state.session = null;
     lastWinnerSide = 0;
     cancelAnimationFrame(rafId);
+    rafId = 0;
+    _setBgTick(false);
     overlay.classList.add("hidden");
   }
 
@@ -3108,11 +3110,12 @@ const Game = (function(){
   }
 
   /* ------------- Loop ------------- */
-  function loop(){
-    rafId = requestAnimationFrame(loop);
-    // Читаем время через Clock, а не через rAF-аргумент. Так всё, что
-    // тикает в игре и rate-limits в кошельке, идёт от одного источника,
-    // в который позже можно подмешать серверный offset.
+  // Ядро тика: физика + опциональный рендер. Вызывается из rAF-loop, когда
+  // вкладка видима, и из Worker-драйвера (`_bgTick`), когда вкладка в фоне —
+  // браузер троттлит rAF до ~1 Гц на hidden-табах, и у хоста это ломает матч
+  // для оппонента (мяч «замирает», потому что физ-шаг и broadcastSnapshot
+  // перестают идти). Worker-таймеры троттлу не подвержены.
+  function _tickCore(){
     const now = Clock.now();
     let dt = (now - last) / 1000;
     last = now;
@@ -3131,9 +3134,11 @@ const Game = (function(){
     // alpha ∈ [0,1] — доля незакоммиченного физ-времени между последним
     // и следующим шагом. Передаём в render(), чтобы при рендер-частоте
     // выше физ-частоты (120/144/240 Гц) позиции между тиками интерполировались,
-    // а не «дёргались».
-    const alpha = Math.min(1, Math.max(0, acc / STEP));
-    render(alpha);
+    // а не «дёргались». В hidden-режиме рендер пропускаем — экран не виден.
+    if(!document.hidden){
+      const alpha = Math.min(1, Math.max(0, acc / STEP));
+      render(alpha);
+    }
     if(profile){
       const t2 = performance.now();
       if(!window.__dvProf) window.__dvProf = { step: [], render: [], steps: [] };
@@ -3144,8 +3149,9 @@ const Game = (function(){
     // Адаптивное качество: считаем EWMA времени кадра. Порог 22 мс ≈ 45 FPS
     // — ниже этого на десктопе включаем lowQuality и скидываем тяжёлые
     // фоновые слои. Нужно подряд несколько «плохих» кадров, чтобы не
-    // реагировать на разовый GC-пик.
-    if(!lowQuality && !isTouch){
+    // реагировать на разовый GC-пик. В hidden-режиме не считаем — dt там
+    // фиксированный 16мс от воркера и к реальному frame-time не относится.
+    if(!document.hidden && !lowQuality && !isTouch){
       const ft = dt * 1000;
       frameTimeAvg = frameTimeAvg * 0.9 + ft * 0.1;
       // Одиночный жирный кадр (>60 мс) — это уже catchup-стутер. На PC в
@@ -3166,6 +3172,67 @@ const Game = (function(){
       }
     }
   }
+
+  function loop(){
+    rafId = requestAnimationFrame(loop);
+    _tickCore();
+  }
+
+  // Background-tick через Worker. Таймеры воркера НЕ троттлятся, так что
+  // даже когда вкладка в фоне (rAF выдаёт ~1 Гц), мы продолжаем гонять
+  // физику и рассылать снапшоты — это критично на стороне хоста, иначе
+  // «оппонент переключил вкладку» = матч замерзает для второго игрока.
+  let _bgWorker = null;
+  let _bgActive = false;
+  function _ensureBgWorker(){
+    if(_bgWorker || typeof Worker === "undefined") return _bgWorker;
+    try{
+      const src =
+        "let h=null;onmessage=function(e){" +
+        "if(e.data===1){if(h)return;h=setInterval(function(){postMessage(0);},16);}" +
+        "else{if(h){clearInterval(h);h=null;}}};";
+      const url = URL.createObjectURL(new Blob([src], {type:"application/javascript"}));
+      _bgWorker = new Worker(url);
+      URL.revokeObjectURL(url);
+      _bgWorker.onmessage = () => {
+        if(!_bgActive) return;
+        if(!state.inGame) return;
+        _tickCore();
+      };
+    }catch(_){ _bgWorker = null; }
+    return _bgWorker;
+  }
+  function _setBgTick(on){
+    if(_bgActive === on) return;
+    _bgActive = on;
+    const w = _ensureBgWorker();
+    if(w){ try{ w.postMessage(on ? 1 : 0); }catch(_){} }
+  }
+
+  // Синхронизация источника тика с видимостью вкладки. В foreground — rAF,
+  // в background — worker-таймер, но только для участников, которые
+  // двигают авторитетное состояние (host/bot). Гостю в фоне делать нечего:
+  // ball/p2 приходят из снапшотов, а CSP своего p1 при hidden-вкладке всё
+  // равно не имеет смысла — ввода нет.
+  document.addEventListener("visibilitychange", () => {
+    if(document.hidden){
+      if(rafId){ cancelAnimationFrame(rafId); rafId = 0; }
+      if(state.inGame && (state.mode === "host" || state.mode === "bot")){
+        // last обновится в первом же _tickCore — это нормально, просто первый
+        // dt будет 0 (Clock.now() только что писали в last внутри loop).
+        last = Clock.now();
+        acc = 0;
+        _setBgTick(true);
+      }
+    } else {
+      _setBgTick(false);
+      // Сбрасываем last/acc, чтобы по возврату из фона не было жирного
+      // catchup-хитча (dt за время отсутствия мог быть большим).
+      last = Clock.now();
+      acc = 0;
+      if(state.inGame && !rafId) rafId = requestAnimationFrame(loop);
+    }
+  });
 
   // Перерисовать тексты overlay после смены языка. Ничего не делает,
   // если overlay скрыт. На форфейте подзаголовок — локализованный, и
