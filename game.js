@@ -1701,20 +1701,33 @@ const Game = (function(){
     // и тем самым «телепортировал» фигурки обратно в спауны — визуально
     // выглядело как «игрок не двигается».
     if(state.mode === "guest"){
-      // Forward-extrapolation между снапшотами. Без этого гость застывает
-      // на 33мс (интервал snap-broadcast 30Гц) между авторитетными пакетами,
-      // и на слабом интернете это воспринимается как лаг: «прыжок → заморозка
-      // → прыжок». Экстраполируем по последней полученной скорости — ошибка
-      // за 33мс мала (игрок ~10px, мяч ~41px max) и гасится следующим снапшотом.
-      // Коллизий тут нет — авторитет у хоста, просто продвигаем позиции.
-      if(p1){
-        p1.x += p1.vx * dt;
-        if(!p1.onGround){
-          p1.vy += GRAV * dt;
-          p1.y  += p1.vy * dt;
-          if(p1.y + p1.r >= GROUND_Y){ p1.y = GROUND_Y - p1.r; p1.vy = 0; p1.onGround = true; }
-        }
+      // Client-side prediction для своего игрока (p1). На интерконтинентальных
+      // RTT (150–300 мс) ждать ack'а хоста = видеть залипший слайм, отсюда
+      // ощущение «лагов» при дальних матчах. Мы симулируем p1 локально на
+      // тех же константах (MOVE/JUMP/GRAV/integratePlayer), что и хост
+      // применяет к p2 от принятого input-mask'а — физика идентична,
+      // поэтому drift между предсказанием и авторитетной позицией ограничен
+      // лишь MOVE*RTT (~60–120 px). Большие расхождения (respawn/teleport)
+      // снапаются в applySnapshot через p2/ball-triggered `big`.
+      // Используем applyInput (без coyote/jump-buffer), чтобы точно совпадать
+      // с тем, как хост трактует guest-input через applyInput(p2, peerKeys).
+      if(p1 && !state.matchOver){
+        applyInput(p1, keys.left, keys.right, keys.jump);
+      } else if(p1){
+        // Матч закончился — у хоста p1.vx гасится экспоненциально (см.
+        // ветку выше, после integratePlayer). Дублируем ту же константу,
+        // чтобы предсказание гостя не уезжало вечно по инерции.
+        const damp = Math.pow(0.4, dt);
+        p1.vx *= damp;
       }
+      if(p1){
+        // В зеркале гостя собственный слайм занимает левую половину поля —
+        // те же границы, что host использует для своего p1.
+        integratePlayer(p1, dt, 0, NET_X - NET_W*0.5);
+      }
+      // Соперник (p2) и мяч — forward-extrapolation по последней авторитетной
+      // скорости. На 30 Гц снапшотах 33 мс межснапшотной экстраполяции дают
+      // ошибку ~10/41 px, которую следующий снапшот переписывает.
       if(p2){
         p2.x += p2.vx * dt;
         if(!p2.onGround){
@@ -1895,19 +1908,29 @@ const Game = (function(){
     // плавный «мягкий» корректив вместо телепорта. Исключение — крупные
     // скачки (респаун раунда): если ошибка > CORRECT_SNAP_PX, снапаем prev,
     // чтобы не получить медленный дрейф через пол-экрана за один кадр.
+    //
+    // Собственный игрок (p1 у гостя) предсказывается локально в step() —
+    // не перезаписываем его из снапшота целиком, иначе на высоком RTT
+    // вернётся лаг: хост видит ввод на RTT/2 позже, его снапшот тянет
+    // предсказание назад. Снапаем только на больших разницах (respawn
+    // либо аномальный drift) через отдельный порог P1_SNAP_PX.
     const CORRECT_SNAP_PX = 120;
+    const P1_SNAP_PX = 240;
     const nx1 = WORLD_W - s.p2.x, ny1 = s.p2.y;
     const nx2 = WORLD_W - s.p1.x, ny2 = s.p1.y;
     const nbx = WORLD_W - s.b.x,  nby = s.b.y;
-    const big = (Math.abs(nx1 - p1.x) > CORRECT_SNAP_PX || Math.abs(ny1 - p1.y) > CORRECT_SNAP_PX
-              || Math.abs(nx2 - p2.x) > CORRECT_SNAP_PX || Math.abs(ny2 - p2.y) > CORRECT_SNAP_PX
+    const big = (Math.abs(nx2 - p2.x) > CORRECT_SNAP_PX || Math.abs(ny2 - p2.y) > CORRECT_SNAP_PX
               || Math.abs(nbx - ball.x) > CORRECT_SNAP_PX || Math.abs(nby - ball.y) > CORRECT_SNAP_PX);
-    p1.x = nx1; p1.y = ny1; p1.vx = -s.p2.vx; p1.vy = s.p2.vy; p1.onGround = !!s.p2.g;
+    const p1Drift = Math.hypot(nx1 - p1.x, ny1 - p1.y);
+    const snapP1 = big || p1Drift > P1_SNAP_PX;
+    if(snapP1){
+      p1.x = nx1; p1.y = ny1; p1.vx = -s.p2.vx; p1.vy = s.p2.vy; p1.onGround = !!s.p2.g;
+      p1.prevX = p1.x; p1.prevY = p1.y;
+    }
     p2.x = nx2; p2.y = ny2; p2.vx = -s.p1.vx; p2.vy = s.p1.vy; p2.onGround = !!s.p1.g;
     ball.x = nbx; ball.y = nby;
     ball.vx = -s.b.vx; ball.vy = s.b.vy; ball.angle = -s.b.a;
     if(big){
-      p1.prevX = p1.x; p1.prevY = p1.y;
       p2.prevX = p2.x; p2.prevY = p2.y;
       ball.prevX = ball.x; ball.prevY = ball.y; ball.prevAngle = ball.angle;
     }
