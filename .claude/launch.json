@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "discord-volley (dev)",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["--experimental-sqlite", "--env-file=.env", "server.js"],
+      "port": 8080
+    }
+  ]
+}

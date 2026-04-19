@@ -12,3 +12,4 @@ data-test/
 .omc/logs/
 playwright-report/
 test-results/
+.claude/settings.local.json
