@@ -12,6 +12,12 @@ const screens = {
 };
 const canvas = $("cv");
 const ctx = canvas.getContext("2d", { alpha:false });
+// Даунскейл текстуры мяча 128→~90 px на PC с DPR=2 без явного quality
+// получается «мыльным» в Chrome (алгоритм по умолчанию — near bilinear).
+// "high" → трёхступенчатое усреднение, цвета остаются насыщенными при
+// уменьшении. На телефоне мяч ~12 px, и без "high" цвета сливались в серое.
+ctx.imageSmoothingEnabled = true;
+ctx.imageSmoothingQuality = "high";
 
 /* ---------------- Clock ----------------
    Одна точка чтения времени на весь клиент. Сейчас это `Clock.now()`,
@@ -2900,9 +2906,13 @@ const Game = (function(){
     if(BALL_TEX.complete && BALL_TEX.naturalWidth){
       ctx.drawImage(BALL_TEX, -ball.r, -ball.r, ball.r*2, ball.r*2);
       if(hitFlash > 0){
+        // На PC мяч ~96 px — overlay #fff7c2 с "lighter" при alpha 0.55
+        // заметно обесцвечивает текстуру. На мобилке ~12 px это незаметно.
+        // Снижаем кап и скорость нарастания, чтобы вспышка подчёркивала удар,
+        // а не выжигала оранжевый.
         ctx.save();
         ctx.globalCompositeOperation = "lighter";
-        ctx.globalAlpha = Math.min(0.55, hitFlash * 3);
+        ctx.globalAlpha = Math.min(0.28, hitFlash * 1.4);
         ctx.fillStyle = "#fff7c2";
         ctx.beginPath(); ctx.arc(0, 0, ball.r, 0, Math.PI*2); ctx.fill();
         ctx.restore();
