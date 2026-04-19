@@ -1338,26 +1338,37 @@ const Game = (function(){
   let snapAcc = 0;
   const SNAP_STEP = 1/30;
   // Snapshot interpolation buffer (режим guest).
-  //   snapQ — входящие снапшоты в порядке приёма, каждый с recvT (локальное
-  //     время приёма, сек). Храним «сырой» s до зеркалирования, чтобы не
-  //     дублировать данные.
   //   snapA — последний потреблённый снапшот; служит «левой» точкой интерполяции
-  //     (правая — snapQ[0], если есть).
+  //     (правая — _snapQAt(0), если есть).
   //   renderDelay — адаптивная задержка рендера соперника/мяча в прошлое.
   //     Считается как max(SNAP_STEP*1.1, p95 интер-арривал гэпов) и клампится
   //     в [40, 140] мс. На локальной игре (RTT ~5 мс, jitter <5 мс) opponent
   //     виден через ~40 мс вместо фиксированных 100; на межконтиненталке сам
   //     поднимется до 120-140 мс и поглотит реальный jitter.
   //   SNAP_Q_MAX — 12 × 33 мс = 400 мс, отсекает зомби-буфер после хитча сети.
-  const snapQ = [];
-  let snapA = null;
+  // snapQ — ring buffer: на каждый приём снапшота push/shift давали по
+  // аллокации Array-внутренностей. На 30 Гц это 60 аллокаций/сек на хол. пути.
+  // Держим пул wrapper'ов { recvT, s } фиксированного размера, а snapA/snapB
+  // отдаём как прямые индексы в пул.
+  const SNAP_Q_MAX = 12;
+  const _snapSlots = new Array(SNAP_Q_MAX);
+  for(let i = 0; i < SNAP_Q_MAX; i++) _snapSlots[i] = { recvT: 0, s: null };
+  let _snapHead = 0;   // индекс самого старого wrapper'а в кольце
+  let _snapCount = 0;  // сколько живых элементов в очереди
+  function _snapQAt(i){
+    if(i < 0 || i >= _snapCount) return null;
+    return _snapSlots[(_snapHead + i) % SNAP_Q_MAX];
+  }
+  // snapA — «левая» точка интерполяции. Храним в отдельной ячейке (не внутри
+  // кольца), иначе push поверх её слота затёр бы payload.
+  const snapA = { recvT: 0, s: null };
+  let snapAValid = false;
   let renderDelay = 0.06;                         // старт: 2× SNAP_STEP
   const RENDER_DELAY_MIN = 0.035;
   const RENDER_DELAY_MAX = 0.14;
   const _snapGaps = [];
   const SNAP_GAP_WINDOW = 24;                     // ~0.8 с истории при 30 Гц
   let _lastSnapRecvT = 0;
-  const SNAP_Q_MAX = 12;
   let hitFlash = 0;
   let jumpBufferT = 0;
   let stuckT = 0;
@@ -1395,7 +1406,14 @@ const Game = (function(){
   let bigText = null;                    // { text, t, dur, color, size }
   // Активные «эмоции» над игроками. Каждая: { emoji, t, dur, side }.
   // side: 1 — игрок (левый), 2 — соперник (правый).
-  const emotes = [];
+  // Emotes — pool: до 3 на сторону × 2 = 6 одновременно. Pool на 8 слотов
+  // с dead-флагом; push/splice заменены на mutate-in-place.
+  const EMOTE_CAP = 8;
+  const emotes = new Array(EMOTE_CAP);
+  for(let i = 0; i < EMOTE_CAP; i++){
+    emotes[i] = { id: "", t: 0, dur: 0, side: 0, seq: 0, dead: true };
+  }
+  let _emoteSeq = 0;
   const EMOTE_DUR = 1.8;
   const squash = { ball:0, p1:0, p2:0 }; // timers that scale targets briefly
   let clouds = null;                     // parallax cloud layer, built once
@@ -1477,14 +1495,32 @@ const Game = (function(){
   function triggerEmote(side, id){
     if(!state.inGame || state.matchOver) return;
     if(!id) return;
-    let count = 0;
-    for(const e of emotes) if(e.side === side) count++;
-    if(count >= 3){
-      for(let i=0;i<emotes.length;i++){
-        if(emotes[i].side === side){ emotes.splice(i,1); break; }
+    // Считаем живые на стороне и одновременно ищем кандидата на вытеснение
+    // (самый старый по seq) и свободный слот.
+    let count = 0, oldestIdx = -1, oldestSeq = Infinity, freeIdx = -1;
+    for(let i = 0; i < EMOTE_CAP; i++){
+      const e = emotes[i];
+      if(e.dead){ if(freeIdx < 0) freeIdx = i; continue; }
+      if(e.side === side){
+        count++;
+        if(e.seq < oldestSeq){ oldestSeq = e.seq; oldestIdx = i; }
       }
     }
-    emotes.push({ id, t:0, dur: EMOTE_DUR, side });
+    let slotIdx;
+    if(count >= 3 && oldestIdx >= 0){
+      slotIdx = oldestIdx;                   // вытесняем самый старый той же стороны
+    } else if(freeIdx >= 0){
+      slotIdx = freeIdx;                     // свободный слот
+    } else {
+      return;                                // пул полон — игнорируем (кап 8 и без того щедрый)
+    }
+    const slot = emotes[slotIdx];
+    slot.id   = id;
+    slot.t    = 0;
+    slot.dur  = EMOTE_DUR;
+    slot.side = side;
+    slot.seq  = ++_emoteSeq;
+    slot.dead = false;
   }
 
   function buildClouds(){
@@ -1614,13 +1650,13 @@ const Game = (function(){
     matchTime = 0;
     // Сбрасываем буфер интерполяции — старые снапшоты прошлого матча не
     // должны утянуть позиции в новом.
-    snapQ.length = 0;
-    snapA = null;
+    _snapHead = 0; _snapCount = 0;
+    snapA.s = null; snapAValid = false;
     _snapGaps.length = 0;
     _lastSnapRecvT = 0;
     renderDelay = 0.06;
     for(let i = 0; i < PARTICLE_CAP; i++) particles[i].dead = true;
-    emotes.length = 0;
+    for(let i = 0; i < EMOTE_CAP; i++) emotes[i].dead = true;
     trailHead = 0; trailCount = 0;
     squash.ball = squash.p1 = squash.p2 = 0;
     bigText = null;
@@ -1735,9 +1771,11 @@ const Game = (function(){
       bigText.t += dt;
       if(bigText.t >= bigText.dur) bigText = null;
     }
-    for(let i = emotes.length - 1; i >= 0; i--){
-      emotes[i].t += dt;
-      if(emotes[i].t >= emotes[i].dur) emotes.splice(i, 1);
+    for(let i = 0; i < EMOTE_CAP; i++){
+      const e = emotes[i];
+      if(e.dead) continue;
+      e.t += dt;
+      if(e.t >= e.dur) e.dead = true;
     }
     // Trail ring buffer: head идёт вперёд, count растёт до TRAIL_LEN.
     trailHead = (trailHead + 1) % TRAIL_LEN;
@@ -1781,13 +1819,18 @@ const Game = (function(){
       // ставит интерполяция ниже.
       const nowT = Clock.now() / 1000;
       const targetT = nowT - renderDelay;
-      while(snapQ.length > 0 && snapQ[0].recvT <= targetT){
-        const e = snapQ.shift();
+      while(_snapCount > 0 && _snapSlots[_snapHead].recvT <= targetT){
+        const e = _snapSlots[_snapHead];
         consumeSnapshot(e.s);
-        snapA = e;
+        // Копируем поля wrapper'а в snapA — сам wrapper в кольце могут переиспользовать.
+        snapA.recvT = e.recvT;
+        snapA.s     = e.s;
+        snapAValid  = true;
+        _snapHead = (_snapHead + 1) % SNAP_Q_MAX;
+        _snapCount--;
       }
-      if(snapA && p2 && ball){
-        const B = snapQ[0] || null;
+      if(snapAValid && p2 && ball){
+        const B = _snapQAt(0);
         const aP2x = WORLD_W - snapA.s.p1.x, aP2y = snapA.s.p1.y;
         const aBx  = WORLD_W - snapA.s.b.x,  aBy  = snapA.s.b.y;
         const aBa  = -snapA.s.b.a;
@@ -1975,8 +2018,16 @@ const Game = (function(){
     // давая буфер для интерполяции между двумя известными кадрами.
     if(state.mode !== "guest" || !p1 || !p2 || !ball) return;
     const now = Clock.now() / 1000;
-    snapQ.push({ recvT: now, s });
-    if(snapQ.length > SNAP_Q_MAX) snapQ.shift();
+    // Кольцо заполнено → самый старый слот замещается (drop-oldest).
+    if(_snapCount === SNAP_Q_MAX){
+      _snapHead = (_snapHead + 1) % SNAP_Q_MAX;
+      _snapCount--;
+    }
+    const tailIdx = (_snapHead + _snapCount) % SNAP_Q_MAX;
+    const slot = _snapSlots[tailIdx];
+    slot.recvT = now;
+    slot.s     = s;
+    _snapCount++;
     // Адаптация renderDelay: p95 интер-арривал гэпов за последние SNAP_GAP_WINDOW
     // снапшотов. Плавно подбираем задержку к реальному jitter сети. Не даём
     // колебаниям переехать вниз (EMA-сглаживание на убывании), иначе один
@@ -2389,18 +2440,12 @@ const Game = (function(){
     ctx.rect(0, 0, WORLD_W, WORLD_H);
     ctx.clip();
 
-    // Sky gradient
-    ctx.fillStyle = skyGrad();
-    ctx.fillRect(0,0,WORLD_W,WORLD_H);
-
-    // На тач-устройствах и на замеренно-слабых десктопах три фоновых слоя
-    // пропускаем: drawBackdropGlow — 2 полноэкранных альфа-градиента за кадр
-    // (fill-rate на мобилках и слабых GPU кусается), drawBackPanels —
-    // десятки roundRect+fillRect поверх канваса, а drawChannelGrid — ещё и
-    // полноэкранный sidebarGrad сверху. Небо + облака + net halo достаточно,
-    // чтобы сцена не смотрелась голой.
+    // Sky + backdrop-glow запечены в один спрайт — 1 drawImage вместо 3
+    // полноэкранных alpha-fill'ов каждый кадр. Остальные фоновые слои ниже
+    // анимированы (channelGrid scroll, backPanels parallax) и остаются per-frame.
+    buildBackdropSprite();
+    ctx.drawImage(_backdropSprite, 0, 0, WORLD_W, WORLD_H);
     if(!isTouch && !lowQuality){
-      drawBackdropGlow();
       drawChannelGrid();
       drawBackPanels();
     }
@@ -2494,15 +2539,6 @@ const Game = (function(){
     const cx = NET_X, cy = GROUND_Y - NET_H * 0.55;
     ctx.fillStyle = netHaloGrad();
     ctx.fillRect(cx - 180, cy - 180, 360, 360);
-  }
-
-  // Soft Blurple ambient glow from the upper-right, like a light source behind
-  // a Discord channel panel. Replaces the old sun.
-  function drawBackdropGlow(){
-    ctx.fillStyle = backdropGlow1();
-    ctx.fillRect(0, 0, WORLD_W, GROUND_Y);
-    ctx.fillStyle = backdropGlow2();
-    ctx.fillRect(0, 0, WORLD_W, GROUND_Y);
   }
 
   // Каждое облако — набор статичных векторных фигур, которые мы раньше
@@ -2711,7 +2747,7 @@ const Game = (function(){
   }
 
   function drawEmotes(){
-    for(const e of emotes) drawEmote(e);
+    for(let i = 0; i < EMOTE_CAP; i++){ if(!emotes[i].dead) drawEmote(emotes[i]); }
     ctx.globalAlpha = 1;
   }
 
@@ -2755,23 +2791,54 @@ const Game = (function(){
 
   // Кэш статичных градиентов: форма фиксирована, цвета не меняются — создаём
   // объекты лениво один раз, вместо пересоздания каждый кадр.
-  let _skyGrad = null, _sidebarGrad = null, _netHaloGrad = null,
-      _backdropGlow1 = null, _backdropGlow2 = null, _netPostsGrad = null,
+  let _sidebarGrad = null, _netHaloGrad = null, _netPostsGrad = null,
       _ballNormalGrad = null, _ballFlashGrad = null;
 
   const BALL_TEX = new Image();
   BALL_TEX.src = "assets/volleyball.png";
 
-  function skyGrad(){
-    if(_skyGrad) return _skyGrad;
-    // Discord dark-mode feel: near-black at top fading into the "chat panel" tone.
-    const g = ctx.createLinearGradient(0,0,0,GROUND_Y);
-    g.addColorStop(0,    "#1e1f22");
-    g.addColorStop(0.55, "#2b2d31");
-    g.addColorStop(1,    "#313338");
-    _skyGrad = g;
-    return g;
+  // Static backdrop baked to OffscreenCanvas (или обычный canvas для Safari ≤16.3):
+  // раньше каждый кадр рисовали sky-gradient + два radial-glow полноэкранно —
+  // это 3 тяжёлых alpha-fill'а на GPU. Теперь один drawImage, сам спрайт
+  // строится один раз и пересобирается только на смене quality (lo/hi).
+  let _backdropSprite = null;
+  let _backdropSpriteQ = "";
+  function _makeOffscreen(w, h){
+    if(typeof OffscreenCanvas !== "undefined"){
+      try{ return new OffscreenCanvas(w, h); }catch(_){}
+    }
+    const c = document.createElement("canvas");
+    c.width = w; c.height = h;
+    return c;
   }
+  function buildBackdropSprite(){
+    const q = (!isTouch && !lowQuality) ? "hi" : "lo";
+    if(_backdropSprite && _backdropSpriteQ === q) return;
+    if(!_backdropSprite) _backdropSprite = _makeOffscreen(WORLD_W, WORLD_H);
+    const g = _backdropSprite.getContext("2d");
+    g.clearRect(0, 0, WORLD_W, WORLD_H);
+    const sky = g.createLinearGradient(0, 0, 0, GROUND_Y);
+    sky.addColorStop(0,    "#1e1f22");
+    sky.addColorStop(0.55, "#2b2d31");
+    sky.addColorStop(1,    "#313338");
+    g.fillStyle = sky;
+    g.fillRect(0, 0, WORLD_W, WORLD_H);
+    if(q === "hi"){
+      const gl1 = g.createRadialGradient(WORLD_W*0.78, 110, 0, WORLD_W*0.78, 110, 320);
+      gl1.addColorStop(0,    "rgba(88,101,242,0.38)");
+      gl1.addColorStop(0.55, "rgba(88,101,242,0.10)");
+      gl1.addColorStop(1,    "rgba(88,101,242,0)");
+      g.fillStyle = gl1;
+      g.fillRect(0, 0, WORLD_W, GROUND_Y);
+      const gl2 = g.createRadialGradient(WORLD_W*0.18, GROUND_Y*0.7, 0, WORLD_W*0.18, GROUND_Y*0.7, 260);
+      gl2.addColorStop(0, "rgba(35,165,90,0.18)");
+      gl2.addColorStop(1, "rgba(35,165,90,0)");
+      g.fillStyle = gl2;
+      g.fillRect(0, 0, WORLD_W, GROUND_Y);
+    }
+    _backdropSpriteQ = q;
+  }
+
   function sidebarGrad(){
     if(_sidebarGrad) return _sidebarGrad;
     const g = ctx.createLinearGradient(0, 0, 140, 0);
@@ -2787,24 +2854,6 @@ const Game = (function(){
     g.addColorStop(0, "rgba(88,101,242,0.22)");
     g.addColorStop(1, "rgba(88,101,242,0)");
     _netHaloGrad = g;
-    return g;
-  }
-  function backdropGlow1(){
-    if(_backdropGlow1) return _backdropGlow1;
-    const sx = WORLD_W*0.78, sy = 110;
-    const g = ctx.createRadialGradient(sx, sy, 0, sx, sy, 320);
-    g.addColorStop(0, "rgba(88,101,242,0.38)");
-    g.addColorStop(0.55, "rgba(88,101,242,0.10)");
-    g.addColorStop(1, "rgba(88,101,242,0)");
-    _backdropGlow1 = g;
-    return g;
-  }
-  function backdropGlow2(){
-    if(_backdropGlow2) return _backdropGlow2;
-    const g = ctx.createRadialGradient(WORLD_W*0.18, GROUND_Y*0.7, 0, WORLD_W*0.18, GROUND_Y*0.7, 260);
-    g.addColorStop(0, "rgba(35,165,90,0.18)");
-    g.addColorStop(1, "rgba(35,165,90,0)");
-    _backdropGlow2 = g;
     return g;
   }
   function netPostsGrad(){
@@ -3137,8 +3186,8 @@ const Game = (function(){
       p1: p1 ? { x: p1.x, y: p1.y, vx: p1.vx, vy: p1.vy, g: p1.onGround } : null,
       p2: p2 ? { x: p2.x, y: p2.y, vx: p2.vx, vy: p2.vy, g: p2.onGround } : null,
       ball: ball ? { x: ball.x, y: ball.y, vx: ball.vx, vy: ball.vy } : null,
-      score1, score2, snapQLen: snapQ.length,
-      snapAtoB: snapA && snapQ[0] ? (snapQ[0].recvT - snapA.recvT) : null,
+      score1, score2, snapQLen: _snapCount,
+      snapAtoB: snapAValid && _snapCount > 0 ? (_snapQAt(0).recvT - snapA.recvT) : null,
       renderDelay
     };
   }
