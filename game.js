@@ -1343,15 +1343,20 @@ const Game = (function(){
   //     дублировать данные.
   //   snapA — последний потреблённый снапшот; служит «левой» точкой интерполяции
   //     (правая — snapQ[0], если есть).
-  //   RENDER_DELAY — рендерим соперника и мяч на этой задержке в прошлое.
-  //     100 мс = ~3× SNAP_STEP — поглощает джиттер до ~66 мс и один дроп пакета
-  //     без визуальных хитчей. Платим постоянной задержкой видимости действий
-  //     соперника, но убираем rubber-band на ударах мяча (где extrapolation
-  //     показывала старое направление до прихода нового снапа).
+  //   renderDelay — адаптивная задержка рендера соперника/мяча в прошлое.
+  //     Считается как max(SNAP_STEP*1.1, p95 интер-арривал гэпов) и клампится
+  //     в [40, 140] мс. На локальной игре (RTT ~5 мс, jitter <5 мс) opponent
+  //     виден через ~40 мс вместо фиксированных 100; на межконтиненталке сам
+  //     поднимется до 120-140 мс и поглотит реальный jitter.
   //   SNAP_Q_MAX — 12 × 33 мс = 400 мс, отсекает зомби-буфер после хитча сети.
   const snapQ = [];
   let snapA = null;
-  const RENDER_DELAY = 0.1;
+  let renderDelay = 0.06;                         // старт: 2× SNAP_STEP
+  const RENDER_DELAY_MIN = 0.035;
+  const RENDER_DELAY_MAX = 0.14;
+  const _snapGaps = [];
+  const SNAP_GAP_WINDOW = 24;                     // ~0.8 с истории при 30 Гц
+  let _lastSnapRecvT = 0;
   const SNAP_Q_MAX = 12;
   let hitFlash = 0;
   let jumpBufferT = 0;
@@ -1591,6 +1596,9 @@ const Game = (function(){
     // должны утянуть позиции в новом.
     snapQ.length = 0;
     snapA = null;
+    _snapGaps.length = 0;
+    _lastSnapRecvT = 0;
+    renderDelay = 0.06;
     particles.length = 0;
     emotes.length = 0;
     trail.length = 0;
@@ -1724,15 +1732,15 @@ const Game = (function(){
       // Client-side prediction для своего игрока (p1). На интерконтинентальных
       // RTT (150–300 мс) ждать ack'а хоста = видеть залипший слайм, отсюда
       // ощущение «лагов» при дальних матчах. Мы симулируем p1 локально на
-      // тех же константах (MOVE/JUMP/GRAV/integratePlayer), что и хост
-      // применяет к p2 от принятого input-mask'а — физика идентична,
-      // поэтому drift между предсказанием и авторитетной позицией ограничен
-      // лишь MOVE*RTT (~60–120 px). Большие расхождения (respawn/teleport)
-      // снапаются в consumeSnapshot через p2/ball-triggered `big`.
-      // Используем applyInput (без coyote/jump-buffer), чтобы точно совпадать
-      // с тем, как хост трактует guest-input через applyInput(p2, peerKeys).
+      // тех же константах (MOVE/JUMP/GRAV/integratePlayer), что и хост.
+      // applyHumanInput (а не applyInput) — с coyote/jump-buffer/autohop, как
+      // на хосте через applyHumanInput(p1). Хост у себя трактует наш input
+      // через упрощённый applyInput(p2, peerKeys) — отсюда разница max в
+      // один кадр на таймингах прыжка/отскока, которую снапает reconciliation.
+      // Разница в ощущении — большая: без autohop гость не может зажать W и
+      // прыгать непрерывно, а на хосте это работает.
       if(p1 && !state.matchOver){
-        applyInput(p1, keys.left, keys.right, keys.jump);
+        applyHumanInput(p1, dt);
       } else if(p1){
         // Матч закончился — у хоста p1.vx гасится экспоненциально (см.
         // ветку выше, после integratePlayer). Дублируем ту же константу,
@@ -1749,7 +1757,7 @@ const Game = (function(){
       // Каждое потребление даёт авторитетные события/скорости; позиции p2/мяча
       // ставит интерполяция ниже.
       const nowT = Clock.now() / 1000;
-      const targetT = nowT - RENDER_DELAY;
+      const targetT = nowT - renderDelay;
       while(snapQ.length > 0 && snapQ[0].recvT <= targetT){
         const e = snapQ.shift();
         consumeSnapshot(e.s);
@@ -1943,8 +1951,29 @@ const Game = (function(){
     // реальная обработка (consumeSnapshot) произойдёт в step() через RENDER_DELAY,
     // давая буфер для интерполяции между двумя известными кадрами.
     if(state.mode !== "guest" || !p1 || !p2 || !ball) return;
-    snapQ.push({ recvT: Clock.now() / 1000, s });
+    const now = Clock.now() / 1000;
+    snapQ.push({ recvT: now, s });
     if(snapQ.length > SNAP_Q_MAX) snapQ.shift();
+    // Адаптация renderDelay: p95 интер-арривал гэпов за последние SNAP_GAP_WINDOW
+    // снапшотов. Плавно подбираем задержку к реальному jitter сети. Не даём
+    // колебаниям переехать вниз (EMA-сглаживание на убывании), иначе один
+    // быстрый снап утащил бы renderDelay ниже уровня jitter и дал бы hitch
+    // через кадр, когда прилетит обычный «запаздыватель».
+    if(_lastSnapRecvT > 0){
+      const gap = now - _lastSnapRecvT;
+      _snapGaps.push(gap);
+      if(_snapGaps.length > SNAP_GAP_WINDOW) _snapGaps.shift();
+      if(_snapGaps.length >= 8){
+        const sorted = _snapGaps.slice().sort((a,b) => a - b);
+        const p95 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
+        const target = Math.max(RENDER_DELAY_MIN, Math.min(RENDER_DELAY_MAX, p95 * 1.15));
+        // Быстро поднимаемся (чтобы не ловить rubber-band), медленно опускаемся.
+        renderDelay = target > renderDelay
+          ? target
+          : renderDelay * 0.94 + target * 0.06;
+      }
+    }
+    _lastSnapRecvT = now;
   }
 
   function consumeSnapshot(s){
@@ -3062,8 +3091,21 @@ const Game = (function(){
     }
   }
 
-  return { start, stop, refreshOverlay, triggerEmote, applySnapshot, endByForfeit };
+  // Debug-хук только под тестами. В продакшне p1/p2/ball инкапсулированы.
+  function _debug(){
+    return {
+      mode: state.mode, inGame: state.inGame, matchOver: state.matchOver,
+      p1: p1 ? { x: p1.x, y: p1.y, vx: p1.vx, vy: p1.vy, g: p1.onGround } : null,
+      p2: p2 ? { x: p2.x, y: p2.y, vx: p2.vx, vy: p2.vy, g: p2.onGround } : null,
+      ball: ball ? { x: ball.x, y: ball.y, vx: ball.vx, vy: ball.vy } : null,
+      score1, score2, snapQLen: snapQ.length,
+      snapAtoB: snapA && snapQ[0] ? (snapQ[0].recvT - snapA.recvT) : null,
+      renderDelay
+    };
+  }
+  return { start, stop, refreshOverlay, triggerEmote, applySnapshot, endByForfeit, _debug };
 })();
+if (typeof window !== "undefined") window.__dvDebug = () => Game._debug();
 
 /* ========================================================================
    AI — pursuit + spike predictor, tuned per difficulty.
