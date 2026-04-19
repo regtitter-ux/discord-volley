@@ -2148,20 +2148,32 @@ const Game = (function(){
     // Собственный игрок (p1 у гостя) предсказывается локально в step() —
     // не перезаписываем его из снапшота целиком, иначе на высоком RTT
     // вернётся лаг: хост видит ввод на RTT/2 позже, его снапшот тянет
-    // предсказание назад. Снапаем только на больших разницах (respawn
-    // либо аномальный drift) через отдельный порог P1_SNAP_PX.
+    // предсказание назад. Две ветки реконсиляции:
+    //   1) hard snap — только для respawn (big) и катастрофического
+    //      дрифта (>P1_HARD_SNAP_PX), это телепорт с ресетом скоростей.
+    //   2) EMA-catchup — в штатном режиме плавно подтягиваем предсказание
+    //      к авторитетной позиции по CATCHUP_ALPHA за снапшот, чтобы
+    //      мелкие расхождения не копились до порога и не прорывались
+    //      единичным телепортом. Скорости не трогаем: prediction работает
+    //      на локальных инпутах, остаточная ошибка по скорости скажется
+    //      на позиции и утащится тем же EMA на следующих снапшотах.
     const CORRECT_SNAP_PX = 120;
-    const P1_SNAP_PX = 240;
+    const P1_HARD_SNAP_PX = 400;
+    const P1_CATCHUP_ALPHA = 0.22;
     const nx1 = WORLD_W - s.p2.x, ny1 = s.p2.y;
     const nx2 = WORLD_W - s.p1.x, ny2 = s.p1.y;
     const nbx = WORLD_W - s.b.x,  nby = s.b.y;
     const big = (Math.abs(nx2 - p2.x) > CORRECT_SNAP_PX || Math.abs(ny2 - p2.y) > CORRECT_SNAP_PX
               || Math.abs(nbx - ball.x) > CORRECT_SNAP_PX || Math.abs(nby - ball.y) > CORRECT_SNAP_PX);
     const p1Drift = Math.hypot(nx1 - p1.x, ny1 - p1.y);
-    const snapP1 = big || p1Drift > P1_SNAP_PX;
-    if(snapP1){
+    if(big || p1Drift > P1_HARD_SNAP_PX){
       p1.x = nx1; p1.y = ny1; p1.vx = -s.p2.vx; p1.vy = s.p2.vy; p1.onGround = !!s.p2.g;
       p1.prevX = p1.x; p1.prevY = p1.y;
+    } else if(p1Drift > 1){
+      // prevX/prevY не сбрасываем: render-интерполяция между pre-step и
+      // post-snapshot позицией естественно размажет коррекцию на кадр.
+      p1.x += (nx1 - p1.x) * P1_CATCHUP_ALPHA;
+      p1.y += (ny1 - p1.y) * P1_CATCHUP_ALPHA;
     }
     p2.vx = -s.p1.vx; p2.vy = s.p1.vy; p2.onGround = !!s.p1.g;
     ball.vx = -s.b.vx; ball.vy = s.b.vy;
