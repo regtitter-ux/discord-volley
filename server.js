@@ -67,7 +67,7 @@ const BUILD_ID =
 const INDEX_HTML = (function(){
   let html = fs.readFileSync(path.join(__dirname, "index.html"), "utf8");
   html = html.replace(
-    /(href|src)="(styles\.css|auth\.js|game\.js|i18n\.js)"/g,
+    /(href|src)="(styles\.css|auth\.js|game\.js|i18n\.js|physics\.js)"/g,
     (_m, attr, file) => `${attr}="${file}?v=${BUILD_ID}"`
   );
   const tag = `<script>window.__BUILD__=${JSON.stringify(BUILD_ID)};</script>`;

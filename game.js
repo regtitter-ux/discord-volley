@@ -1308,27 +1308,22 @@ const Game = (function(){
   // Players are HEMISPHERES: center sits on the ground line, upper half
   // collides with ball. Lower-hemisphere collisions are physically impossible
   // by construction, which kills a whole class of "ball under the floor" bugs.
-  const GRAV      = 1250;
-  const MOVE      = 620;
-  const JUMP      = 590;   // peak ≈ JUMP²/(2·GRAV) ≈ 139 px (~28% of field)
-  const BALL_R    = 17;
-  const PLR_R     = 42;    // slightly smaller for more room to maneuver
-  const NET_X     = WORLD_W*0.5, NET_W = 14, NET_H = 152;
-  const GROUND_Y  = WORLD_H - 30;   // ground line; player's feet rest HERE
-  const E_WALL    = 0.85;
-  const E_NET     = 0.85;
-  const E_GROUND  = 0.60;
-  // Отскок от пассивного игрока: мяч теряет энергию, как от пола, но мягче.
-  // Активный удар (игрок бежит/прыгает В мяч) возвращает упругость к 1.0 —
-  // см. E в collideBallPlayer, plush-velocity компенсирует коэффициент.
-  const E_PLAYER_IDLE = 0.78;
-  const MAX_BSPD  = 1300;
-  const SERVE_SPAWN_Y = -60;
-  const POST_POINT_TIME = 1.5;
-  const COYOTE   = 0.10;    // grace period after leaving ground
-  const JUMP_BUFFER = 0.12; // jump press remembered this long before landing
-  const STUCK_SPEED  = 55;
-  const STUCK_TIME   = 2.8;
+  //
+  // Pure-числа держим в physics.js — клиент и будущий server-authoritative
+  // engine обязаны читать одни и те же коэффициенты, иначе prediction и
+  // авторитетная симуляция расходятся за секунды. Derived-константы, которые
+  // зависят от размеров поля (NET_X, GROUND_Y), остаются тут — они дерируются
+  // из WORLD_W/WORLD_H, а те — часть canvas-layout.
+  const {
+    GRAV, MOVE, JUMP, BALL_R, PLR_R, NET_W, NET_H,
+    E_WALL, E_NET, E_GROUND, E_PLAYER_IDLE,
+    MAX_BSPD, SERVE_SPAWN_Y, POST_POINT_TIME,
+    COYOTE, JUMP_BUFFER,
+    STUCK_SPEED, STUCK_TIME,
+    STEP_HI, STEP_LO
+  } = DVPhysics;
+  const NET_X    = WORLD_W*0.5;
+  const GROUND_Y = WORLD_H - 30;   // ground line; player's feet rest HERE
   // На desktop крутим физику на 120 Гц (гладко на 120/144 Гц мониторах).
   // На тач-устройствах — 60 Гц: рендер-интерполяция между prev/curr всё равно
   // сглаживает движение, а мобильный CPU перестаёт тратить по 2 шага физики
@@ -1341,8 +1336,6 @@ const Game = (function(){
   // При срабатывании lowQuality снижаемся до 60 Гц (см. _switchStep) — это
   // ровно та же частота, что на мобиле, и при включённой интерполяции
   // визуально отличается только на >120 Гц мониторах.
-  const STEP_HI = 1/120;
-  const STEP_LO = 1/60;
   let STEP = (document.body && document.body.classList.contains("is-touch")) ? STEP_LO : STEP_HI;
   function _switchStep(next){
     if(next === STEP) return;
@@ -3353,11 +3346,12 @@ function makeAI(difficulty, rand){
   })[difficulty] || {};
   let t = 0;
   let target = WORLD_W * 0.75;
-  // Must match Game module constants.
-  const GRAV     = 1250;
+  // Физ-константы берём из общего DVPhysics (physics.js), чтобы AI и
+  // движок не разъезжались при тюнинге. NET_X/GROUND_Y — derived из
+  // размеров поля, живут здесь же.
+  const { GRAV, PLR_R } = DVPhysics;
   const NET_X    = WORLD_W * 0.5;
   const GROUND_Y = WORLD_H - 30;
-  const PLR_R    = 42;
   // AI aims to strike the ball at its ideal hit zone — just above the player's head.
   const STRIKE_Y = GROUND_Y - PLR_R * 2.4;
 
