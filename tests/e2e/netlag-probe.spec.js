@@ -46,6 +46,29 @@ test("local PvP latency probe", async ({ browser }) => {
   await pageA.click("#btn-play");
   await pageB.click("#btn-play");
 
+  // Ставим мониторы frame-time и long-task ПЕРЕД матчем, чтобы ловить всё.
+  for(const p of [pageA, pageB]){
+    await p.evaluate(() => {
+      window.__frameTimes = [];
+      window.__longTasks = [];
+      let prev = performance.now();
+      const tick = (now) => {
+        window.__frameTimes.push(now - prev);
+        prev = now;
+        requestAnimationFrame(tick);
+      };
+      requestAnimationFrame(tick);
+      try{
+        const obs = new PerformanceObserver(list => {
+          for(const entry of list.getEntries()){
+            window.__longTasks.push({ d: entry.duration, s: entry.startTime, n: entry.name });
+          }
+        });
+        obs.observe({ entryTypes: ["longtask"] });
+      }catch(_){}
+    });
+  }
+
   const stA = await waitForState(pageA, s => s.inGame && (s.mode === "host" || s.mode === "guest"));
   const stB = await waitForState(pageB, s => s.inGame && (s.mode === "host" || s.mode === "guest"));
   console.log(`[probe] A.mode=${stA.mode}  B.mode=${stB.mode}`);
@@ -143,6 +166,29 @@ test("local PvP latency probe", async ({ browser }) => {
 
   if(logsA.length || logsB.length){
     console.log("[probe] errors:\n" + logsA.concat(logsB).join("\n"));
+  }
+
+  // Анализ frame-times. Берём только «игровые» кадры (отсечь хвост загрузки).
+  for(const [tag, page] of [["host", host], ["guest", guest]]){
+    const { frames, longTasks } = await page.evaluate(() => ({
+      frames: window.__frameTimes.slice(-300),
+      longTasks: window.__longTasks.slice()
+    }));
+    if(!frames.length) continue;
+    const sorted = frames.slice().sort((a,b) => a - b);
+    const p50 = sorted[Math.floor(sorted.length*0.5)];
+    const p95 = sorted[Math.floor(sorted.length*0.95)];
+    const p99 = sorted[Math.floor(sorted.length*0.99)];
+    const max = sorted[sorted.length - 1];
+    const jank = frames.filter(f => f > 33).length;
+    const freeze = frames.filter(f => f > 100).length;
+    console.log(`[probe ${tag}] frames n=${frames.length} p50=${p50.toFixed(1)} p95=${p95.toFixed(1)} p99=${p99.toFixed(1)} max=${max.toFixed(1)} jank>33ms=${jank} freeze>100ms=${freeze}`);
+    if(longTasks.length){
+      const top = longTasks.slice().sort((a,b) => b.d - a.d).slice(0, 5);
+      console.log(`[probe ${tag}] longTasks n=${longTasks.length} top=${top.map(t => t.d.toFixed(0)+"ms").join(",")}`);
+    } else {
+      console.log(`[probe ${tag}] longTasks: none`);
+    }
   }
 
   const finalG = await readGuest();

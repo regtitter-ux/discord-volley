@@ -1363,10 +1363,24 @@ const Game = (function(){
   let stuckT = 0;
 
   // --- Production polish state ---
-  const particles = [];                  // hit spark particles
-  const trail = [];                      // ball position trail (newest first)
-  const TRAIL_LEN = 10;
+  // Pre-allocated pool: на каждый удар spawnParticles делает 4-22 объекта,
+  // и при rally из нескольких ударов подряд это стабильный поток new-object
+  // аллокаций. GC-паузы на такие burst'ы дают классический «фриз на удар».
+  // Переиспользуем слоты и держим их прямо в массиве particles; field
+  // particle.dead=true помечает свободные, чтобы draw/update их пропускали,
+  // а spawnParticles сначала искал свободный слот. Нет allocation в hot path.
   const PARTICLE_CAP = 160;
+  const particles = new Array(PARTICLE_CAP);
+  for(let i = 0; i < PARTICLE_CAP; i++){
+    particles[i] = { x:0, y:0, vx:0, vy:0, life:0, age:0, size:0, color:"#fff", dead:true };
+  }
+  // Trail — ring buffer из двух Float32Array. shift/unshift давали 120
+  // allocations/sec на физ-тике; ring buffer на typed arrays — 0 allocations.
+  const TRAIL_LEN = 10;
+  const trailX = new Float32Array(TRAIL_LEN);
+  const trailY = new Float32Array(TRAIL_LEN);
+  let trailHead = 0;  // индекс «новейшего» элемента
+  let trailCount = 0; // сколько реально заполнено (до TRAIL_LEN)
   // alpha последнего render() — нужен drawTrail, чтобы «хвост» смещался
   // синхронно с телом мяча (иначе между физ-тиками точки трейла отстают).
   let renderAlpha = 1;
@@ -1434,17 +1448,23 @@ const Game = (function(){
   };
 
   function spawnParticles(x, y, count, color, speed){
-    for(let i=0;i<count && particles.length < PARTICLE_CAP; i++){
+    // Ищем мёртвые слоты в пуле. Если все живы — просто не спавним больше
+    // (кап естественный: 160 частиц — потолок на экране).
+    let spawned = 0;
+    for(let i = 0; i < PARTICLE_CAP && spawned < count; i++){
+      const pt = particles[i];
+      if(!pt.dead) continue;
       const a = rng()*Math.PI*2;
       const s = speed * (0.4 + rng()*0.8);
-      particles.push({
-        x, y,
-        vx: Math.cos(a)*s, vy: Math.sin(a)*s - speed*0.3,
-        life: 0.45 + rng()*0.3,
-        age: 0,
-        size: 2 + rng()*3,
-        color
-      });
+      pt.x = x; pt.y = y;
+      pt.vx = Math.cos(a)*s;
+      pt.vy = Math.sin(a)*s - speed*0.3;
+      pt.life = 0.45 + rng()*0.3;
+      pt.age = 0;
+      pt.size = 2 + rng()*3;
+      pt.color = color;
+      pt.dead = false;
+      spawned++;
     }
   }
 
@@ -1566,7 +1586,7 @@ const Game = (function(){
       prevX: bx, prevY: SERVE_SPAWN_Y, prevAngle: 0,
       renderX: bx, renderY: SERVE_SPAWN_Y, renderAngle: 0
     };
-    trail.length = 0;
+    trailHead = 0; trailCount = 0;
     hitFlash = 0;
     squash.ball = 0;
     rallyHits = 0;
@@ -1599,9 +1619,9 @@ const Game = (function(){
     _snapGaps.length = 0;
     _lastSnapRecvT = 0;
     renderDelay = 0.06;
-    particles.length = 0;
+    for(let i = 0; i < PARTICLE_CAP; i++) particles[i].dead = true;
     emotes.length = 0;
-    trail.length = 0;
+    trailHead = 0; trailCount = 0;
     squash.ball = squash.p1 = squash.p2 = 0;
     bigText = null;
     if(!clouds)      clouds     = buildClouds();
@@ -1699,10 +1719,11 @@ const Game = (function(){
     // не теряли точность. Период кратен 2π (≈17 ч), так что sin-анимации
     // (блики, покачивание тени) остаются непрерывными на границе.
     matchTime = (matchTime + dt) % (Math.PI * 20000);
-    for(let i = particles.length - 1; i >= 0; i--){
+    for(let i = 0; i < PARTICLE_CAP; i++){
       const pt = particles[i];
+      if(pt.dead) continue;
       pt.age += dt;
-      if(pt.age >= pt.life){ particles.splice(i, 1); continue; }
+      if(pt.age >= pt.life){ pt.dead = true; continue; }
       pt.vy += GRAV * 0.35 * dt;
       pt.x  += pt.vx * dt;
       pt.y  += pt.vy * dt;
@@ -1718,9 +1739,11 @@ const Game = (function(){
       emotes[i].t += dt;
       if(emotes[i].t >= emotes[i].dur) emotes.splice(i, 1);
     }
-    // Ball motion trail — prepend current pos each step, cap length
-    trail.unshift({ x: ball.x, y: ball.y });
-    if(trail.length > TRAIL_LEN) trail.length = TRAIL_LEN;
+    // Trail ring buffer: head идёт вперёд, count растёт до TRAIL_LEN.
+    trailHead = (trailHead + 1) % TRAIL_LEN;
+    trailX[trailHead] = ball.x;
+    trailY[trailHead] = ball.y;
+    if(trailCount < TRAIL_LEN) trailCount++;
 
     // В роли гостя физика авторитетна у хоста — мы получаем её снапшотами
     // и рендерим; локально только визуальные тики (частицы/эмоции/трейл) выше.
@@ -2598,26 +2621,32 @@ const Game = (function(){
   }
 
   function drawTrail(){
-    // Fade from oldest to newest; only while ball is moving fast enough
+    // Fade from oldest to newest; only while ball is moving fast enough.
     const speed2 = ball.vx*ball.vx + ball.vy*ball.vy;
     if(speed2 < 260*260) return;
-    // trail[i] — snapshot i физ-шагов назад. Тело мяча рисуется в
-    // lerp(trail[1], trail[0], renderAlpha). Чтобы хвост не отставал, каждую
-    // точку тоже сдвигаем: эффективная позиция i-й точки — lerp(trail[i+1], trail[i]).
+    if(trailCount < 3) return;
+    // Ring buffer: trailHead — новейший, шаги назад = (head - i + TRAIL_LEN)%TRAIL_LEN.
+    // Тело мяча — lerp(trail[1], trail[0]). Каждая точка смещается на alpha:
+    // effective[i] = lerp(trail[i+1], trail[i]).
     const a = renderAlpha;
-    for(let i = 1; i < trail.length - 1; i++){
-      const cur = trail[i], old = trail[i+1];
-      const x = old.x + (cur.x - old.x) * a;
-      const y = old.y + (cur.y - old.y) * a;
-      const alpha = (1 - i/trail.length) * 0.35;
-      const r = ball.r * (1 - i/trail.length*0.6);
+    const inv = 1 / TRAIL_LEN;
+    for(let i = 1; i < trailCount - 1; i++){
+      const cIdx = (trailHead - i + TRAIL_LEN) % TRAIL_LEN;
+      const oIdx = (trailHead - (i+1) + TRAIL_LEN) % TRAIL_LEN;
+      const x = trailX[oIdx] + (trailX[cIdx] - trailX[oIdx]) * a;
+      const y = trailY[oIdx] + (trailY[cIdx] - trailY[oIdx]) * a;
+      const t = i * inv;
+      const alpha = (1 - t) * 0.35;
+      const r = ball.r * (1 - t*0.6);
       ctx.fillStyle = "rgba(255,255,255," + alpha + ")";
       ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill();
     }
   }
 
   function drawParticles(){
-    for(const pt of particles){
+    for(let i = 0; i < PARTICLE_CAP; i++){
+      const pt = particles[i];
+      if(pt.dead) continue;
       const k = 1 - pt.age/pt.life;
       ctx.globalAlpha = k;
       ctx.fillStyle = pt.color;
@@ -3041,18 +3070,28 @@ const Game = (function(){
     if(dt > 0.25) dt = 0.25;
     acc += dt;
     let steps = 0;
+    const profile = window.__dvProfile === true;
+    const t0 = profile ? performance.now() : 0;
     while(acc >= STEP && steps < 6){
       step(STEP);
       acc -= STEP;
       steps++;
     }
     if(steps === 6) acc = 0;
+    const t1 = profile ? performance.now() : 0;
     // alpha ∈ [0,1] — доля незакоммиченного физ-времени между последним
     // и следующим шагом. Передаём в render(), чтобы при рендер-частоте
     // выше физ-частоты (120/144/240 Гц) позиции между тиками интерполировались,
     // а не «дёргались».
     const alpha = Math.min(1, Math.max(0, acc / STEP));
     render(alpha);
+    if(profile){
+      const t2 = performance.now();
+      if(!window.__dvProf) window.__dvProf = { step: [], render: [], steps: [] };
+      window.__dvProf.step.push(t1 - t0);
+      window.__dvProf.render.push(t2 - t1);
+      window.__dvProf.steps.push(steps);
+    }
     // Адаптивное качество: считаем EWMA времени кадра. Порог 22 мс ≈ 45 FPS
     // — ниже этого на десктопе включаем lowQuality и скидываем тяжёлые
     // фоновые слои. Нужно подряд несколько «плохих» кадров, чтобы не
