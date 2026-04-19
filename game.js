@@ -1423,6 +1423,7 @@ const Game = (function(){
   let _emoteSeq = 0;
   const EMOTE_DUR = 1.8;
   const squash = { ball:0, p1:0, p2:0 }; // timers that scale targets briefly
+  let clouds = null;                     // parallax cloud layer (icons/bubbles/logos)
   let sparkles = null;                   // faint twinkling dots
   let matchTime = 0;                     // total in-game seconds (for parallax)
   let rallyHits = 0;                     // consecutive hits for combo feedback
@@ -1528,6 +1529,34 @@ const Game = (function(){
     slot.dead = false;
   }
 
+  function buildClouds(){
+    // Deterministic backdrop: drifting "server icons" and chat-bubble marks.
+    const arr = [];
+    const rng = (n)=> ((Math.sin(n*12.9898)*43758.5453) % 1 + 1) % 1;
+    const palette = ["#5865f2","#4752c4","#23a55a","#f0b232","#f23f42","#949ba4","#ffffff"];
+    const marks = ["#","@","/","&","!","?","+"];
+    // На мобиле уменьшаем количество слоёв параллакса — каждый cloud = save/
+    // translate/rotate/drawImage/restore, iGPU на слабых телефонах сериализует
+    // state-changes и это видно в фризах. На PC тот же набор рендерится без
+    // нагрузки, поэтому оставляем полный объём.
+    const count = isTouch ? 5 : 10;
+    for(let i=0;i<count;i++){
+      const k = rng(i+97);
+      arr.push({
+        x:     rng(i+1)  * WORLD_W,
+        y:     30 + rng(i+13) * 230,
+        size:  24 + rng(i+29) * 22,
+        speed: 4 + rng(i+41) * 8,
+        alpha: 0.14 + rng(i+71) * 0.18,
+        kind:  k < 0.45 ? "logo" : (k < 0.80 ? "icon" : "bubble"),
+        color: palette[(rng(i+113)*palette.length)|0],
+        mark:  marks[(rng(i+131)*marks.length)|0],
+        tilt:  (rng(i+149)*2 - 1) * 0.18
+      });
+    }
+    return arr;
+  }
+
   // Tiny sparkle field — faint stars/dots that slowly twinkle.
   function buildSparkles(){
     const arr = [];
@@ -1625,6 +1654,7 @@ const Game = (function(){
     trailHead = 0; trailCount = 0;
     squash.ball = squash.p1 = squash.p2 = 0;
     bigText = null;
+    if(!clouds)      clouds     = buildClouds();
     if(!sparkles)    sparkles   = buildSparkles();
     // Сброс счётчиков rate-limit кошелька на новый матч, иначе лимиты
     // «maxPerMatch» останутся от предыдущего.
@@ -2434,6 +2464,7 @@ const Game = (function(){
     buildBackdropSprite();
     ctx.drawImage(_backdropSprite, 0, 0, WORLD_W, WORLD_H);
     drawSparkles();
+    drawClouds();
     drawNetHalo();
 
     // Court + base line (Discord sidebar / channel list vibe)
@@ -2446,7 +2477,10 @@ const Game = (function(){
     ctx.fillRect(NET_X - 1, GROUND_Y + 6, 2, 14);
 
     drawNet();
-    drawTrail();
+    // Trail — 15 накладных arc+fill на быстром мяче. На мобиле в lowQuality
+    // срубаем: мяч и так хорошо виден по squash+hitFlash, а GPU-fill-rate
+    // разгружается заметно.
+    if(!(isTouch && lowQuality)) drawTrail();
     drawPlayer(p1, playerUser(1));
     drawPlayer(p2, playerUser(2));
     drawServeIndicator();
@@ -2477,6 +2511,93 @@ const Game = (function(){
     const cx = NET_X, cy = GROUND_Y - NET_H * 0.55;
     ctx.fillStyle = netHaloGrad();
     ctx.fillRect(cx - 180, cy - 180, 360, 360);
+  }
+
+  // Каждое облако — набор статичных векторных фигур. Один раз рендерим
+  // в офскрин-спрайт, дальше просто blit через drawImage (+ translate/rotate),
+  // чтобы освободить 2D-контекст от десятков path-команд за кадр.
+  function buildCloudSprite(c){
+    const s = c.size;
+    const side = Math.ceil(s * 2.4);
+    const off = document.createElement("canvas");
+    off.width = side;
+    off.height = side;
+    const octx = off.getContext("2d");
+    const cx = side / 2, cy = side / 2;
+    if(c.kind === "logo")      drawCloudLogo(octx, cx, cy, s, c.color);
+    else if(c.kind === "icon") drawCloudIcon(octx, cx, cy, s, c.color, c.mark);
+    else                       drawCloudBubble(octx, cx, cy, s, c.color);
+    c._sprite = off;
+    c._spriteHalf = side / 2;
+  }
+  function drawCloudLogo(g, x, y, s, color){
+    const w = s*1.3, h = s, rr = s*0.35;
+    g.fillStyle = color;
+    pathRoundRect(g, x - w/2, y - h/2, w, h, rr);
+    g.fill();
+    g.fillStyle = "#1e1f22";
+    g.beginPath();
+    g.ellipse(x - w*0.18, y, s*0.085, s*0.14, 0, 0, Math.PI*2);
+    g.ellipse(x + w*0.18, y, s*0.085, s*0.14, 0, 0, Math.PI*2);
+    g.fill();
+  }
+  function drawCloudIcon(g, x, y, s, color, mark){
+    const w = s*1.15, h = s*1.15, rr = s*0.28;
+    g.fillStyle = color;
+    pathRoundRect(g, x - w/2, y - h/2, w, h, rr);
+    g.fill();
+    g.fillStyle = "rgba(30,31,34,0.85)";
+    g.font = "900 " + Math.round(s*0.8) + "px system-ui,sans-serif";
+    g.textAlign = "center";
+    g.textBaseline = "middle";
+    g.fillText(mark || "#", x, y + s*0.04);
+  }
+  function drawCloudBubble(g, x, y, s, color){
+    const w = s*1.6, h = s*0.95, rr = s*0.32;
+    g.fillStyle = color;
+    pathRoundRect(g, x - w/2, y - h/2, w, h, rr);
+    g.fill();
+    g.beginPath();
+    g.moveTo(x - w*0.22, y + h/2 - 1);
+    g.lineTo(x - w*0.42, y + h/2 + s*0.35);
+    g.lineTo(x - w*0.08, y + h/2 - 1);
+    g.closePath();
+    g.fill();
+    g.fillStyle = "rgba(30,31,34,0.7)";
+    const dotR = s*0.08;
+    for(let i=-1;i<=1;i++){
+      g.beginPath();
+      g.arc(x + i*s*0.28, y, dotR, 0, Math.PI*2);
+      g.fill();
+    }
+  }
+  function pathRoundRect(g, x, y, w, h, r){
+    const rr = Math.min(r, w*0.5, h*0.5);
+    g.beginPath();
+    g.moveTo(x + rr, y);
+    g.lineTo(x + w - rr, y);
+    g.quadraticCurveTo(x + w, y, x + w, y + rr);
+    g.lineTo(x + w, y + h - rr);
+    g.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
+    g.lineTo(x + rr, y + h);
+    g.quadraticCurveTo(x, y + h, x, y + h - rr);
+    g.lineTo(x, y + rr);
+    g.quadraticCurveTo(x, y, x + rr, y);
+    g.closePath();
+  }
+  function drawClouds(){
+    if(!clouds) return;
+    for(const c of clouds){
+      if(!c._sprite) buildCloudSprite(c);
+      const x = ((c.x + matchTime * c.speed) % (WORLD_W + 160)) - 80;
+      ctx.save();
+      ctx.globalAlpha = c.alpha;
+      ctx.translate(x, c.y);
+      ctx.rotate(c.tilt);
+      ctx.drawImage(c._sprite, -c._spriteHalf, -c._spriteHalf);
+      ctx.restore();
+    }
+    ctx.globalAlpha = 1;
   }
 
   function drawNet(){
@@ -2803,10 +2924,16 @@ const Game = (function(){
   const FALLBACK_USER = { color: "#5865f2", global_name: "?", avatar_url: null };
   function getAvatarCanvas(user, size){
     if(!user) user = FALLBACK_USER;
+    // Фастпас: в пределах одного матча user-объект не меняется, и аватар
+    // нам нужен одного и того же размера каждый кадр. Пришиваем ссылку на
+    // canvas прямо к user и возвращаем без аллокаций. На мобиле это снимает
+    // 2 строковые аллокации + sanitizeAvatarUrl regex каждый кадр × 2 игрока
+    // × 60 fps = ощутимая GC-нагрузка.
+    if(user._avatarCanvas && user._avatarCanvasSize === size) return user._avatarCanvas;
     const safeUrl = Auth.sanitizeAvatarUrl(user.avatar_url);
     const key = (safeUrl || user.color || "?") + "|" + (user.global_name||user.username||"?") + "|" + size;
     const hit = avatarCacheGet(key);
-    if(hit) return hit;
+    if(hit){ user._avatarCanvas = hit; user._avatarCanvasSize = size; return hit; }
     const c = document.createElement("canvas");
     c.width = c.height = size;
     const g = c.getContext("2d");
@@ -2818,6 +2945,8 @@ const Game = (function(){
     g.textAlign = "center"; g.textBaseline = "middle";
     g.fillText(letter, size/2, size/2 + size*0.03);
     avatarCacheSet(key, c);
+    user._avatarCanvas = c;
+    user._avatarCanvasSize = size;
     if(safeUrl){
       const img = new Image();
       img.crossOrigin = "anonymous";
@@ -2985,7 +3114,7 @@ const Game = (function(){
     // фоновые слои. Нужно подряд несколько «плохих» кадров, чтобы не
     // реагировать на разовый GC-пик. В hidden-режиме не считаем — dt там
     // фиксированный 16мс от воркера и к реальному frame-time не относится.
-    if(!document.hidden && !lowQuality && !isTouch){
+    if(!document.hidden && !lowQuality){
       const ft = dt * 1000;
       frameTimeAvg = frameTimeAvg * 0.9 + ft * 0.1;
       // Одиночный жирный кадр (>60 мс) — это уже catchup-стутер. На PC в
@@ -2994,11 +3123,16 @@ const Game = (function(){
       // порог), то деградации не произойдёт никогда — хитчи редкие, EWMA
       // усредняет их до нормы. Накидываем сразу 20 очков: три таких хитча
       // за короткий период уже переваливают порог и срубают тяжёлый glow/
-      // panels/grid. Мгновенный кап 150 мс = моментальный freeze — такой
-      // единичный кадр сразу включает lowQuality, без ожидания.
-      if(ft > 150){ lowQuality = true; }
-      else if(ft > 60){ slowFrames += 20; if(slowFrames > 40) lowQuality = true; }
-      else if(frameTimeAvg > 22){
+      // trail. Мгновенный кап 150 мс = моментальный freeze — такой единичный
+      // кадр сразу включает lowQuality, без ожидания. На мобиле пороги
+      // щадящие (iGPU слабее, 30 fps — норма, деградируем только на явных
+      // фризах: >200 мс single frame или >33 мс среднее).
+      const hardFreeze = isTouch ? 200 : 150;
+      const hitch      = isTouch ? 100 : 60;
+      const avgSlow    = isTouch ? 33  : 22;
+      if(ft > hardFreeze){ lowQuality = true; }
+      else if(ft > hitch){ slowFrames += 20; if(slowFrames > 40) lowQuality = true; }
+      else if(frameTimeAvg > avgSlow){
         slowFrames++;
         if(slowFrames > 40) lowQuality = true;
       } else {
