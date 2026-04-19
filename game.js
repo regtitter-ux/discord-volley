@@ -1318,6 +1318,10 @@ const Game = (function(){
   const E_WALL    = 0.85;
   const E_NET     = 0.85;
   const E_GROUND  = 0.60;
+  // Отскок от пассивного игрока: мяч теряет энергию, как от пола, но мягче.
+  // Активный удар (игрок бежит/прыгает В мяч) возвращает упругость к 1.0 —
+  // см. E в collideBallPlayer, plush-velocity компенсирует коэффициент.
+  const E_PLAYER_IDLE = 0.78;
   const MAX_BSPD  = 1300;
   const SERVE_SPAWN_Y = -60;
   const POST_POINT_TIME = 1.5;
@@ -1330,7 +1334,23 @@ const Game = (function(){
   // сглаживает движение, а мобильный CPU перестаёт тратить по 2 шага физики
   // на каждый кадр. Типовой бюджет кадра 16.67 мс, двойной step — это
   // удвоенная коллизия+AI+трейл, чего мидрейндж-телефон не вывозит.
-  const STEP = (document.body && document.body.classList.contains("is-touch")) ? 1/60 : 1/120;
+  //
+  // На PC под нагрузкой (GPU contention от соседних вкладок/браузеров,
+  // особенно в PvP — там host ещё и broadcastSnapshot крутит 30 Гц) 120-гц
+  // step начинает не укладываться в кадр, и мы катимся в catchup-спираль.
+  // При срабатывании lowQuality снижаемся до 60 Гц (см. _switchStep) — это
+  // ровно та же частота, что на мобиле, и при включённой интерполяции
+  // визуально отличается только на >120 Гц мониторах.
+  const STEP_HI = 1/120;
+  const STEP_LO = 1/60;
+  let STEP = (document.body && document.body.classList.contains("is-touch")) ? STEP_LO : STEP_HI;
+  function _switchStep(next){
+    if(next === STEP) return;
+    // Перекладываем остаток аккумулятора в той же шкале времени, чтобы на
+    // границе перехода не уронить ни одного тика и не наловить лишних.
+    STEP = next;
+    if(acc > next * 6) acc = next * 6;
+  }
 
   // Round state
   let rafId = 0, acc = 0, last = 0;
@@ -2021,6 +2041,12 @@ const Game = (function(){
   function broadcastSnapshot(){
     const ws = state.ws;
     if(!ws || ws.readyState !== 1) return;
+    // Backpressure guard: если сокет не успевает флашиться (плохая сеть у
+    // соперника, TCP-буфер забит), не складируем новые снапшоты поверх —
+    // гость всё равно увидит устаревшее состояние, зато у нас send() не
+    // растёт в синхронной очереди и не блокирует event loop. 8 КБ — это
+    // ~130 кадров state (по 61 Б), после которых точно есть отставание.
+    if(ws.bufferedAmount > 8192) return;
     try {
       const u = Codec.encodeState(
         p1, p2, ball,
@@ -2360,8 +2386,15 @@ const Game = (function(){
     let uy = ball.vy - p.vy;
     const un = ux*nx + uy*ny;
     if(un < 0){
-      ux -= 2 * un * nx;
-      uy -= 2 * un * ny;
+      // Коэффициент упругости зависит от «пуша» игрока в мяч вдоль нормали.
+      // Стоит на месте → E=E_PLAYER_IDLE (как мягкий пол, рали сам затухает).
+      // Бежит/прыгает В мяч → E→1.0 (классический slime-удар, полная упругость).
+      // Линейный переход между ними: активный контакт ощущается как удар,
+      // пассивный — как столкновение с подушкой.
+      const pushN = Math.max(0, p.vx*nx + p.vy*ny);
+      const E = Math.min(1.0, E_PLAYER_IDLE + pushN / 420);
+      ux -= (1 + E) * un * nx;
+      uy -= (1 + E) * un * ny;
       // Slime-friction: тангенциальная компонента относительной скорости
       // гасится частично (не идеально-упругий отскок). Без этого круглая
       // форма слайма отражала только нормаль — бежишь по слайму вправо,
@@ -3154,6 +3187,12 @@ const Game = (function(){
       } else {
         slowFrames = Math.max(0, slowFrames - 1);
       }
+      // Как только деградировали на десктопе — снижаем физ-рейт со 120 до
+      // 60 Гц. Это убирает второй step-вызов на каждый кадр (коллизии/
+      // integrate/broadcast-аккумулятор), давая host'у в PvP запас на сеть
+      // и рендер. В онлайне хостовой броадкаст идёт от acc в step(), так
+      // что частота снапшотов не меняется — SNAP_STEP=33мс независимо от STEP.
+      if(lowQuality && !isTouch && STEP !== STEP_LO) _switchStep(STEP_LO);
     }
   }
 
