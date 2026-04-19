@@ -1423,6 +1423,14 @@ const Game = (function(){
     };
   }
   let _lastSnapRecvT = 0;
+  // Счётчики для debug-overlay: видимость, что реконсиляция/экстраполяция
+  // реально срабатывают под нагрузкой. _lastP1Drift — мгновенный drift на
+  // последнем снапшоте, _bigSnapCount — hard-snap'ы (катастрофический
+  // дрейф/respawn), _extrapCount — сколько раз буфер опустел и рендерили
+  // экстраполяцией. Всё — только для чтения снаружи через Game._debug().
+  let _lastP1Drift = 0;
+  let _bigSnapCount = 0;
+  let _extrapCount = 0;
   let hitFlash = 0;
   let jumpBufferT = 0;
   let stuckT = 0;
@@ -1759,6 +1767,7 @@ const Game = (function(){
     snapA.s = null; snapAValid = false;
     _snapGaps.length = 0;
     _snapDiagHead = 0; _snapDiagCount = 0; _snapDiagMax = 0;
+    _lastP1Drift = 0; _bigSnapCount = 0; _extrapCount = 0;
     _lastSnapRecvT = 0;
     renderDelay = 0.06;
     _ballHiddenTeleport = false;
@@ -1977,6 +1986,7 @@ const Game = (function(){
           // границе — лучше «подвисший» соперник, чем улетевший и прыгающий.
           const MAX_EXTRAPOLATE = 0.3;
           const dtA = Math.min(MAX_EXTRAPOLATE, Math.max(0, targetT - snapA.recvT));
+          if(dtA > 0) _extrapCount++;
           _ballHiddenTeleport = false;
           const vx2 = -snapA.s.p1.vx, vy2 = snapA.s.p1.vy;
           const vbx = -snapA.s.b.vx,  vby = snapA.s.b.vy;
@@ -2211,7 +2221,9 @@ const Game = (function(){
     const big = (Math.abs(nx2 - p2.x) > CORRECT_SNAP_PX || Math.abs(ny2 - p2.y) > CORRECT_SNAP_PX
               || Math.abs(nbx - ball.x) > CORRECT_SNAP_PX || Math.abs(nby - ball.y) > CORRECT_SNAP_PX);
     const p1Drift = Math.hypot(nx1 - p1.x, ny1 - p1.y);
+    _lastP1Drift = p1Drift;
     if(big || p1Drift > P1_HARD_SNAP_PX){
+      _bigSnapCount++;
       p1.x = nx1; p1.y = ny1; p1.vx = -s.p2.vx; p1.vy = s.p2.vy; p1.onGround = !!s.p2.g;
       p1.prevX = p1.x; p1.prevY = p1.y;
     } else if(p1Drift > 1){
@@ -3348,6 +3360,12 @@ const Game = (function(){
       score1, score2, snapQLen: _snapCount,
       snapAtoB: snapAValid && _snapCount > 0 ? (_snapQAt(0).recvT - snapA.recvT) : null,
       renderDelay,
+      // Perf-снимок: avg frame-time (EWMA), флаг деградации, current STEP
+      // в Гц, slowFrames — сколько подряд плохих кадров к lowQuality-порогу.
+      frameTimeAvg, lowQuality, slowFrames, stepHz: Math.round(1 / STEP),
+      // Netcode-счётчики: p1 drift за последний снапшот, кумулятивные
+      // hard-snap'ы и extrapolate-кадры с начала матча.
+      p1Drift: _lastP1Drift, bigSnaps: _bigSnapCount, extraps: _extrapCount,
       // Jitter-статистика по 300 последним интер-арривалам снапшотов
       // (host→guest). Диагноз TCP head-of-line blocking: p99 заметно выше
       // p95 (например p95=45 мс, p99=250 мс) = редкие выпавшие сегменты
@@ -3358,6 +3376,100 @@ const Game = (function(){
   return { start, stop, refreshOverlay, triggerEmote, applySnapshot, endByForfeit, _debug };
 })();
 if (typeof window !== "undefined") window.__dvDebug = () => Game._debug();
+
+/* ========================================================================
+   Runtime debug overlay. Toggle: ?debug=1 в URL или F9.
+   Показывает perf + netcode-снимок в углу экрана. Обновляется 3 Гц, сам
+   панель в DOM (не canvas), чтобы не влезать в render loop. При скрытом
+   оверлее интервал снимается — нулевой cost для обычных игроков.
+   ======================================================================== */
+(function(){
+  if(typeof window === "undefined" || typeof document === "undefined") return;
+  let panel = null;
+  let timerId = 0;
+  let visible = false;
+
+  function build(){
+    const el = document.createElement("div");
+    el.id = "dv-debug-overlay";
+    el.style.cssText = [
+      "position:fixed","top:8px","left:8px","z-index:9999",
+      "padding:8px 10px","background:rgba(0,0,0,0.72)","color:#c6f",
+      "font:11px/1.35 ui-monospace,Consolas,monospace","border-radius:6px",
+      "pointer-events:none","white-space:pre","min-width:220px",
+      "box-shadow:0 2px 8px rgba(0,0,0,0.4)"
+    ].join(";");
+    el.textContent = "debug: waiting for game…";
+    document.body.appendChild(el);
+    return el;
+  }
+
+  function fmt(n, digits){
+    if(n == null || Number.isNaN(n)) return "—";
+    if(typeof n !== "number") return String(n);
+    return n.toFixed(digits == null ? 1 : digits);
+  }
+
+  function tick(){
+    if(!panel || !visible) return;
+    let d;
+    try{ d = window.__dvDebug && window.__dvDebug(); }catch(_){ d = null; }
+    if(!d){ panel.textContent = "debug: game not ready"; return; }
+    const fps = d.frameTimeAvg > 0 ? 1000 / d.frameTimeAvg : 0;
+    const j = d.snapJitter;
+    const lines = [
+      "mode: " + (d.mode || "—") + (d.inGame ? " (in-game)" : "") + (d.lowQuality ? " LQ" : ""),
+      "fps:  " + fmt(fps, 0) + "   ft: " + fmt(d.frameTimeAvg) + "ms   step: " + d.stepHz + "Hz",
+      "slow: " + d.slowFrames + "   score: " + d.score1 + ":" + d.score2,
+      "— netcode —",
+      "renderDelay: " + fmt(d.renderDelay * 1000, 0) + "ms",
+      "snapQ: " + d.snapQLen + "   A→B: " + (d.snapAtoB != null ? fmt(d.snapAtoB * 1000, 0) + "ms" : "—"),
+      "p1drift: " + fmt(d.p1Drift, 0) + "px   hardsnap: " + d.bigSnaps + "   extrap: " + d.extraps,
+      j
+        ? "jitter p50/p95/p99: " + fmt(j.p50 * 1000, 0) + "/" + fmt(j.p95 * 1000, 0) + "/" + fmt(j.p99 * 1000, 0) + "ms (n=" + j.n + ")"
+        : "jitter: collecting…"
+    ];
+    panel.textContent = lines.join("\n");
+  }
+
+  function show(){
+    if(visible) return;
+    visible = true;
+    if(!panel) panel = build();
+    panel.style.display = "block";
+    tick();
+    timerId = setInterval(tick, 300);
+  }
+
+  function hide(){
+    if(!visible) return;
+    visible = false;
+    if(timerId){ clearInterval(timerId); timerId = 0; }
+    if(panel) panel.style.display = "none";
+  }
+
+  function toggle(){ visible ? hide() : show(); }
+
+  window.__dvDebugOverlay = { show, hide, toggle };
+
+  document.addEventListener("keydown", (e) => {
+    // F9 — тогглер. Не мешает игровому вводу (используем keydown на document,
+    // но слаймы берут W/A/D/стрелки, так что F9 не конфликтует).
+    if(e.key === "F9"){ e.preventDefault(); toggle(); }
+  });
+
+  function maybeAutoShow(){
+    try{
+      const q = new URLSearchParams(window.location.search);
+      if(q.get("debug") === "1") show();
+    }catch(_){}
+  }
+  if(document.readyState === "loading"){
+    document.addEventListener("DOMContentLoaded", maybeAutoShow, { once: true });
+  } else {
+    maybeAutoShow();
+  }
+})();
 
 /* ========================================================================
    AI — pursuit + spike predictor, tuned per difficulty.
