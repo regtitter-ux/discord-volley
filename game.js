@@ -1396,6 +1396,39 @@ const Game = (function(){
   const RENDER_DELAY_MAX = 0.14;
   const _snapGaps = [];
   const SNAP_GAP_WINDOW = 24;                     // ~0.8 с истории при 30 Гц
+
+  // Отдельное длинное окно для диагностики TCP head-of-line blocking.
+  // _snapGaps короткий (24) и нужен для быстрой адаптации renderDelay к
+  // текущему jitter; для хвоста распределения (p99) 24 сэмпла мало — один
+  // HoL-спайк уже даёт p99=max, без статистической устойчивости. 300 сэмплов
+  // = 10 с истории при 30 Гц: p99 ≈ 3 худших из 300, что достаточно, чтобы
+  // различить «чистый канал» (p99 близок к p95) и «TCP HoL» (p99 заметно
+  // выше p95, редкие 100-500 мс дыры). Ring buffer без shift/push, чтобы
+  // не аллоцировать на hot-path.
+  const SNAP_DIAG_WINDOW = 300;
+  const _snapDiagBuf = new Float32Array(SNAP_DIAG_WINDOW);
+  let _snapDiagHead = 0;
+  let _snapDiagCount = 0;
+  let _snapDiagMax = 0;
+  function _snapDiagPush(gap){
+    _snapDiagBuf[_snapDiagHead] = gap;
+    _snapDiagHead = (_snapDiagHead + 1) % SNAP_DIAG_WINDOW;
+    if(_snapDiagCount < SNAP_DIAG_WINDOW) _snapDiagCount++;
+    if(gap > _snapDiagMax) _snapDiagMax = gap;
+  }
+  function _snapDiagStats(){
+    if(_snapDiagCount < 8) return null;
+    const arr = new Float32Array(_snapDiagCount);
+    for(let i = 0; i < _snapDiagCount; i++) arr[i] = _snapDiagBuf[i];
+    Array.prototype.sort.call(arr, (a,b) => a - b);
+    const at = q => arr[Math.min(_snapDiagCount - 1, Math.floor(_snapDiagCount * q))];
+    return {
+      n: _snapDiagCount,
+      p50: at(0.50), p95: at(0.95), p99: at(0.99),
+      max: arr[_snapDiagCount - 1],
+      maxEver: _snapDiagMax
+    };
+  }
   let _lastSnapRecvT = 0;
   let hitFlash = 0;
   let jumpBufferT = 0;
@@ -1680,6 +1713,7 @@ const Game = (function(){
     _snapHead = 0; _snapCount = 0;
     snapA.s = null; snapAValid = false;
     _snapGaps.length = 0;
+    _snapDiagHead = 0; _snapDiagCount = 0; _snapDiagMax = 0;
     _lastSnapRecvT = 0;
     renderDelay = 0.06;
     _ballHiddenTeleport = false;
@@ -2084,6 +2118,7 @@ const Game = (function(){
     // через кадр, когда прилетит обычный «запаздыватель».
     if(_lastSnapRecvT > 0){
       const gap = now - _lastSnapRecvT;
+      _snapDiagPush(gap);
       _snapGaps.push(gap);
       if(_snapGaps.length > SNAP_GAP_WINDOW) _snapGaps.shift();
       if(_snapGaps.length >= 8){
@@ -3278,7 +3313,12 @@ const Game = (function(){
       ball: ball ? { x: ball.x, y: ball.y, vx: ball.vx, vy: ball.vy } : null,
       score1, score2, snapQLen: _snapCount,
       snapAtoB: snapAValid && _snapCount > 0 ? (_snapQAt(0).recvT - snapA.recvT) : null,
-      renderDelay
+      renderDelay,
+      // Jitter-статистика по 300 последним интер-арривалам снапшотов
+      // (host→guest). Диагноз TCP head-of-line blocking: p99 заметно выше
+      // p95 (например p95=45 мс, p99=250 мс) = редкие выпавшие сегменты
+      // держат буфер ядра на время retransmit. Null, пока сэмплов мало.
+      snapJitter: _snapDiagStats()
     };
   }
   return { start, stop, refreshOverlay, triggerEmote, applySnapshot, endByForfeit, _debug };
