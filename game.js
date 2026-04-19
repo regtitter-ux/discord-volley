@@ -1550,6 +1550,61 @@ const Game = (function(){
     bigText = { text, t:0, dur: dur||0.9, color: color||"#ffffff", size: size||84 };
   }
 
+  // Fx — аудиовизуальный фидбек общих игровых событий (очко/подача/удар).
+  // Единый вход для host-ветки (bot/host моды, авторитетная физика) и
+  // guest-ветки (восстановление событий из снапшота). Все методы принимают
+  // «локальную» сторону: side===1 — свой игрок, side===2 — соперник. На
+  // хосте это совпадает с world-координатами (хост всегда p1); на госте
+  // вызывается ПОСЛЕ зеркалирования в consumeSnapshot. Методы не трогают
+  // state (score/rallyHits/servingSide) и Wallet — это контекстно-зависимая
+  // логика, живёт на стороне вызова. Fx отвечает только за HUD/sfx/particles.
+  const Fx = {
+    point(localSide, isFoul){
+      const elA = $("hud-score-p1"), elB = $("hud-score-p2");
+      elA.textContent = String(score1);
+      elB.textContent = String(score2);
+      const pulseEl = localSide === 1 ? elA : elB;
+      pulseEl.classList.remove("pulse");
+      void pulseEl.offsetWidth; // reflow to restart animation
+      pulseEl.classList.add("pulse");
+      spawnParticles(
+        ball.x, GROUND_Y - 2, 22,
+        localSide === 1 ? "rgba(35,165,90,1)" : "rgba(242,63,66,1)", 260
+      );
+      if(localSide === 1){
+        showBig(I18n.t(isFoul ? "game.foul" : "game.point"), "#23a55a", 0.9, 96);
+        sfx.point();
+      } else {
+        showBig(I18n.t(isFoul ? "game.foul" : "game.miss"),  "#f23f42", 0.9, 80);
+        sfx.lose();
+      }
+    },
+    serve(localServingSide){
+      sfx.serve();
+      showBig(
+        I18n.t(localServingSide === 1 ? "game.serve_you" : "game.serve_opp"),
+        localServingSide === 1 ? "#ffffff" : "#b5bac1",
+        0.8, localServingSide === 1 ? 62 : 46
+      );
+    },
+    hit(localHitSide, x, y, isSpike){
+      hitFlash = 1;
+      spawnParticles(
+        x, y,
+        isSpike ? 14 : 8,
+        isSpike ? "rgba(255,220,120,1)" : "rgba(255,255,255,0.95)",
+        isSpike ? 320 : 220
+      );
+      squash.ball = Math.max(squash.ball, isSpike ? 0.16 : 0.11);
+      if(isSpike) sfx.spike(); else sfx.hit();
+    },
+    combo(rallyCount){
+      if(rallyCount > 0 && rallyCount % 5 === 0){
+        showBig("x" + rallyCount, "#ffd34a", 0.6, 52);
+      }
+    }
+  };
+
   // Публичный триггер реакции. Ограничиваем до 3-х одновременно на сторону,
   // чтобы спам кликов не засыпал экран — более старая замещается новой.
   function triggerEmote(side, id){
@@ -1679,10 +1734,7 @@ const Game = (function(){
     hitFlash = 0;
     squash.ball = 0;
     rallyHits = 0;
-    sfx.serve();
-    showBig(I18n.t(servingSide === 1 ? "game.serve_you" : "game.serve_opp"),
-            servingSide === 1 ? "#ffffff" : "#b5bac1",
-            0.8, servingSide === 1 ? 62 : 46);
+    Fx.serve(servingSide);
   }
 
   function resetMatch(){
@@ -2191,10 +2243,7 @@ const Game = (function(){
     const serveTransition = prevRoundOver && !roundOver;
     const firstServeCorrection = !firstSnapshotSeen && !roundOver && servingSide !== prevServingSide;
     if(serveTransition || firstServeCorrection){
-      sfx.serve();
-      showBig(I18n.t(servingSide === 1 ? "game.serve_you" : "game.serve_opp"),
-              servingSide === 1 ? "#ffffff" : "#b5bac1",
-              0.8, servingSide === 1 ? 62 : 46);
+      Fx.serve(servingSide);
     }
     firstSnapshotSeen = true;
     const incomingRh = s.rh || 0;
@@ -2203,32 +2252,33 @@ const Game = (function(){
     // раунда и сбрасывается в 0 на очко; зеркалим это, смотрим прирост.
     if(incomingRh > prevSnapRallyHits){
       const deltaHits = incomingRh - prevSnapRallyHits;
-      if(s.lh === 2){
+      // lastHitSide — post-mirror: у хоста lh===1 → у гостя это p2 (справа).
+      const hitterSide = s.lh === 1 ? 2 : (s.lh === 2 ? 1 : 0);
+      // Wallet: начисляем только свои касания (hitterSide===1). Идём по
+      // delta'е, а не по одному событию: если между снапшотами прошло
+      // несколько касаний подряд, каждое из них — повод для награды.
+      if(hitterSide === 1){
         for(let i = 0; i < deltaHits; i++){
           Wallet.award("rally.hit", 1);
           const combo = prevSnapRallyHits + i + 1;
           if(combo > 0 && combo % 5 === 0) Wallet.award("rally.combo", combo);
         }
       }
-      // Визуальный фидбек касания у гостя. Хост в spawnHitEffects
-      // крутит particles+hitFlash+squash, но это локальное состояние —
-      // через snapshot оно не летит. Раньше гость видел только, что мяч
-      // резко меняет направление, без искр и «удара». Ставим искры у мяча
-      // (координаты близки к точке контакта: snapshot приходит сразу
-      // после соударения), вспышку и сквош — на стороне того, кто ударил.
-      // lastHitSide — post-mirror: у хоста lh===1 → у гостя это p2 (справа).
-      const hitterSide = s.lh === 1 ? 2 : (s.lh === 2 ? 1 : 0);
-      hitFlash = 1;
-      squash.ball = Math.max(squash.ball, 0.11);
-      spawnParticles(ball.x, ball.y, 8, "rgba(255,255,255,0.95)", 220);
+      // Визуальный фидбек. Хост в collideBallPlayer показывает эффекты
+      // локально, но они не летят в снапшот — восстанавливаем их по lh/rh.
+      // isSpike мы без дополнительных полей в снапшоте не определим, поэтому
+      // на госте всегда обычный удар. Spike-инфо — кандидат в wire-format
+      // расширение (этап 2 netcode-плана).
+      Fx.hit(hitterSide, ball.x, ball.y, false);
+      // squash.p1/p2 — гостевой workaround за отсутствие landing-squash
+      // в снапшоте: impact-velocity у хоста срабатывает в integratePlayer,
+      // а гость её не видит. Бампим сквош того, кто ударил, чтобы удар
+      // «ощущался» визуально не хуже, чем у хоста.
       if(hitterSide === 1)      squash.p1 = Math.max(squash.p1, 0.14);
       else if(hitterSide === 2) squash.p2 = Math.max(squash.p2, 0.14);
-      sfx.hit();
       lastHitSide = hitterSide;
       rallyHits = incomingRh;
-      if(rallyHits > 0 && rallyHits % 5 === 0){
-        showBig("x" + rallyHits, "#ffd34a", 0.6, 52);
-      }
+      Fx.combo(rallyHits);
     }
     prevSnapRallyHits = incomingRh;
     rallyHits = incomingRh;
@@ -2236,28 +2286,20 @@ const Game = (function(){
     if(newS1 !== score1 || newS2 !== score2){
       const wasP1 = score1, wasP2 = score2;
       score1 = newS1; score2 = newS2;
-      const elA = $("hud-score-p1"), elB = $("hud-score-p2");
-      elA.textContent = String(score1); elB.textContent = String(score2);
-      const pulseEl = (score1 > wasP1) ? elA : (score2 > wasP2) ? elB : null;
-      if(pulseEl){
-        pulseEl.classList.remove("pulse");
-        void pulseEl.offsetWidth;
-        pulseEl.classList.add("pulse");
-      }
-      // Фидбек на очко у гостя: хост показывает showBig+sfx+particles в
-      // awardPoint, но гость проходит через applySnapshot и раньше видел
-      // только смену цифры в HUD — без «ОЧКО!/ПРОПУСК», без звука, без
-      // искр. Это ломало ощущение матча: казалось, что очки «случаются
-      // в тишине». Цвет/вдохновение копируем из awardPoint.
-      if(score1 > wasP1){
-        showBig(I18n.t("game.point"), "#23a55a", 0.9, 96);
-        sfx.point();
-        spawnParticles(ball.x, GROUND_Y - 2, 22, "rgba(35,165,90,1)", 260);
-        Wallet.award("round.win", 5);
-      } else if(score2 > wasP2){
-        showBig(I18n.t("game.miss"), "#f23f42", 0.9, 80);
-        sfx.lose();
-        spawnParticles(ball.x, GROUND_Y - 2, 22, "rgba(242,63,66,1)", 260);
+      // HUD держим в синхроне даже если счёт не вырос — защита от крайнего
+      // случая (напр. несинхронный reset), чтобы цифры не разъехались с
+      // авторитетом. В штатной игре счёт монотонен, Fx.point ниже всё равно
+      // перезапишет те же числа — идемпотентно.
+      $("hud-score-p1").textContent = String(score1);
+      $("hud-score-p2").textContent = String(score2);
+      const scoredSide = (score1 > wasP1) ? 1 : (score2 > wasP2) ? 2 : 0;
+      // Фидбек на очко у гостя: ровно тот же Fx.point, что в host'ном
+      // awardPoint. reason="foul" не приходит в снапшоте — всегда point/miss.
+      // Wallet.award round.win только когда своя сторона (scoredSide===1);
+      // на хосте это тоже условно, симметрия сохранена.
+      if(scoredSide > 0){
+        Fx.point(scoredSide, false);
+        if(scoredSide === 1) Wallet.award("round.win", 5);
       }
     }
     if(s.mo && !state.matchOver){
@@ -2462,25 +2504,22 @@ const Game = (function(){
       const k = MAX_BSPD / Math.sqrt(sp2);
       ball.vx *= k; ball.vy *= k;
     }
-    hitFlash = 1;
 
     // Feel: sparks, squash, sound — scaled by hit strength
     const isSpike = !p.onGround && ny < -0.3 && ball.vy > 200;
-    const cx = p.x + nx * (p.r + ball.r*0.3);
-    const cy = p.y + ny * (p.r + ball.r*0.3);
-    spawnParticles(cx, cy, isSpike ? 14 : 8, isSpike ? "rgba(255,220,120,1)" : "rgba(255,255,255,0.95)", isSpike ? 320 : 220);
-    squash.ball = Math.max(squash.ball, isSpike ? 0.16 : 0.11);
-    if(isSpike) sfx.spike(); else sfx.hit();
+    const fxX = p.x + nx * (p.r + ball.r*0.3);
+    const fxY = p.y + ny * (p.r + ball.r*0.3);
+    Fx.hit(p.side, fxX, fxY, isSpike);
     rallyHits++;
     lastHitSide = p.side;
+    Fx.combo(rallyHits);
     // Монеты за касания своего игрока. В bot/host свой игрок — p.side===1;
     // у гостя физика не крутится локально, поэтому его награда приезжает
     // через applySnapshot (lastHitSide=2 у хоста — это как раз гость).
     const isOwnHit = (p.side === 1) && (state.mode === "bot" || state.mode === "host");
-    if(isOwnHit) Wallet.award("rally.hit", 1);
-    if(rallyHits > 0 && rallyHits % 5 === 0){
-      showBig("x" + rallyHits, "#ffd34a", 0.6, 52);
-      if(isOwnHit) Wallet.award("rally.combo", rallyHits);
+    if(isOwnHit){
+      Wallet.award("rally.hit", 1);
+      if(rallyHits > 0 && rallyHits % 5 === 0) Wallet.award("rally.combo", rallyHits);
     }
     // 4-touch rule
     if(p.side === 1){ ball.touches.left++;  ball.touches.right = 0; }
@@ -2499,17 +2538,7 @@ const Game = (function(){
     rallyHits = 0;
     if(side===1){ score1++; servingSide = 1; }
     else        { score2++; servingSide = -1; }
-    const elA = $("hud-score-p1"), elB = $("hud-score-p2");
-    elA.textContent = score1; elB.textContent = score2;
-    // Trigger CSS pulse on the scored side
-    const pulseEl = side === 1 ? elA : elB;
-    pulseEl.classList.remove("pulse");
-    void pulseEl.offsetWidth; // reflow to restart animation
-    pulseEl.classList.add("pulse");
-    spawnParticles(ball.x, GROUND_Y - 2, 22, side === 1 ? "rgba(35,165,90,1)" : "rgba(242,63,66,1)", 260);
-    const isFoul = reason === "foul";
-    if(side === 1){ showBig(I18n.t(isFoul ? "game.foul" : "game.point"), "#23a55a", 0.9, 96); sfx.point(); }
-    else          { showBig(I18n.t(isFoul ? "game.foul" : "game.miss"),  "#f23f42", 0.9, 80); sfx.lose(); }
+    Fx.point(side, reason === "foul");
     // Монеты: +5 за выигранное очко. Bot/host — когда side===1 (свой игрок).
     // Гостю начисляется в applySnapshot, когда его «свой» счёт (mirror s.s2)
     // вырос между снапшотами.
