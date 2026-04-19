@@ -438,22 +438,31 @@ function enterMenu(){
 
 // Один постоянный сокет на сессию. Переиспользуем его для matchmaking,
 // онлайн-счётчика и пушей кошелька. Закрываем только на logout/выгрузке.
+//
+// КЛЮЧЕВОЙ ИНВАРИАНТ: state.ws присваивается СИНХРОННО, сразу после
+// new WebSocket(). Иначе между enterMenu() (fire-and-forget вызов) и
+// первым кликом «ИГРАТЬ» параллельные ensureMenuSocket() не увидели бы
+// друг друга (state.ws ещё null до await openSocket()) и открывали по
+// второму/третьему сокету. Один из них обычно успевал, но если handshake
+// задерживался и таймаут выстреливал → startMatchmaking получал null и
+// сваливал игрока в бот-матч ДО queue_timeout, что и видел пользователь
+// как «бот у обоих сразу после клика ИГРАТЬ».
 async function ensureMenuSocket(){
   if(state.ws && state.ws.readyState === 1) return state.ws;
-  if(state.ws && state.ws.readyState === 0){
-    // Уже идёт handshake — подождём его завершения (race между вкладками).
-    return new Promise((res)=>{
-      const ws = state.ws;
-      const done = ()=> res(ws.readyState === 1 ? ws : null);
-      ws.addEventListener("open",  done, { once: true });
-      ws.addEventListener("error", done, { once: true });
-    });
+  if(state.ws && (state.ws.readyState === 0 || state.ws.readyState === 2)){
+    // Идёт handshake или close — ждём здесь, без создания второго сокета.
+    return await waitSocketOpen(state.ws);
   }
-  const ws = await openSocket();
-  if(!ws) return null;
-  state.ws = ws;
-  attachSocketHandlers(ws);
-  return ws;
+  try {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const ws = new WebSocket(proto + "//" + location.host + "/ws");
+    ws.binaryType = "arraybuffer";
+    state.ws = ws;
+    attachSocketHandlers(ws);
+    return await waitSocketOpen(ws);
+  } catch(_){
+    return null;
+  }
 }
 
 /* ---------------- Онлайн-счётчик и таблица лидеров ----------------
@@ -621,23 +630,22 @@ function hideLobby(){
   stopLobbyCountdown();
 }
 
-function openSocket(){
+// Ожидание open у переданного WebSocket. Если сокет уже открыт — возвращаем
+// его без задержки. На ошибку/close/длинный таймаут возвращаем null, чтобы
+// вызывающий мог сделать fallback.
+function waitSocketOpen(ws, timeoutMs){
   return new Promise((resolve) => {
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    let ws;
-    try { ws = new WebSocket(proto + "//" + location.host + "/ws"); }
-    catch(_){ resolve(null); return; }
-    // Для бинарных relay-фреймов (снапшоты/инпут/эмоции) нужен ArrayBuffer
-    // в ev.data — по умолчанию браузер отдаёт Blob, что заставило бы делать
-    // асинхронный arrayBuffer() на каждом кадре.
-    ws.binaryType = "arraybuffer";
+    if(!ws || ws.readyState === 3){ resolve(null); return; }
+    if(ws.readyState === 1){ resolve(ws); return; }
     let settled = false;
     const done = (val) => { if(!settled){ settled = true; resolve(val); } };
-    ws.addEventListener("open",  ()=> done(ws));
-    ws.addEventListener("error", ()=> done(null));
-    // Подстраховка: если open не стрельнул за пару секунд — считаем,
-    // что коннекта нет, и откатываемся к боту.
-    setTimeout(()=> done(null), 2500);
+    ws.addEventListener("open",  () => done(ws),   { once: true });
+    ws.addEventListener("error", () => done(null), { once: true });
+    ws.addEventListener("close", () => done(null), { once: true });
+    // 8 секунд вместо 2.5 — на холодном старте/медленной сети первый handshake
+    // может подтянуться и за 3-4 секунды. Лучше продержать лобби дольше, чем
+    // ошибочно свалиться в бот-матч вместо реального соперника.
+    setTimeout(() => done(null), timeoutMs || 8000);
   });
 }
 
@@ -1601,10 +1609,16 @@ const Game = (function(){
   // Ball spawns above the visible area over the serving player and falls in
   // under gravity. No freeze — physics run continuously so the drop is visible.
   function serveBall(){
-    const serverX = servingSide===1 ? WORLD_W*0.25 : WORLD_W*0.75;
-    // Offset toward center so the serve arcs toward the net
-    const offset  = servingSide===1 ? 40 : -40;
-    const bx = serverX + offset;
+    // Подающий НЕ возвращается в центр зоны — мяч падает прямо над его
+    // текущей позицией. Клампим по краям поля и по своей половине, чтобы
+    // при игре в движении рядом с сеткой мяч не оказался на чужой стороне.
+    const server = servingSide === 1 ? p1 : p2;
+    const sx = (server && typeof server.x === "number")
+      ? server.x
+      : (servingSide === 1 ? WORLD_W*0.25 : WORLD_W*0.75);
+    const minX = (servingSide === 1) ? BALL_R : NET_X + NET_W/2 + BALL_R;
+    const maxX = (servingSide === 1) ? NET_X - NET_W/2 - BALL_R : WORLD_W - BALL_R;
+    const bx = Math.max(minX, Math.min(maxX, sx));
     ball = {
       x: bx,
       y: SERVE_SPAWN_Y,
@@ -1891,7 +1905,9 @@ const Game = (function(){
       roundTimer -= dt;
       if(roundTimer <= 0){
         roundOver = false;
-        spawnPlayers();
+        // Игроков НЕ телепортируем в центр зон — каждый остаётся там, где
+        // его застал конец раунда. serveBall() уронит мяч прямо над
+        // подающим. Устраняет «дёрганый» возврат слаймов после гола.
         serveBall();
         return;
       }
