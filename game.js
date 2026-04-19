@@ -1372,6 +1372,13 @@ const Game = (function(){
   let hitFlash = 0;
   let jumpBufferT = 0;
   let stuckT = 0;
+  // Гость: при переходе «ro=true → ro=false» (= хост только что сделал
+  // serveBall()) мяч скачком меняет позицию с точки гола на спавн подачи.
+  // Без этого флага интерполяция A→B между снапшотами плавно «везла» мяч
+  // из точки гола к спавну — выглядело как быстрый полёт. Прячем мяч на
+  // время этого A→B окна, чтобы визуально он пропал в точке гола и
+  // появился уже на спавне при первом кадре нового раунда.
+  let _ballHiddenTeleport = false;
 
   // --- Production polish state ---
   // Pre-allocated pool: на каждый удар spawnParticles делает 4-22 объекта,
@@ -1416,10 +1423,8 @@ const Game = (function(){
   let _emoteSeq = 0;
   const EMOTE_DUR = 1.8;
   const squash = { ball:0, p1:0, p2:0 }; // timers that scale targets briefly
-  let clouds = null;                     // parallax cloud layer, built once
-  let backPanels = null;                 // distant panel layer (parallaxed slower)
   let sparkles = null;                   // faint twinkling dots
-  let matchTime = 0;                     // total in-game seconds (for cloud drift)
+  let matchTime = 0;                     // total in-game seconds (for parallax)
   let rallyHits = 0;                     // consecutive hits for combo feedback
   let lastHitSide = 0;                   // side (1/2) последнего касания — для гостевых наград
   let prevSnapRallyHits = 0;             // на клиенте-госте: последний отрисованный счётчик касаний
@@ -1523,47 +1528,6 @@ const Game = (function(){
     slot.dead = false;
   }
 
-  function buildClouds(){
-    // Deterministic backdrop: drifting Discord-style "server icons" and chat-bubble marks.
-    const arr = [];
-    const rng = (n)=> ((Math.sin(n*12.9898)*43758.5453) % 1 + 1) % 1;
-    // Discord brand palette
-    const palette = ["#5865f2","#4752c4","#23a55a","#f0b232","#f23f42","#949ba4","#ffffff"];
-    const marks = ["#","@","/","&","!","?","+"];
-    for(let i=0;i<10;i++){
-      const k = rng(i+97);
-      arr.push({
-        x:     rng(i+1)  * WORLD_W,
-        y:     30 + rng(i+13) * 230,
-        size:  24 + rng(i+29) * 22,
-        speed: 4 + rng(i+41) * 8,
-        alpha: 0.14 + rng(i+71) * 0.18,
-        kind:  k < 0.45 ? "logo" : (k < 0.80 ? "icon" : "bubble"),
-        color: palette[(rng(i+113)*palette.length)|0],
-        mark:  marks[(rng(i+131)*marks.length)|0],
-        tilt:  (rng(i+149)*2 - 1) * 0.18
-      });
-    }
-    return arr;
-  }
-
-  // Far-background "server panel" rectangles — large, desaturated, drift slowly.
-  function buildBackPanels(){
-    const arr = [];
-    const rng = (n)=> ((Math.sin(n*78.233)*12345.678) % 1 + 1) % 1;
-    for(let i=0;i<5;i++){
-      arr.push({
-        x:     rng(i+3)  * WORLD_W,
-        y:     40 + rng(i+17) * (GROUND_Y - 180),
-        w:     180 + rng(i+29) * 180,
-        h:     60  + rng(i+37) * 60,
-        speed: 1.5 + rng(i+53) * 2.5,
-        alpha: 0.05 + rng(i+61) * 0.05
-      });
-    }
-    return arr;
-  }
-
   // Tiny sparkle field — faint stars/dots that slowly twinkle.
   function buildSparkles(){
     const arr = [];
@@ -1655,13 +1619,12 @@ const Game = (function(){
     _snapGaps.length = 0;
     _lastSnapRecvT = 0;
     renderDelay = 0.06;
+    _ballHiddenTeleport = false;
     for(let i = 0; i < PARTICLE_CAP; i++) particles[i].dead = true;
     for(let i = 0; i < EMOTE_CAP; i++) emotes[i].dead = true;
     trailHead = 0; trailCount = 0;
     squash.ball = squash.p1 = squash.p2 = 0;
     bigText = null;
-    if(!clouds)      clouds     = buildClouds();
-    if(!backPanels)  backPanels = buildBackPanels();
     if(!sparkles)    sparkles   = buildSparkles();
     // Сброс счётчиков rate-limit кошелька на новый матч, иначе лимиты
     // «maxPerMatch» останутся от предыдущего.
@@ -1752,7 +1715,7 @@ const Game = (function(){
     if(p1){ p1.prevX = p1.x; p1.prevY = p1.y; }
     if(p2){ p2.prevX = p2.x; p2.prevY = p2.y; }
     if(ball){ ball.prevX = ball.x; ball.prevY = ball.y; ball.prevAngle = ball.angle; }
-    // Tick polish timers (particles, trail, squash, big text, clouds).
+    // Tick polish timers (particles, trail, squash, big text).
     // Оборачиваем matchTime, чтобы на длинных сессиях синусы/модульные расчёты
     // не теряли точность. Период кратен 2π (≈17 ч), так что sin-анимации
     // (блики, покачивание тени) остаются непрерывными на границе.
@@ -1847,9 +1810,20 @@ const Game = (function(){
           const bBa  = -B.s.b.a;
           p2.x = aP2x + (bP2x - aP2x) * alpha;
           p2.y = aP2y + (bP2y - aP2y) * alpha;
-          ball.x = aBx + (bBx - aBx) * alpha;
-          ball.y = aBy + (bBy - aBy) * alpha;
-          ball.angle = aBa + (bBa - aBa) * alpha;
+          // Телепорт мяча на подачу: A.ro=true (пост-очко) → B.ro=false
+          // (свежий serveBall). Не интерполируем — сразу ставим мяч в
+          // точку спавна и прячем его на время окна, чтобы визуально
+          // старый мяч «пропал» на точке гола, а новый «появился» на
+          // спавне с первым тиком нового раунда (без видимого полёта).
+          if(snapA.s.ro && !B.s.ro){
+            ball.x = bBx; ball.y = bBy; ball.angle = bBa;
+            _ballHiddenTeleport = true;
+          } else {
+            ball.x = aBx + (bBx - aBx) * alpha;
+            ball.y = aBy + (bBy - aBy) * alpha;
+            ball.angle = aBa + (bBa - aBa) * alpha;
+            _ballHiddenTeleport = false;
+          }
         } else {
           // Буфер пуст (сетевой дроп/спайк) — форвард-экстраполяция от последнего
           // снапа по его авторитетной скорости. Это fallback; обычно снапшот
@@ -1860,6 +1834,7 @@ const Game = (function(){
           // границе — лучше «подвисший» соперник, чем улетевший и прыгающий.
           const MAX_EXTRAPOLATE = 0.3;
           const dtA = Math.min(MAX_EXTRAPOLATE, Math.max(0, targetT - snapA.recvT));
+          _ballHiddenTeleport = false;
           const vx2 = -snapA.s.p1.vx, vy2 = snapA.s.p1.vy;
           const vbx = -snapA.s.b.vx,  vby = snapA.s.b.vy;
           const p2gnd = !!snapA.s.p1.g;
@@ -2341,6 +2316,18 @@ const Game = (function(){
     if(un < 0){
       ux -= 2 * un * nx;
       uy -= 2 * un * ny;
+      // Slime-friction: тангенциальная компонента относительной скорости
+      // гасится частично (не идеально-упругий отскок). Без этого круглая
+      // форма слайма отражала только нормаль — бежишь по слайму вправо,
+      // мяч всё равно летит строго вверх, потому что тангенциальная часть
+      // сохраняется полностью и компенсирует p.vx при возврате в world frame.
+      // Ощущение «мяч всегда летит в одну сторону» уходит: часть движения
+      // слайма переносится в мяч, удар по бокам/в движении работает.
+      const tx = -ny, ty = nx;
+      const ut = ux*tx + uy*ty;
+      const FRICTION = 0.35;
+      ux -= ut * tx * FRICTION;
+      uy -= ut * ty * FRICTION;
       ball.vx = ux + p.vx;
       ball.vy = uy + p.vy;
     }
@@ -2436,23 +2423,17 @@ const Game = (function(){
     ctx.save();
     ctx.translate(offsetX, offsetY);
     ctx.scale(scale, scale);
-    // Clip every world-space draw to the playfield rect so clouds, particles,
-    // big text etc. never bleed into the letterbox bars on wide screens.
+    // Clip every world-space draw to the playfield rect so particles, big
+    // text etc. never bleed into the letterbox bars on wide screens.
     ctx.beginPath();
     ctx.rect(0, 0, WORLD_W, WORLD_H);
     ctx.clip();
 
     // Sky + backdrop-glow запечены в один спрайт — 1 drawImage вместо 3
-    // полноэкранных alpha-fill'ов каждый кадр. Остальные фоновые слои ниже
-    // анимированы (channelGrid scroll, backPanels parallax) и остаются per-frame.
+    // полноэкранных alpha-fill'ов каждый кадр.
     buildBackdropSprite();
     ctx.drawImage(_backdropSprite, 0, 0, WORLD_W, WORLD_H);
-    if(!isTouch && !lowQuality){
-      drawChannelGrid();
-      drawBackPanels();
-    }
     drawSparkles();
-    drawClouds();
     drawNetHalo();
 
     // Court + base line (Discord sidebar / channel list vibe)
@@ -2477,51 +2458,6 @@ const Game = (function(){
     ctx.restore();
   }
 
-  // Thin horizontal "chat row" divider lines — very subtle, evokes Discord's
-  // message list without competing with gameplay.
-  function drawChannelGrid(){
-    ctx.strokeStyle = "rgba(255,255,255,0.025)";
-    ctx.lineWidth = 1;
-    const step = 36;
-    const offset = (matchTime * 6) % step;
-    for(let y = -offset; y < GROUND_Y; y += step){
-      ctx.beginPath();
-      ctx.moveTo(0, y);
-      ctx.lineTo(WORLD_W, y);
-      ctx.stroke();
-    }
-    // Left "sidebar" tint — hints at the server-list column.
-    ctx.fillStyle = sidebarGrad();
-    ctx.fillRect(0, 0, 140, GROUND_Y);
-  }
-
-  // Far-back rounded panels — slow parallax, heavy blur-ish desaturation.
-  function drawBackPanels(){
-    if(!backPanels) return;
-    ctx.save();
-    for(const p of backPanels){
-      const x = ((p.x + matchTime * p.speed) % (WORLD_W + p.w + 100)) - p.w - 50;
-      ctx.globalAlpha = p.alpha;
-      ctx.fillStyle = "#ffffff";
-      roundRect(x, p.y, p.w, p.h, 18);
-      ctx.fill();
-      // Fake "avatar + text rows" inside the panel
-      ctx.globalAlpha = p.alpha * 1.6;
-      ctx.fillStyle = "#5865f2";
-      ctx.beginPath();
-      ctx.arc(x + 24, p.y + 24, 10, 0, Math.PI*2);
-      ctx.fill();
-      ctx.fillStyle = "#ffffff";
-      ctx.fillRect(x + 42, p.y + 18, p.w - 60, 4);
-      ctx.fillRect(x + 42, p.y + 28, (p.w - 60)*0.6, 4);
-      if(p.h > 80){
-        ctx.fillRect(x + 42, p.y + 44, (p.w - 60)*0.8, 4);
-      }
-    }
-    ctx.restore();
-    ctx.globalAlpha = 1;
-  }
-
   // Tiny blinking dots scattered across the sky.
   function drawSparkles(){
     if(!sparkles) return;
@@ -2541,101 +2477,6 @@ const Game = (function(){
     const cx = NET_X, cy = GROUND_Y - NET_H * 0.55;
     ctx.fillStyle = netHaloGrad();
     ctx.fillRect(cx - 180, cy - 180, 360, 360);
-  }
-
-  // Каждое облако — набор статичных векторных фигур, которые мы раньше
-  // рисовали на главный canvas каждый кадр. Рендерим их в офскрин-спрайт
-  // один раз и дальше просто blit'им через drawImage (+ translate/rotate),
-  // чтобы освободить 2D-контекст от десятков path-команд за кадр.
-  function buildCloudSprite(c){
-    const s = c.size;
-    // Запас в два раза от размера — хватает с полями для чат-бабла с хвостом.
-    const side = Math.ceil(s * 2.4);
-    const off = document.createElement("canvas");
-    off.width = side;
-    off.height = side;
-    const octx = off.getContext("2d");
-    const cx = side / 2, cy = side / 2;
-    if(c.kind === "logo"){
-      drawCloudLogo(octx, cx, cy, s, c.color);
-    } else if(c.kind === "icon"){
-      drawCloudIcon(octx, cx, cy, s, c.color, c.mark);
-    } else {
-      drawCloudBubble(octx, cx, cy, s, c.color);
-    }
-    c._sprite = off;
-    c._spriteHalf = side / 2;
-  }
-
-  function drawCloudLogo(g, x, y, s, color){
-    const w = s*1.3, h = s, rr = s*0.35;
-    g.fillStyle = color;
-    pathRoundRect(g, x - w/2, y - h/2, w, h, rr);
-    g.fill();
-    g.fillStyle = "#1e1f22";
-    g.beginPath();
-    g.ellipse(x - w*0.18, y, s*0.085, s*0.14, 0, 0, Math.PI*2);
-    g.ellipse(x + w*0.18, y, s*0.085, s*0.14, 0, 0, Math.PI*2);
-    g.fill();
-  }
-  function drawCloudIcon(g, x, y, s, color, mark){
-    const w = s*1.15, h = s*1.15, rr = s*0.28;
-    g.fillStyle = color;
-    pathRoundRect(g, x - w/2, y - h/2, w, h, rr);
-    g.fill();
-    g.fillStyle = "rgba(30,31,34,0.85)";
-    g.font = "900 " + Math.round(s*0.8) + "px system-ui,sans-serif";
-    g.textAlign = "center";
-    g.textBaseline = "middle";
-    g.fillText(mark || "#", x, y + s*0.04);
-  }
-  function drawCloudBubble(g, x, y, s, color){
-    const w = s*1.6, h = s*0.95, rr = s*0.32;
-    g.fillStyle = color;
-    pathRoundRect(g, x - w/2, y - h/2, w, h, rr);
-    g.fill();
-    g.beginPath();
-    g.moveTo(x - w*0.22, y + h/2 - 1);
-    g.lineTo(x - w*0.42, y + h/2 + s*0.35);
-    g.lineTo(x - w*0.08, y + h/2 - 1);
-    g.closePath();
-    g.fill();
-    g.fillStyle = "rgba(30,31,34,0.7)";
-    const dotR = s*0.08;
-    for(let i=-1;i<=1;i++){
-      g.beginPath();
-      g.arc(x + i*s*0.28, y, dotR, 0, Math.PI*2);
-      g.fill();
-    }
-  }
-  function pathRoundRect(g, x, y, w, h, r){
-    const rr = Math.min(r, w*0.5, h*0.5);
-    g.beginPath();
-    g.moveTo(x + rr, y);
-    g.lineTo(x + w - rr, y);
-    g.quadraticCurveTo(x + w, y, x + w, y + rr);
-    g.lineTo(x + w, y + h - rr);
-    g.quadraticCurveTo(x + w, y + h, x + w - rr, y + h);
-    g.lineTo(x + rr, y + h);
-    g.quadraticCurveTo(x, y + h, x, y + h - rr);
-    g.lineTo(x, y + rr);
-    g.quadraticCurveTo(x, y, x + rr, y);
-    g.closePath();
-  }
-
-  function drawClouds(){
-    if(!clouds) return;
-    for(const c of clouds){
-      if(!c._sprite) buildCloudSprite(c);
-      const x = ((c.x + matchTime * c.speed) % (WORLD_W + 160)) - 80;
-      ctx.save();
-      ctx.globalAlpha = c.alpha;
-      ctx.translate(x, c.y);
-      ctx.rotate(c.tilt);
-      ctx.drawImage(c._sprite, -c._spriteHalf, -c._spriteHalf);
-      ctx.restore();
-    }
-    ctx.globalAlpha = 1;
   }
 
   function drawNet(){
@@ -2793,7 +2634,7 @@ const Game = (function(){
 
   // Кэш статичных градиентов: форма фиксирована, цвета не меняются — создаём
   // объекты лениво один раз, вместо пересоздания каждый кадр.
-  let _sidebarGrad = null, _netHaloGrad = null, _netPostsGrad = null,
+  let _netHaloGrad = null, _netPostsGrad = null,
       _ballNormalGrad = null, _ballFlashGrad = null;
 
   const BALL_TEX = new Image();
@@ -2841,14 +2682,6 @@ const Game = (function(){
     _backdropSpriteQ = q;
   }
 
-  function sidebarGrad(){
-    if(_sidebarGrad) return _sidebarGrad;
-    const g = ctx.createLinearGradient(0, 0, 140, 0);
-    g.addColorStop(0, "rgba(30,31,34,0.55)");
-    g.addColorStop(1, "rgba(30,31,34,0)");
-    _sidebarGrad = g;
-    return g;
-  }
   function netHaloGrad(){
     if(_netHaloGrad) return _netHaloGrad;
     const cx = NET_X, cy = GROUND_Y - NET_H * 0.55;
@@ -3066,6 +2899,7 @@ const Game = (function(){
   }
 
   function drawBall(){
+    if(_ballHiddenTeleport) return;
     const bx = ball.renderX, by = ball.renderY;
     // Soft ground shadow scaled by height above court
     const shf = 1 - Math.min(0.7, (GROUND_Y - by)/GROUND_Y);
