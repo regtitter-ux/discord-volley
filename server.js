@@ -436,6 +436,17 @@ const DECORATIONS = {
     frameH:     96,
     cols:       6,
     rows:       10
+  },
+  deco4: {
+    id:         "deco4",
+    price:      10000,
+    atlas:      "/assets/decorations/deco4/atlas.png",
+    frames:     60,
+    fps:        12,
+    frameW:     96,
+    frameH:     96,
+    cols:       6,
+    rows:       10
   }
 };
 const DECORATION_IDS = new Set(Object.keys(DECORATIONS));
