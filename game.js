@@ -1337,6 +1337,22 @@ const Game = (function(){
   // чтобы сеть не зависела от частоты рендера.
   let snapAcc = 0;
   const SNAP_STEP = 1/30;
+  // Snapshot interpolation buffer (режим guest).
+  //   snapQ — входящие снапшоты в порядке приёма, каждый с recvT (локальное
+  //     время приёма, сек). Храним «сырой» s до зеркалирования, чтобы не
+  //     дублировать данные.
+  //   snapA — последний потреблённый снапшот; служит «левой» точкой интерполяции
+  //     (правая — snapQ[0], если есть).
+  //   RENDER_DELAY — рендерим соперника и мяч на этой задержке в прошлое.
+  //     100 мс = ~3× SNAP_STEP — поглощает джиттер до ~66 мс и один дроп пакета
+  //     без визуальных хитчей. Платим постоянной задержкой видимости действий
+  //     соперника, но убираем rubber-band на ударах мяча (где extrapolation
+  //     показывала старое направление до прихода нового снапа).
+  //   SNAP_Q_MAX — 12 × 33 мс = 400 мс, отсекает зомби-буфер после хитча сети.
+  const snapQ = [];
+  let snapA = null;
+  const RENDER_DELAY = 0.1;
+  const SNAP_Q_MAX = 12;
   let hitFlash = 0;
   let jumpBufferT = 0;
   let stuckT = 0;
@@ -1571,6 +1587,10 @@ const Game = (function(){
     firstSnapshotSeen = false;
     hitFlash = 0;
     matchTime = 0;
+    // Сбрасываем буфер интерполяции — старые снапшоты прошлого матча не
+    // должны утянуть позиции в новом.
+    snapQ.length = 0;
+    snapA = null;
     particles.length = 0;
     emotes.length = 0;
     trail.length = 0;
@@ -1708,7 +1728,7 @@ const Game = (function(){
       // применяет к p2 от принятого input-mask'а — физика идентична,
       // поэтому drift между предсказанием и авторитетной позицией ограничен
       // лишь MOVE*RTT (~60–120 px). Большие расхождения (respawn/teleport)
-      // снапаются в applySnapshot через p2/ball-triggered `big`.
+      // снапаются в consumeSnapshot через p2/ball-triggered `big`.
       // Используем applyInput (без coyote/jump-buffer), чтобы точно совпадать
       // с тем, как хост трактует guest-input через applyInput(p2, peerKeys).
       if(p1 && !state.matchOver){
@@ -1725,38 +1745,50 @@ const Game = (function(){
         // те же границы, что host использует для своего p1.
         integratePlayer(p1, dt, 0, NET_X - NET_W*0.5);
       }
-      // Соперник (p2) и мяч — forward-extrapolation по последней авторитетной
-      // скорости. На 30 Гц снапшотах 33 мс межснапшотной экстраполяции дают
-      // ошибку ~10/41 px, которую следующий снапшот переписывает.
-      if(p2){
-        p2.x += p2.vx * dt;
-        if(!p2.onGround){
-          p2.vy += GRAV * dt;
-          p2.y  += p2.vy * dt;
-          if(p2.y + p2.r >= GROUND_Y){ p2.y = GROUND_Y - p2.r; p2.vy = 0; p2.onGround = true; }
-        }
+      // Потребляем все снапшоты, ready-время которых уже наступило (recvT <= targetT).
+      // Каждое потребление даёт авторитетные события/скорости; позиции p2/мяча
+      // ставит интерполяция ниже.
+      const nowT = Clock.now() / 1000;
+      const targetT = nowT - RENDER_DELAY;
+      while(snapQ.length > 0 && snapQ[0].recvT <= targetT){
+        const e = snapQ.shift();
+        consumeSnapshot(e.s);
+        snapA = e;
       }
-      if(ball){
-        ball.vy += GRAV * dt;
-        ball.x  += ball.vx * dt;
-        ball.y  += ball.vy * dt;
-        ball.angle += ball.vx * dt * 0.025;
-        // Страховка от визуального «проваливания под землю» между снапшотами,
-        // если мяч как раз в момент удара о землю. Следующий снапшот всё
-        // равно перепишет авторитетную позицию. Заодно эмитим те же bounce-
-        // искры + squash, что и хост в stepBall — без этого гость видел
-        // «пустой» удар мяча о пол, без фидбека.
-        if(ball.y + ball.r > GROUND_Y){
-          const impactSpeed = Math.abs(ball.vy);
-          ball.y = GROUND_Y - ball.r;
-          if(ball.vy > 0){
-            if(impactSpeed > 80){
-              sfx.bounce();
-              spawnParticles(ball.x, GROUND_Y - 2, Math.min(12, 4 + (impactSpeed/120)|0), "rgba(255,255,255,1)", 180);
-              squash.ball = Math.max(squash.ball, 0.12);
-            }
-            ball.vy = 0;
-          }
+      if(snapA && p2 && ball){
+        const B = snapQ[0] || null;
+        const aP2x = WORLD_W - snapA.s.p1.x, aP2y = snapA.s.p1.y;
+        const aBx  = WORLD_W - snapA.s.b.x,  aBy  = snapA.s.b.y;
+        const aBa  = -snapA.s.b.a;
+        if(B){
+          // Интерполяция A→B на доле [0..1] между их recvT. Даёт гладкое
+          // движение без «телепортов» на смене направления мяча — всё, что
+          // видит гость, это интерполяция между двумя реальными кадрами хоста.
+          const range = B.recvT - snapA.recvT;
+          const alpha = range > 1e-6 ? Math.min(1, Math.max(0, (targetT - snapA.recvT) / range)) : 0;
+          const bP2x = WORLD_W - B.s.p1.x, bP2y = B.s.p1.y;
+          const bBx  = WORLD_W - B.s.b.x,  bBy  = B.s.b.y;
+          const bBa  = -B.s.b.a;
+          p2.x = aP2x + (bP2x - aP2x) * alpha;
+          p2.y = aP2y + (bP2y - aP2y) * alpha;
+          ball.x = aBx + (bBx - aBx) * alpha;
+          ball.y = aBy + (bBy - aBy) * alpha;
+          ball.angle = aBa + (bBa - aBa) * alpha;
+        } else {
+          // Буфер пуст (сетевой дроп/спайк) — форвард-экстраполяция от последнего
+          // снапа по его авторитетной скорости. Это fallback; обычно снапшот
+          // приходит в пределах SNAP_STEP и мы возвращаемся на интерполяцию.
+          const dtA = Math.max(0, targetT - snapA.recvT);
+          const vx2 = -snapA.s.p1.vx, vy2 = snapA.s.p1.vy;
+          const vbx = -snapA.s.b.vx,  vby = snapA.s.b.vy;
+          const p2gnd = !!snapA.s.p1.g;
+          p2.x = aP2x + vx2 * dtA;
+          p2.y = p2gnd ? aP2y : (aP2y + vy2 * dtA + 0.5 * GRAV * dtA * dtA);
+          if(p2.y + p2.r > GROUND_Y) p2.y = GROUND_Y - p2.r;
+          ball.x = aBx + vbx * dtA;
+          ball.y = aBy + vby * dtA + 0.5 * GRAV * dtA * dtA;
+          ball.angle = aBa + vbx * dtA * 0.025;
+          if(ball.y + ball.r > GROUND_Y) ball.y = GROUND_Y - ball.r;
         }
       }
       return;
@@ -1898,16 +1930,24 @@ const Game = (function(){
   }
 
   function applySnapshot(s){
+    // Публичная точка входа из onPeerPayload. Просто ставит снапшот в очередь —
+    // реальная обработка (consumeSnapshot) произойдёт в step() через RENDER_DELAY,
+    // давая буфер для интерполяции между двумя известными кадрами.
+    if(state.mode !== "guest" || !p1 || !p2 || !ball) return;
+    snapQ.push({ recvT: Clock.now() / 1000, s });
+    if(snapQ.length > SNAP_Q_MAX) snapQ.shift();
+  }
+
+  function consumeSnapshot(s){
+    // Применение авторитетного снапшота, сдвинутого по времени на RENDER_DELAY.
+    // Занимается: событиями (счёт/подача/удар/matchOver), скоростями p2/мяча,
+    // реконсиляцией p1. Позиции p2/мяча НЕ ставит — их ставит интерполяция
+    // в step() между двумя снапшотами (snapA → snapQ[0]).
     if(state.mode !== "guest" || !p1 || !p2 || !ball) return;
     // Зеркалим по X, чтобы гость видел себя слева. В мировых координатах
     // хоста гость — p2 (справа), поэтому p1 у нас собираем из s.p2 с
     // отражением x и vx, а p2 — из s.p1. Счёт и сторону подачи тоже
     // меняем местами, иначе при первой подаче мяч уедет не туда.
-    // prev НЕ ресетим: step-экстраполяция между снапшотами уже подвинула
-    // позицию близко к авторитетной, render-lerp prev→curr по alpha даёт
-    // плавный «мягкий» корректив вместо телепорта. Исключение — крупные
-    // скачки (респаун раунда): если ошибка > CORRECT_SNAP_PX, снапаем prev,
-    // чтобы не получить медленный дрейф через пол-экрана за один кадр.
     //
     // Собственный игрок (p1 у гостя) предсказывается локально в step() —
     // не перезаписываем его из снапшота целиком, иначе на высоком RTT
@@ -1927,10 +1967,13 @@ const Game = (function(){
       p1.x = nx1; p1.y = ny1; p1.vx = -s.p2.vx; p1.vy = s.p2.vy; p1.onGround = !!s.p2.g;
       p1.prevX = p1.x; p1.prevY = p1.y;
     }
-    p2.x = nx2; p2.y = ny2; p2.vx = -s.p1.vx; p2.vy = s.p1.vy; p2.onGround = !!s.p1.g;
-    ball.x = nbx; ball.y = nby;
-    ball.vx = -s.b.vx; ball.vy = s.b.vy; ball.angle = -s.b.a;
+    p2.vx = -s.p1.vx; p2.vy = s.p1.vy; p2.onGround = !!s.p1.g;
+    ball.vx = -s.b.vx; ball.vy = s.b.vy;
     if(big){
+      // Respawn/телепорт — снапаем интерполяцию к новым позициям, чтобы на
+      // следующем кадре не было визуального «тягучего» перехода через пол-экрана.
+      p2.x = nx2; p2.y = ny2;
+      ball.x = nbx; ball.y = nby; ball.angle = -s.b.a;
       p2.prevX = p2.x; p2.prevY = p2.y;
       ball.prevX = ball.x; ball.prevY = ball.y; ball.prevAngle = ball.angle;
     }
