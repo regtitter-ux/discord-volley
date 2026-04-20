@@ -611,7 +611,10 @@ const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
 // Broker — абстракция над (local | redis). Инициализируется в startup
 // async IIFE ниже. Все multi-instance примитивы (очередь, relay, stakes,
 // online-counter) идут через него; под капотом либо in-memory, либо Redis.
-const { createBroker } = require("./broker");
+const { createBroker }    = require("./broker");
+const { ShadowRegistry }  = require("./shadowsim");
+const shadow = new ShadowRegistry(process.env.DV_SHADOW_PHYSICS === "1");
+shadow.start();
 let broker = null;
 let INSTANCE_ID = crypto.randomBytes(6).toString("hex");
 
@@ -760,6 +763,9 @@ async function pairLocal(host, guest){
   const stakesMsg = { win: stakes.win, loss: stakes.loss };
   send(host,  { type: "matched", role: "host",  room: roomId, matchId, stakes: stakesMsg, opponent: safeUser(guest.user) });
   send(guest, { type: "matched", role: "guest", room: roomId, matchId, stakes: stakesMsg, opponent: safeUser(host.user)  });
+  shadow.registerRole(host.wsId,  "host");
+  shadow.registerRole(guest.wsId, "guest");
+  shadow.openRoom(roomId);
   console.log(`[ws] matched host=${host.user.id} guest=${guest.user.id} room=${roomId} match=${matchId} stakes=+${stakes.win}/-${stakes.loss}`);
 }
 
@@ -777,6 +783,8 @@ async function onRemotePair(info){
   await broker.joinRoom(info.roomId, host);
   const stakesMsg = { win: info.stakes.win, loss: info.stakes.loss };
   send(host.ws, { type: "matched", role: "host", room: info.roomId, matchId: info.matchId, stakes: stakesMsg, opponent: info.guestUser });
+  shadow.registerRole(host.ws.wsId, "host");
+  shadow.openRoom(info.roomId);
   console.log(`[ws] remote-matched host=${host.ws.user.id} room=${info.roomId} match=${info.matchId}`);
 }
 
@@ -812,6 +820,8 @@ async function onQueue(ws){
     await broker.joinRoom(roomId, ws._client);
     const stakesMsg = { win: stakes.win, loss: stakes.loss };
     send(ws, { type: "matched", role: "guest", room: roomId, matchId, stakes: stakesMsg, opponent: { id: res.partner.userId } });
+    shadow.registerRole(ws.wsId, "guest");
+    shadow.openRoom(roomId);
     await broker.publishPair(res.partner.instance, {
       hostWsId:  res.partner.wsId,
       guestUser: safeUser(ws.user),
@@ -866,9 +876,16 @@ async function leaveRoom(ws, reason){
         // держим: оставшийся пир всё ещё может прислать match_win/match_loss
         // без matchId-в-пейлоаде, и сервер найдёт нужный matchId через него.
         if (c.ws) c.ws.roomId = null;
+        // Shadow: у пира roomId только что занулили, его собственный close
+        // не зайдёт в блок unregisterRole. Чистим здесь по snapshot списку.
+        shadow.unregisterRole(c.wsId);
       }
     }
     await broker.leaveRoom(roomId, ws._client);
+    shadow.unregisterRole(ws.wsId);
+    shadow.closeRoom(roomId);
+  } else {
+    shadow.unregisterRole(ws.wsId);
   }
 }
 
@@ -918,6 +935,7 @@ wss.on("connection", async (ws, req) => {
     if (isBinary) {
       if (!ws.roomId) return;
       if (!raw || raw.length < 2 || raw.length > 256) return;
+      shadow.observeFrame(ws.roomId, ws.wsId, raw);
       broker.publishRoom(ws.roomId, ws.wsId, raw);
       return;
     }
