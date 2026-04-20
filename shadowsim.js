@@ -18,6 +18,13 @@ const DVCodec   = require("./codec.js");
 
 const TICK_HZ        = 60;
 const TICK_MS        = 1000 / TICK_HZ;
+const TICK_NS        = BigInt(Math.round(TICK_MS * 1e6));
+// MAX_CATCHUP — максимум физ-шагов за один вызов accumulator'а. Cap=2 по
+// рекомендации ревью: при длинной GC-паузе (>2 тиков) сервер не «взрывается»
+// пачкой тиков, а мягко дропает накопленный лаг — клиент увидит только один
+// снапшот вместо серии, и его interpolation-буфер не схлопнется.
+const MAX_CATCHUP    = 2;
+const MAX_ACC_NS     = TICK_NS * 4n;
 const STATS_LOG_MS   = 30000;     // summary лог раз в 30 с
 const DRIFT_WARN_PX  = 50;        // одноразовый варн, если drift > X
 // Stage 8: snapshot rate 30 → 60 Hz. Половина inter-arrival gap на клиенте
@@ -169,16 +176,34 @@ class ShadowRegistry {
     this.wsRole = new Map();   // wsId → 'host' | 'guest'
     this.tickHandle = null;
     this.statsHandle = null;
+    // DV_TICK_ACCUMULATOR=1 — «Fix Your Timestep» на Node.js setInterval.
+    // На shared-CPU Railway/Hathora GC-паузы и scheduling jitter иногда
+    // откладывают setInterval-колбэк на 30-80 мс. При фикс-dt физика в эти
+    // моменты «замирала» — снапшоты редели, клиент переходил в extrapolation.
+    // С accumulator мы добираем пропущенные тики (cap MAX_CATCHUP), а snap
+    // эмитится только один раз за вызов, чтобы клиентский interp-буфер не
+    // получил пачку снапшотов с gap≈0. Default off — включим после замера
+    // baseline-метрик на проде.
+    this.useAccumulator = process.env.DV_TICK_ACCUMULATOR === "1";
+    this._accNs = 0n;
+    this._lastTickNs = 0n;
+    this._tickStats = { maxLagMs: 0, catchup2: 0, drops: 0, ticks: 0 };
   }
   start(){
     if (!this.enabled) return;
-    this.tickHandle = setInterval(() => this._tickAll(), TICK_MS);
+    if (this.useAccumulator){
+      this._lastTickNs = process.hrtime.bigint();
+      this.tickHandle = setInterval(() => this._tickAccum(), TICK_MS);
+    } else {
+      this.tickHandle = setInterval(() => this._tickAll(true), TICK_MS);
+    }
     this.statsHandle = setInterval(() => this._flushStats(), STATS_LOG_MS);
     this.tickHandle.unref?.();
     this.statsHandle.unref?.();
     const tags = [
       this.shadowMode ? "shadow" : null,
-      this.authMode   ? "auth"   : null
+      this.authMode   ? "auth"   : null,
+      this.useAccumulator ? "accum" : null
     ].filter(Boolean).join("+");
     console.log(`[shadow] enabled (${tags}, tick=${TICK_HZ}Hz, stats=${STATS_LOG_MS/1000}s)`);
   }
@@ -304,7 +329,37 @@ class ShadowRegistry {
       sim.servingSide = dec.ss;
     }
   }
-  _tickAll(){
+  // Fix Your Timestep accumulator: замеряет реальный elapsed между вызовами
+  // через process.hrtime.bigint(), догоняет пропущенные тики (до MAX_CATCHUP
+  // за вызов). Snap эмитится только на последнем шаге batch'а, чтобы не
+  // накачать клиентский буфер пачкой снапшотов с нулевым inter-arrival gap.
+  _tickAccum(){
+    const now = process.hrtime.bigint();
+    const elapsedNs = now - this._lastTickNs;
+    this._lastTickNs = now;
+    const lagMs = Number(elapsedNs) / 1e6;
+    if (lagMs > this._tickStats.maxLagMs) this._tickStats.maxLagMs = lagMs;
+    this._accNs += elapsedNs;
+    // Клип accumulator'а: после очень долгой паузы (MAX_ACC_NS = 4 тика) не
+    // пытаемся догнать всё, оставляем ровно один тик. Иначе получим всплеск
+    // CPU и пачку снапов, хуже чем просто «потерянное» время.
+    if (this._accNs > MAX_ACC_NS){
+      this._accNs = TICK_NS;
+      this._tickStats.drops++;
+    }
+    let steps = 0;
+    while (this._accNs >= TICK_NS && steps < MAX_CATCHUP){
+      this._accNs -= TICK_NS;
+      steps++;
+      // Эмитим snap только на последнем шаге. При обычном ритме steps=1 —
+      // поведение идентично старому _tickAll(true).
+      const isLast = (steps === MAX_CATCHUP) || (this._accNs < TICK_NS);
+      this._tickAll(isLast);
+    }
+    this._tickStats.ticks += steps;
+    if (steps >= 2) this._tickStats.catchup2++;
+  }
+  _tickAll(emitSnap){
     const dt = 1 / TICK_HZ;
     for (const [roomId, sim] of this.sims){
       // Post-point фриз: мяч падает/летит, но очков больше не присуждаем,
@@ -345,19 +400,32 @@ class ShadowRegistry {
         const pointSide = sim.ball.x < sim.NET_X ? 2 : 1;
         _awardPoint(sim, pointSide, "ground");
       }
-      // Authoritative-only: эмитим снапшот обоим пирам на 30 Гц. Сим
-      // работает на 60 Гц, так что аккумулятор выдаёт кадр через каждый
-      // второй тик. Снапшот — world-coord, клиент-гость зеркалит у себя.
+      // Authoritative-only: эмитим снапшот обоим пирам (Stage 8: 60 Гц,
+      // каждый tick). Снапшот — world-coord, клиент-гость зеркалит у себя.
+      // emitSnap=false внутри catchup-batch: физика делает несколько шагов,
+      // но snap идёт один раз — клиентский interp-буфер не должен получать
+      // пачку снапов с gap≈0 (см. _tickAccum).
       if (sim.authoritative){
         sim.snapAcc += dt;
         if (sim.snapAcc >= SNAP_STEP){
           sim.snapAcc = 0;
-          _emitSnapshot(sim);
+          if (emitSnap) _emitSnapshot(sim);
         }
       }
     }
   }
   _flushStats(){
+    // Tick-loop метрики — baseline для оценки drift/catchup на проде.
+    // Логим один раз на 30 с независимо от количества комнат. maxLagMs показывает
+    // худшую задержку setInterval-колбэка за окно (GC, CPU-throttle на shared-
+    // инстансе). catchup2 — сколько раз accumulator добирал 2 шага за вызов
+    // (индикатор jitter event loop'а). drops — сколько раз пришлось выкинуть
+    // накопленный лаг (очень длинная пауза).
+    if (this.useAccumulator && this._tickStats.ticks > 0){
+      const s = this._tickStats;
+      console.log(`[shadow-tick] ticks=${s.ticks} maxLagMs=${s.maxLagMs.toFixed(1)} catchup2=${s.catchup2} drops=${s.drops}`);
+      s.maxLagMs = 0; s.catchup2 = 0; s.drops = 0; s.ticks = 0;
+    }
     const now = Date.now();
     for (const [roomId, sim] of this.sims){
       const dt = (now - sim.lastStatsAt) / 1000;
