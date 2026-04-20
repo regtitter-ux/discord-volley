@@ -113,6 +113,73 @@
     return { hit: false, hitPower: 0 };
   }
 
+  // Pure-столкновение мяча с игроком: classic slime-volleyball bounce
+  // (hardmaru/slimevolleygym) — circle-on-circle с push-term от активного
+  // удара, тангенциальной friction и floor guard. Мутирует ball. Возвращает
+  // {hit, isSpike, fxX, fxY} — клиент цепляет на это Fx.hit / rallyHits /
+  // Wallet.award / 4-touch-rule (всё application-state, не физика).
+  //
+  // isSpike — эвристика «сильный удар сверху», нужна чтобы нарисовать
+  // более крупный flash/particles. Сервер-реплика её проигнорирует.
+  // fxX/fxY — точка контакта на поверхности слайма (для искр/flash).
+  function collideBallPlayer(ball, p, groundY){
+    let nx = ball.x - p.x;
+    let ny = ball.y - p.y;
+    const rr = p.r + ball.r;
+    const d2 = nx*nx + ny*ny;
+    if(d2 >= rr*rr) return { hit: false, isSpike: false, fxX: 0, fxY: 0 };
+    const d = Math.sqrt(d2);
+    if(d < 0.0001){
+      // Degenerate: ball embedded at player center. Eject straight up.
+      nx = 0; ny = -1;
+    }else{
+      nx /= d; ny /= d;
+    }
+    // Separate: place ball exactly at surface
+    ball.x = p.x + nx * rr;
+    ball.y = p.y + ny * rr;
+    // Classic bounce: relative velocity, factor of 2, then add back player vel
+    let ux = ball.vx - p.vx;
+    let uy = ball.vy - p.vy;
+    const un = ux*nx + uy*ny;
+    if(un < 0){
+      // Коэффициент упругости зависит от «пуша» игрока в мяч вдоль нормали.
+      // Стоит на месте → E=E_PLAYER_IDLE (как мягкий пол, рали сам затухает).
+      // Бежит/прыгает В мяч → E→1.0 (классический slime-удар, полная упругость).
+      const pushN = Math.max(0, p.vx*nx + p.vy*ny);
+      const E = Math.min(1.0, E_PLAYER_IDLE + pushN / 420);
+      ux -= (1 + E) * un * nx;
+      uy -= (1 + E) * un * ny;
+      // Slime-friction: тангенциальная компонента относительной скорости
+      // гасится частично (не идеально-упругий отскок). Без этого круглая
+      // форма слайма отражала только нормаль — бежишь по слайму вправо,
+      // мяч всё равно летит строго вверх.
+      const tx = -ny, ty = nx;
+      const ut = ux*tx + uy*ty;
+      const FRICTION = 0.35;
+      ux -= ut * tx * FRICTION;
+      uy -= ut * ty * FRICTION;
+      ball.vx = ux + p.vx;
+      ball.vy = uy + p.vy;
+    }
+    // Floor guard: если separation толкнул мяч в пол — поднимаем выше и
+    // подбрасываем vy вверх, чтобы не давать ложного очка.
+    if(ball.y + ball.r > groundY - 1){
+      ball.y = groundY - ball.r - 1;
+      if(ball.vy > 0) ball.vy = -Math.max(180, Math.abs(ball.vy) * 0.7);
+    }
+    // Clamp max speed
+    const sp2 = ball.vx*ball.vx + ball.vy*ball.vy;
+    if(sp2 > MAX_BSPD*MAX_BSPD){
+      const k = MAX_BSPD / Math.sqrt(sp2);
+      ball.vx *= k; ball.vy *= k;
+    }
+    const isSpike = !p.onGround && ny < -0.3 && ball.vy > 200;
+    const fxX = p.x + nx * (p.r + ball.r*0.3);
+    const fxY = p.y + ny * (p.r + ball.r*0.3);
+    return { hit: true, isSpike, fxX, fxY };
+  }
+
   const PHYSICS = Object.freeze({
     GRAV, MOVE, JUMP, BALL_R, PLR_R, NET_W, NET_H,
     E_WALL, E_NET, E_GROUND, E_PLAYER_IDLE,
@@ -122,7 +189,8 @@
     integratePlayerKinematics,
     collideBallWalls,
     collideBallGround,
-    collideBallNet
+    collideBallNet,
+    collideBallPlayer
   });
   if(typeof module !== "undefined" && module.exports){
     module.exports = PHYSICS;

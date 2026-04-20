@@ -2450,85 +2450,22 @@ const Game = (function(){
     }
   }
 
-  // Classic Slime Volleyball bounce (hardmaru/slimevolleygym):
-  // elastic circle-on-circle reflection with factor of 2 inherits player velocity.
-  // Full-circle collision — the floor-guard at the end keeps the ball above ground
-  // even on rare lower-hemisphere contacts.
+  // Pure-физика — в shared physics.js (Этап 2 netcode будет крутить её на
+  // сервере). Здесь — только application-state: FX, счётчики touches, 4-touch
+  // rule, Wallet.award. Гостю lastHitSide/очки прилетают через applySnapshot,
+  // поэтому rally.hit начисляется только в bot/host и только для p.side===1.
   function collideBallPlayer(p){
-    let nx = ball.x - p.x;
-    let ny = ball.y - p.y;
-    const rr = p.r + ball.r;
-    const d2 = nx*nx + ny*ny;
-    if(d2 >= rr*rr) return;
-    const d = Math.sqrt(d2);
-    if(d < 0.0001){
-      // Degenerate: ball embedded at player center. Eject straight up.
-      nx = 0; ny = -1;
-    }else{
-      nx /= d; ny /= d;
-    }
-    // Separate: place ball exactly at surface
-    ball.x = p.x + nx * rr;
-    ball.y = p.y + ny * rr;
-    // Classic bounce: relative velocity, factor of 2, then add back player vel
-    let ux = ball.vx - p.vx;
-    let uy = ball.vy - p.vy;
-    const un = ux*nx + uy*ny;
-    if(un < 0){
-      // Коэффициент упругости зависит от «пуша» игрока в мяч вдоль нормали.
-      // Стоит на месте → E=E_PLAYER_IDLE (как мягкий пол, рали сам затухает).
-      // Бежит/прыгает В мяч → E→1.0 (классический slime-удар, полная упругость).
-      // Линейный переход между ними: активный контакт ощущается как удар,
-      // пассивный — как столкновение с подушкой.
-      const pushN = Math.max(0, p.vx*nx + p.vy*ny);
-      const E = Math.min(1.0, E_PLAYER_IDLE + pushN / 420);
-      ux -= (1 + E) * un * nx;
-      uy -= (1 + E) * un * ny;
-      // Slime-friction: тангенциальная компонента относительной скорости
-      // гасится частично (не идеально-упругий отскок). Без этого круглая
-      // форма слайма отражала только нормаль — бежишь по слайму вправо,
-      // мяч всё равно летит строго вверх, потому что тангенциальная часть
-      // сохраняется полностью и компенсирует p.vx при возврате в world frame.
-      // Ощущение «мяч всегда летит в одну сторону» уходит: часть движения
-      // слайма переносится в мяч, удар по бокам/в движении работает.
-      const tx = -ny, ty = nx;
-      const ut = ux*tx + uy*ty;
-      const FRICTION = 0.35;
-      ux -= ut * tx * FRICTION;
-      uy -= ut * ty * FRICTION;
-      ball.vx = ux + p.vx;
-      ball.vy = uy + p.vy;
-    }
-    // Floor guard: if separation pushed the ball into the ground plane, lift it
-    // above and flip vy upward so the rally continues instead of awarding a bogus point.
-    if(ball.y + ball.r > GROUND_Y - 1){
-      ball.y = GROUND_Y - ball.r - 1;
-      if(ball.vy > 0) ball.vy = -Math.max(180, Math.abs(ball.vy) * 0.7);
-    }
-    // Clamp max speed
-    const sp2 = ball.vx*ball.vx + ball.vy*ball.vy;
-    if(sp2 > MAX_BSPD*MAX_BSPD){
-      const k = MAX_BSPD / Math.sqrt(sp2);
-      ball.vx *= k; ball.vy *= k;
-    }
-
-    // Feel: sparks, squash, sound — scaled by hit strength
-    const isSpike = !p.onGround && ny < -0.3 && ball.vy > 200;
-    const fxX = p.x + nx * (p.r + ball.r*0.3);
-    const fxY = p.y + ny * (p.r + ball.r*0.3);
-    Fx.hit(p.side, fxX, fxY, isSpike);
+    const ev = DVPhysics.collideBallPlayer(ball, p, GROUND_Y);
+    if(!ev.hit) return;
+    Fx.hit(p.side, ev.fxX, ev.fxY, ev.isSpike);
     rallyHits++;
     lastHitSide = p.side;
     Fx.combo(rallyHits);
-    // Монеты за касания своего игрока. В bot/host свой игрок — p.side===1;
-    // у гостя физика не крутится локально, поэтому его награда приезжает
-    // через applySnapshot (lastHitSide=2 у хоста — это как раз гость).
     const isOwnHit = (p.side === 1) && (state.mode === "bot" || state.mode === "host");
     if(isOwnHit){
       Wallet.award("rally.hit", 1);
       if(rallyHits > 0 && rallyHits % 5 === 0) Wallet.award("rally.combo", rallyHits);
     }
-    // 4-touch rule
     if(p.side === 1){ ball.touches.left++;  ball.touches.right = 0; }
     else            { ball.touches.right++; ball.touches.left  = 0; }
     if(ball.touches.left  >= 4){ awardPoint(2, "foul"); return; }
