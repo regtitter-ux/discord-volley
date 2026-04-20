@@ -1427,10 +1427,32 @@ const Game = (function(){
   // реально срабатывают под нагрузкой. _lastP1Drift — мгновенный drift на
   // последнем снапшоте, _bigSnapCount — hard-snap'ы (катастрофический
   // дрейф/respawn), _extrapCount — сколько раз буфер опустел и рендерили
-  // экстраполяцией. Всё — только для чтения снаружи через Game._debug().
+  // экстраполяцией. _snapTotalCount — кумулятив принятых снапшотов, чтобы
+  // в оверлее видеть «поток идёт / поток встал». _stepsLastFrame — сколько
+  // физ-тиков ушло на прошлом кадре (6 = cap, catchup-стутер после хитча).
   let _lastP1Drift = 0;
   let _bigSnapCount = 0;
   let _extrapCount = 0;
+  let _snapTotalCount = 0;
+  let _stepsLastFrame = 0;
+  // Ring-buffer frame-time'ов для p95 (а не только EWMA). EWMA усредняет
+  // спайки до невидимости, хвост распределения точнее показывает stutter.
+  const FT_WINDOW = 120;
+  const _frameTimeBuf = new Float32Array(FT_WINDOW);
+  let _frameTimeHead = 0;
+  let _frameTimeCount = 0;
+  function _frameTimePush(ft){
+    _frameTimeBuf[_frameTimeHead] = ft;
+    _frameTimeHead = (_frameTimeHead + 1) % FT_WINDOW;
+    if(_frameTimeCount < FT_WINDOW) _frameTimeCount++;
+  }
+  function _frameTimeP95(){
+    if(_frameTimeCount < 8) return null;
+    const arr = new Float32Array(_frameTimeCount);
+    for(let i = 0; i < _frameTimeCount; i++) arr[i] = _frameTimeBuf[i];
+    Array.prototype.sort.call(arr, (a,b) => a - b);
+    return arr[Math.min(_frameTimeCount - 1, Math.floor(_frameTimeCount * 0.95))];
+  }
   let hitFlash = 0;
   let jumpBufferT = 0;
   let stuckT = 0;
@@ -1768,6 +1790,8 @@ const Game = (function(){
     _snapGaps.length = 0;
     _snapDiagHead = 0; _snapDiagCount = 0; _snapDiagMax = 0;
     _lastP1Drift = 0; _bigSnapCount = 0; _extrapCount = 0;
+    _snapTotalCount = 0; _stepsLastFrame = 0;
+    _frameTimeHead = 0; _frameTimeCount = 0;
     _lastSnapRecvT = 0;
     renderDelay = 0.06;
     _ballHiddenTeleport = false;
@@ -2166,6 +2190,7 @@ const Game = (function(){
     slot.recvT = now;
     slot.s     = s;
     _snapCount++;
+    _snapTotalCount++;
     // Адаптация renderDelay: p95 интер-арривал гэпов за последние SNAP_GAP_WINDOW
     // снапшотов. Плавно подбираем задержку к реальному jitter сети. Не даём
     // колебаниям переехать вниз (EMA-сглаживание на убывании), иначе один
@@ -3231,6 +3256,8 @@ const Game = (function(){
       steps++;
     }
     if(steps === 6) acc = 0;
+    _stepsLastFrame = steps;
+    if(!document.hidden) _frameTimePush(dt * 1000);
     const t1 = profile ? performance.now() : 0;
     // alpha ∈ [0,1] — доля незакоммиченного физ-времени между последним
     // и следующим шагом. Передаём в render(), чтобы при рендер-частоте
@@ -3360,6 +3387,14 @@ const Game = (function(){
 
   // Debug-хук только под тестами. В продакшне p1/p2/ball инкапсулированы.
   function _debug(){
+    const nowSec = Clock.now() / 1000;
+    const ws = (typeof state !== "undefined") ? state.ws : null;
+    const wsState = ws ? ({0:"CONN", 1:"OPEN", 2:"CLOSING", 3:"CLOSED"})[ws.readyState] || "?" : "(none)";
+    // performance.memory — только в Chrome/Edge. Null-безопасно: если движок
+    // не отдаёт, ничего страшного, просто не показываем строку.
+    const mem = (typeof performance !== "undefined" && performance.memory)
+      ? performance.memory.usedJSHeapSize / 1048576
+      : null;
     return {
       mode: state.mode, inGame: state.inGame, matchOver: state.matchOver,
       p1: p1 ? { x: p1.x, y: p1.y, vx: p1.vx, vy: p1.vy, g: p1.onGround } : null,
@@ -3368,12 +3403,22 @@ const Game = (function(){
       score1, score2, snapQLen: _snapCount,
       snapAtoB: snapAValid && _snapCount > 0 ? (_snapQAt(0).recvT - snapA.recvT) : null,
       renderDelay,
-      // Perf-снимок: avg frame-time (EWMA), флаг деградации, current STEP
-      // в Гц, slowFrames — сколько подряд плохих кадров к lowQuality-порогу.
-      frameTimeAvg, lowQuality, slowFrames, stepHz: Math.round(1 / STEP),
-      // Netcode-счётчики: p1 drift за последний снапшот, кумулятивные
-      // hard-snap'ы и extrapolate-кадры с начала матча.
+      // Perf-снимок: EWMA frame-time + p95 хвост, флаг деградации, current
+      // STEP в Гц, slowFrames к lowQuality-порогу, сколько физ-шагов ушло
+      // на прошлом кадре (6 = cap, post-hitch catchup). heapMB = JS-heap,
+      // растущая кривая = утечка.
+      frameTimeAvg, frameTimeP95: _frameTimeP95(),
+      lowQuality, slowFrames, stepHz: Math.round(1 / STEP),
+      stepsLastFrame: _stepsLastFrame,
+      heapMB: mem,
+      // Netcode-счётчики + live-поле «сколько мс назад приходил последний
+      // снапшот»: если растёт и не обнуляется — поток от хоста встал.
       p1Drift: _lastP1Drift, bigSnaps: _bigSnapCount, extraps: _extrapCount,
+      snapTotal: _snapTotalCount,
+      timeSinceSnap: _lastSnapRecvT > 0 ? (nowSec - _lastSnapRecvT) : null,
+      wsState,
+      // Скорость мяча — «мяч должен двигаться, а vx/vy=0» = физика встала.
+      ballSpeed: ball ? Math.hypot(ball.vx, ball.vy) : 0,
       // Jitter-статистика по 300 последним интер-арривалам снапшотов
       // (host→guest). Диагноз TCP head-of-line blocking: p99 заметно выше
       // p95 (например p95=45 мс, p99=250 мс) = редкие выпавшие сегменты
@@ -3425,17 +3470,22 @@ if (typeof window !== "undefined") window.__dvDebug = () => Game._debug();
     if(!d){ panel.textContent = "debug: game not ready"; return; }
     const fps = d.frameTimeAvg > 0 ? 1000 / d.frameTimeAvg : 0;
     const j = d.snapJitter;
+    // «Возраст» последнего снапшота в мс — если поток встал, значение растёт
+    // без обнуления, визуальный сигнал на рост видно сразу.
+    const sinceMs = d.timeSinceSnap != null ? d.timeSinceSnap * 1000 : null;
     const lines = [
-      "mode: " + (d.mode || "—") + (d.inGame ? " (in-game)" : "") + (d.lowQuality ? " LQ" : ""),
-      "fps:  " + fmt(fps, 0) + "   ft: " + fmt(d.frameTimeAvg) + "ms   step: " + d.stepHz + "Hz",
-      "slow: " + d.slowFrames + "   score: " + d.score1 + ":" + d.score2,
+      "mode: " + (d.mode || "—") + (d.inGame ? " (in-game)" : "") + (d.matchOver ? " END" : "") + (d.lowQuality ? " LQ" : ""),
+      "fps:  " + fmt(fps, 0) + "   ft avg/p95: " + fmt(d.frameTimeAvg) + "/" + (d.frameTimeP95 != null ? fmt(d.frameTimeP95) : "—") + "ms",
+      "step: " + d.stepHz + "Hz   steps/f: " + d.stepsLastFrame + (d.stepsLastFrame >= 6 ? "!" : "") + "   slow: " + d.slowFrames,
+      "heap: " + (d.heapMB != null ? fmt(d.heapMB, 0) + "MB" : "—") + "   score: " + d.score1 + ":" + d.score2,
       "— netcode —",
-      "renderDelay: " + fmt(d.renderDelay * 1000, 0) + "ms",
-      "snapQ: " + d.snapQLen + "   A→B: " + (d.snapAtoB != null ? fmt(d.snapAtoB * 1000, 0) + "ms" : "—"),
-      "p1drift: " + fmt(d.p1Drift, 0) + "px   hardsnap: " + d.bigSnaps + "   extrap: " + d.extraps,
+      "ws: " + d.wsState + "   snaps: " + d.snapTotal + "   since: " + (sinceMs != null ? fmt(sinceMs, 0) + "ms" : "—"),
+      "renderDelay: " + fmt(d.renderDelay * 1000, 0) + "ms   snapQ: " + d.snapQLen + "   A→B: " + (d.snapAtoB != null ? fmt(d.snapAtoB * 1000, 0) + "ms" : "—"),
+      "drift: " + fmt(d.p1Drift, 0) + "px   hardsnap: " + d.bigSnaps + "   extrap: " + d.extraps,
       j
         ? "jitter p50/p95/p99: " + fmt(j.p50 * 1000, 0) + "/" + fmt(j.p95 * 1000, 0) + "/" + fmt(j.p99 * 1000, 0) + "ms (n=" + j.n + ")"
-        : "jitter: collecting…"
+        : "jitter: collecting…",
+      "ball: " + fmt(d.ballSpeed, 0) + "px/s"
     ];
     panel.textContent = lines.join("\n");
   }

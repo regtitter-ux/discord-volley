@@ -286,6 +286,10 @@ body.is-touch .lb-wins .lb-trophy-ico{filter:none}
 .hud-diff{font-size:11px;color:var(--muted);text-transform:uppercase;letter-spacing:.5px;font-weight:700}
 .wallet-trophies .wallet-value{color:#ffd34a}
 .trophy-ico{flex-shrink:0;display:inline-block}
+/* На мобиле шапка и так узкая — баланс кубков убираем, игрок видит его
+   в таблице рейтинга. Монеты остаются, они завязаны на награды и
+   админ-кнопки, так что их скрывать нельзя. */
+body.is-touch #trophies-menu{display:none}
 
 /* Touch controls.
    Каждая .tbtn — прозрачная зона-хитбокс, растянутая на свою часть нижней
