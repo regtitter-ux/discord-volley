@@ -10,7 +10,8 @@
     "start": "node --experimental-sqlite server.js",
     "dev": "node --experimental-sqlite server.js",
     "test": "node --test \"tests/*.test.js\"",
-    "test:e2e": "playwright test"
+    "test:e2e": "playwright test",
+    "smoke:hathora": "node scripts/hathora-smoke.js"
   },
   "dependencies": {
     "cookie": "^0.6.0",
