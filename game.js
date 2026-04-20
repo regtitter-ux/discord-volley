@@ -1384,9 +1384,16 @@ const Game = (function(){
   // кольца), иначе push поверх её слота затёр бы payload.
   const snapA = { recvT: 0, s: null };
   let snapAValid = false;
-  let renderDelay = 0.06;                         // старт: 2× SNAP_STEP
-  const RENDER_DELAY_MIN = 0.035;
-  const RENDER_DELAY_MAX = 0.14;
+  let renderDelay = 0.08;                         // старт: ~2.5× SNAP_STEP
+  // MIN подняли с 35 до 70 мс: на реальных матчах PvP jitter p99 = 100-150 мс
+  // (TCP HoL), а старый min=35 мс давал 14+ extrap'ов за матч — буфер
+  // пустел на каждом HoL-спайке, и позиция оппонента/мяча прыгала рывком
+  // при возврате нормального потока. 70 мс = 2× SNAP_STEP, покрывает
+  // типовой p95≈50 мс с запасом. Компромисс: ~35 мс дополнительного
+  // отставания оппонента/мяча — невидимо глазу, но убирает визуальные
+  // рывки на краю буфера.
+  const RENDER_DELAY_MIN = 0.07;
+  const RENDER_DELAY_MAX = 0.18;
   const _snapGaps = [];
   const SNAP_GAP_WINDOW = 24;                     // ~0.8 с истории при 30 Гц
 
@@ -1793,7 +1800,7 @@ const Game = (function(){
     _snapTotalCount = 0; _stepsLastFrame = 0;
     _frameTimeHead = 0; _frameTimeCount = 0;
     _lastSnapRecvT = 0;
-    renderDelay = 0.06;
+    renderDelay = 0.08;
     _ballHiddenTeleport = false;
     for(let i = 0; i < PARTICLE_CAP; i++) particles[i].dead = true;
     for(let i = 0; i < EMOTE_CAP; i++) emotes[i].dead = true;
