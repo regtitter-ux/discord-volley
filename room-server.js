@@ -22,24 +22,27 @@ const http = require("http");
 const { WebSocketServer } = require("ws");
 const crypto = require("crypto");
 
-const { verifyRoomToken } = require("./room-auth.js");
+const { verifyRoomToken, signWebhook } = require("./room-auth.js");
 const { ShadowRegistry }  = require("./shadowsim.js");
 
 const IDLE_TIMEOUT_MS = Number(process.env.ROOM_IDLE_TIMEOUT_MS) || 5 * 60 * 1000;
 const MAX_FRAME_BYTES = 256;
+const WEBHOOK_TIMEOUT_MS = Number(process.env.ROOM_WEBHOOK_TIMEOUT_MS) || 5000;
 
 function parseArgs(argv){
-  const out = { port: null, secret: null, matchId: null, authoritative: true };
+  const out = { port: null, secret: null, matchId: null, authoritative: true, railwayUrl: null };
   for (let i = 0; i < argv.length; i++){
     const a = argv[i];
     if (a === "--port")             out.port = Number(argv[++i]);
     else if (a === "--secret")      out.secret = argv[++i];
     else if (a === "--match-id")    out.matchId = argv[++i];
+    else if (a === "--railway-url") out.railwayUrl = argv[++i];
     else if (a === "--authoritative")    out.authoritative = true;
     else if (a === "--no-authoritative") out.authoritative = false;
   }
   if (!out.secret) out.secret = process.env.ROOM_SECRET || null;
   if (!out.matchId) out.matchId = process.env.ROOM_MATCH_ID || null;
+  if (!out.railwayUrl) out.railwayUrl = process.env.ROOM_RAILWAY_URL || null;
   return out;
 }
 
@@ -56,6 +59,50 @@ function main(){
 
   const shadow = new ShadowRegistry({ shadow: false, auth: args.authoritative });
   shadow.start();
+
+  // Webhook на Railway: единоразово на matchOver-transition, с HMAC по raw-body.
+  // Retry 1 раз через 500мс при 5xx/network-fail, дальше — лог и idle-timeout
+  // добьёт процесс. Идемпотентность в Railway: applyMatchOutcome через
+  // broker.claimOutcome — повторные webhook'и не начислят трофеи дважды.
+  let webhookFired = false;
+  async function postMatchResult(payload){
+    if (!args.railwayUrl){
+      console.log(`[room-server] matchOver but no --railway-url — skipping webhook. payload=${JSON.stringify(payload)}`);
+      return;
+    }
+    const body = JSON.stringify(payload);
+    const sig  = signWebhook(args.secret, body);
+    const url  = args.railwayUrl.replace(/\/+$/, "") + "/internal/match-result";
+    const attempt = async () => {
+      const ctrl = new AbortController();
+      const to = setTimeout(() => ctrl.abort(), WEBHOOK_TIMEOUT_MS);
+      try {
+        const r = await fetch(url, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-dv-room-signature": sig
+          },
+          body,
+          signal: ctrl.signal
+        });
+        clearTimeout(to);
+        return r.ok;
+      } catch (e){
+        clearTimeout(to);
+        return false;
+      }
+    };
+    const ok = await attempt();
+    if (ok){
+      console.log(`[room-server] match-result webhook ok match=${payload.matchId} winner=${payload.winnerRole}`);
+      return;
+    }
+    await new Promise(r => setTimeout(r, 500));
+    const ok2 = await attempt();
+    if (ok2) console.log(`[room-server] match-result webhook ok (retry) match=${payload.matchId} winner=${payload.winnerRole}`);
+    else     console.error(`[room-server] match-result webhook FAILED match=${payload.matchId} url=${url}`);
+  }
 
   // Связь wsId ↔ room-клиент: peers хранит sendRaw, role, roomId, userId.
   // rooms — множество wsId по roomId для emote-relay (один room-process
@@ -123,7 +170,21 @@ function main(){
         peers.set(ws.wsId, { ws, sendRaw, role: claims.role, roomId: claims.roomId, userId: claims.userId });
 
         shadow.registerRole(ws.wsId, claims.role);
-        shadow.openRoom(claims.roomId, { authoritative: args.authoritative });
+        shadow.openRoom(claims.roomId, {
+          authoritative: args.authoritative,
+          onMatchOver: ({ winnerSide, score1, score2 }) => {
+            if (webhookFired) return;
+            webhookFired = true;
+            postMatchResult({
+              matchId:    args.matchId || claims.matchId,
+              roomId:     claims.roomId,
+              winnerRole: winnerSide === 1 ? "host" : "guest",
+              scoreHost:  score1 | 0,
+              scoreGuest: score2 | 0,
+              ts:         Date.now()
+            }).catch(() => {});
+          }
+        });
         shadow.attachPeer(claims.roomId, claims.role, sendRaw);
         try { ws.send(JSON.stringify({ type: "joined", role: claims.role, room: claims.roomId })); } catch {}
         console.log(`[room-server] peer joined wsId=${ws.wsId} user=${claims.userId} role=${claims.role} room=${claims.roomId}`);

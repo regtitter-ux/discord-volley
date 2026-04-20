@@ -2,7 +2,7 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { signRoomToken, verifyRoomToken } = require("../room-auth.js");
+const { signRoomToken, verifyRoomToken, signWebhook, verifyWebhook } = require("../room-auth.js");
 
 const SECRET = "testkey-0123456789";
 
@@ -37,7 +37,10 @@ test("verifyRoomToken tampered signature → null", () => {
     userId: "u1", roomId: "r1", role: "host", matchId: "m1"
   }, 60000);
   const [p, s] = token.split(".");
-  const mutated = s.slice(0, -1) + (s.slice(-1) === "A" ? "B" : "A");
+  // Меняем ПЕРВЫЙ символ подписи: последний в base64url-кодировке 32-байт
+  // HMAC несёт только 4 значащих бита (2 — padding), его мутация может
+  // декодироваться в те же 32 байта, и тест становился flaky.
+  const mutated = (s[0] === "A" ? "B" : "A") + s.slice(1);
   assert.equal(verifyRoomToken(SECRET, p + "." + mutated), null);
 });
 
@@ -64,4 +67,31 @@ test("verifyRoomToken отвергает неизвестную role", () => {
     userId: "u1", roomId: "r1", role: "spectator", matchId: "m1"
   }, 60000);
   assert.equal(verifyRoomToken(SECRET, token), null);
+});
+
+// Stage 7.5: webhook HMAC для /internal/match-result.
+test("signWebhook → verifyWebhook round-trip на той же строке", () => {
+  const body = JSON.stringify({ matchId: "m1", winnerRole: "host", ts: 1 });
+  const sig = signWebhook(SECRET, body);
+  assert.equal(verifyWebhook(SECRET, body, sig), true);
+});
+
+test("verifyWebhook: другой секрет → false", () => {
+  const body = JSON.stringify({ matchId: "m1", winnerRole: "host", ts: 1 });
+  const sig = signWebhook(SECRET, body);
+  assert.equal(verifyWebhook("wrong", body, sig), false);
+});
+
+test("verifyWebhook: изменённый body → false", () => {
+  const body = JSON.stringify({ matchId: "m1", winnerRole: "host", ts: 1 });
+  const sig = signWebhook(SECRET, body);
+  const tampered = body.replace("host", "guest");
+  assert.equal(verifyWebhook(SECRET, tampered, sig), false);
+});
+
+test("verifyWebhook: пустая/мусорная подпись → false", () => {
+  const body = "{}";
+  assert.equal(verifyWebhook(SECRET, body, ""), false);
+  assert.equal(verifyWebhook(SECRET, body, "abc"), false);
+  assert.equal(verifyWebhook(SECRET, body, null), false);
 });

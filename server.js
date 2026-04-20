@@ -566,6 +566,58 @@ app.post("/api/decorations/select", (req, res) => {
   });
 });
 
+/* ---------- Stage 7.5: match-result webhook от room-server ---------- */
+// Room-server (Hathora) по окончании матча шлёт POST с HMAC. Railway
+// применяет match.win/loss через те же applyMatchOutcome (broker.claimOutcome
+// идемпотентный, так что повторный webhook или гонка с клиентским match_win
+// безопасны) и пушит trophies-фрейм в menu-WS обоим.
+//
+// Body — raw Buffer (express.raw), HMAC считается по байт-в-байт строке.
+// Отдельный parser: глобального express.json нет, да и нельзя, т.к. он
+// съел бы raw body до проверки подписи.
+const WEBHOOK_TS_WINDOW_MS = Number(process.env.ROOM_WEBHOOK_TS_WINDOW_MS) || 5 * 60 * 1000;
+app.post("/internal/match-result",
+  express.raw({ type: "*/*", limit: "4kb" }),
+  async (req, res) => {
+    if (!ROOM_SECRET) return res.status(503).json({ ok: false, error: "room-secret-unset" });
+    const raw = req.body;
+    if (!Buffer.isBuffer(raw)) return res.status(400).json({ ok: false, error: "no-body" });
+    const sig = req.headers["x-dv-room-signature"];
+    if (!verifyWebhook(ROOM_SECRET, raw.toString("utf8"), sig)){
+      return res.status(401).json({ ok: false, error: "bad-signature" });
+    }
+    let msg;
+    try { msg = JSON.parse(raw.toString("utf8")); }
+    catch { return res.status(400).json({ ok: false, error: "bad-json" }); }
+    if (!msg || typeof msg !== "object") return res.status(400).json({ ok: false, error: "bad-json" });
+    const { matchId, roomId, winnerRole, scoreHost, scoreGuest, ts } = msg;
+    if (typeof matchId !== "string" || !matchId)    return res.status(400).json({ ok: false, error: "bad-matchId" });
+    if (winnerRole !== "host" && winnerRole !== "guest"){
+      return res.status(400).json({ ok: false, error: "bad-winner" });
+    }
+    if (!Number.isFinite(ts) || Math.abs(Date.now() - ts) > WEBHOOK_TS_WINDOW_MS){
+      return res.status(401).json({ ok: false, error: "ts-out-of-window" });
+    }
+    const users = hathoraMatchUsers.get(matchId);
+    if (!users) return res.status(404).json({ ok: false, error: "unknown-match" });
+    const winnerUser = winnerRole === "host" ? users.host : users.guest;
+    const loserUser  = winnerRole === "host" ? users.guest : users.host;
+    const rw = await applyMatchOutcome(winnerUser, matchId, "win");
+    const rl = await applyMatchOutcome(loserUser,  matchId, "loss");
+    // Trophies-фрейм через menu-WS — находим оба WS по activeMatchId. Если
+    // клиент уже ушёл (disconnect), его WS не найдётся — это ок, трофеи всё
+    // равно записаны в БД через applyMatchOutcome.
+    for (const client of wss.clients){
+      if (!client || client.readyState !== 1) continue;
+      if (!client.user || client.activeMatchId !== matchId) continue;
+      const r = client.user.id === winnerUser.id ? rw : rl;
+      if (r) send(client, { type: "trophies", total: r.total, delta: r.delta });
+    }
+    console.log(`[ws] match-result webhook ok match=${matchId} winner=${winnerRole} scores=${scoreHost}:${scoreGuest}`);
+    res.json({ ok: true, applied: { win: !!rw, loss: !!rl } });
+  }
+);
+
 /* ---------- Static frontend ---------- */
 
 function sendIndex(res){
@@ -616,7 +668,7 @@ const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
 const { createBroker }    = require("./broker");
 const { ShadowRegistry }  = require("./shadowsim");
 const hathoraClient       = require("./hathora-client");
-const { signRoomToken }   = require("./room-auth");
+const { signRoomToken, verifyWebhook } = require("./room-auth");
 // DV_SHADOW_PHYSICS=1 — observer (host остаётся авторитетом).
 // DV_AUTH_PHYSICS=1   — сервер сам крутит физику для каждого матча и
 // шлёт бинарные снапшоты обоим клиентам. Клиентский код читает
@@ -644,6 +696,17 @@ if (DV_ROOMS === "hathora" && !ROOM_SECRET){
 // независимая страховка от повисших процессов.
 const localRoomChildren = new Map();
 
+// Stage 7.5: matchId → { host: user, guest: user, roomId }. Заполняется
+// в pairHathora, используется в POST /internal/match-result для маппинга
+// winnerRole → userId. Чистим в leaveRoom после broker.closeRoom.
+const hathoraMatchUsers = new Map();
+
+// Наш base URL для webhook'ов room-server → Railway. В проде это
+// PUBLIC_URL (Railway), в интеграционных тестах — http://127.0.0.1:<PORT>.
+// Если DV_LOCAL_ROOMS=1, child'у нужен реальный callback-адрес — иначе
+// webhook уйдёт в никуда и трофеи не начислятся.
+const RAILWAY_SELF_URL = process.env.RAILWAY_SELF_URL || process.env.PUBLIC_URL || "";
+
 async function _getFreePort(){
   return await new Promise((resolve, reject) => {
     const srv = net.createServer();
@@ -664,6 +727,7 @@ async function spawnLocalRoomServer({ roomId, matchId }){
     "--secret", ROOM_SECRET
   ];
   if (matchId) args.push("--match-id", matchId);
+  if (RAILWAY_SELF_URL) args.push("--railway-url", RAILWAY_SELF_URL);
   const child = spawn(process.execPath, args, {
     cwd: __dirname,
     env: {
@@ -923,6 +987,10 @@ async function pairHathora(host, guest){
   clearQueueTimer(guest);
   await broker.joinRoom(roomId, host._client);
   await broker.joinRoom(roomId, guest._client);
+  // Stage 7.5: запомнить user-объекты под matchId. Webhook от room-server
+  // принесёт только winnerRole (host/guest), нам нужны полные userObj для
+  // applyMatchOutcome + ensureUser. Снимаем запись в leaveRoom.
+  hathoraMatchUsers.set(matchId, { host: host.user, guest: guest.user, roomId });
   const hostToken  = signRoomToken(ROOM_SECRET, { userId: host.user.id,  roomId, role: "host",  matchId }, ROOM_TOKEN_TTL_MS);
   const guestToken = signRoomToken(ROOM_SECRET, { userId: guest.user.id, roomId, role: "guest", matchId }, ROOM_TOKEN_TTL_MS);
   const stakesMsg = { win: stakes.win, loss: stakes.loss };
@@ -1059,6 +1127,11 @@ async function leaveRoom(ws, reason){
     // или Hathora=local_spawn), грохаем процесс. Для Hathora-cloud такого
     // child'а нет (room-server живёт в их контейнере), Map не знает о нём.
     killLocalRoomChild(roomId);
+    // Stage 7.5: освобождаем Map user'ов под matchId. Если webhook ещё не
+    // пришёл — beast-case: клиент ушёл до конца матча. broker.claimOutcome
+    // всё равно идемпотентен, а хранение user-объекта под TTL смысла не
+    // имеет — leave/disconnect значит webhook приходит в никуда.
+    if (mid) hathoraMatchUsers.delete(mid);
   } else {
     shadow.unregisterRole(ws.wsId);
   }

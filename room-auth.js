@@ -66,4 +66,27 @@ function verifyRoomToken(secret, token){
   return { userId, roomId, role, matchId };
 }
 
-module.exports = { signRoomToken, verifyRoomToken };
+// Stage 7.5: отдельный HMAC для match-result webhook'а room-server → Railway.
+// Подписываем весь raw body POST'а (строка JSON, байт-в-байт) и шлём в header
+// x-dv-room-signature. Railway читает raw body (express.raw), верифицирует,
+// тогда парсит JSON. Отдельная функция от signRoomToken, т.к. payload —
+// произвольный JSON-блоб, а не фиксированная структура claims.
+function signWebhook(secret, bodyStr){
+  if (typeof secret !== "string" || !secret) throw new Error("secret required");
+  if (typeof bodyStr !== "string") throw new Error("body must be string");
+  return b64urlEncode(crypto.createHmac("sha256", secret).update(bodyStr).digest());
+}
+
+function verifyWebhook(secret, bodyStr, signature){
+  if (typeof secret !== "string" || !secret) return false;
+  if (typeof bodyStr !== "string") return false;
+  if (typeof signature !== "string" || !signature) return false;
+  let provided;
+  try { provided = b64urlDecode(signature); } catch { return false; }
+  const expected = crypto.createHmac("sha256", secret).update(bodyStr).digest();
+  if (provided.length !== expected.length) return false;
+  try { return crypto.timingSafeEqual(provided, expected); }
+  catch { return false; }
+}
+
+module.exports = { signRoomToken, verifyRoomToken, signWebhook, verifyWebhook };
