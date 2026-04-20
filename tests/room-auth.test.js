@@ -2,8 +2,6 @@
 
 const test = require("node:test");
 const assert = require("node:assert/strict");
-const { setTimeout: sleep } = require("node:timers/promises");
-
 const { signRoomToken, verifyRoomToken } = require("../room-auth.js");
 
 const SECRET = "testkey-0123456789";
@@ -43,11 +41,13 @@ test("verifyRoomToken tampered signature → null", () => {
   assert.equal(verifyRoomToken(SECRET, p + "." + mutated), null);
 });
 
-test("verifyRoomToken expired → null", async () => {
+test("verifyRoomToken expired → null", () => {
+  // Отрицательный TTL даёт exp в прошлом — детерминированная проверка
+  // без зависимости от setTimeout/системных таймеров (node:test под
+  // параллельной CPU-нагрузкой их сбивает).
   const token = signRoomToken(SECRET, {
     userId: "u1", roomId: "r1", role: "host", matchId: "m1"
-  }, 1);
-  await sleep(5);
+  }, -1000);
   assert.equal(verifyRoomToken(SECRET, token), null);
 });
 

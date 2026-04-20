@@ -613,11 +613,24 @@ const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
 // online-counter) идут через него; под капотом либо in-memory, либо Redis.
 const { createBroker }    = require("./broker");
 const { ShadowRegistry }  = require("./shadowsim");
+const hathoraClient       = require("./hathora-client");
+const { signRoomToken }   = require("./room-auth");
 // DV_SHADOW_PHYSICS=1 — observer (host остаётся авторитетом).
 // DV_AUTH_PHYSICS=1   — сервер сам крутит физику для каждого матча и
 // шлёт бинарные снапшоты обоим клиентам. Клиентский код читает
 // matched.net === "auth" и в этом режиме выключает локальную физику.
 const AUTH_PHYSICS = process.env.DV_AUTH_PHYSICS === "1";
+// DV_ROOMS=hathora — pair создаёт room на Hathora Cloud и отдаёт клиентам
+// адрес room-server'а (второй WS). Дефолт local — весь gameplay идёт через
+// этот же server.js как раньше. ROOM_SECRET обязателен для hathora-пути:
+// Railway подписывает, room-server верифицирует.
+const DV_ROOMS   = process.env.DV_ROOMS === "hathora" ? "hathora" : "local";
+const ROOM_SECRET = process.env.ROOM_SECRET || "";
+const ROOM_TOKEN_TTL_MS = Number(process.env.ROOM_TOKEN_TTL_MS) || 60000;
+const HATHORA_REGION    = process.env.HATHORA_REGION || "Frankfurt";
+if (DV_ROOMS === "hathora" && !ROOM_SECRET){
+  console.warn("[ws] DV_ROOMS=hathora но ROOM_SECRET пуст — pairHathora будет падать в local");
+}
 const shadow = new ShadowRegistry({
   shadow: process.env.DV_SHADOW_PHYSICS === "1",
   auth:   AUTH_PHYSICS
@@ -782,6 +795,52 @@ async function pairLocal(host, guest){
   console.log(`[ws] matched host=${host.user.id} guest=${guest.user.id} room=${roomId} match=${matchId} stakes=+${stakes.win}/-${stakes.loss} net=${net}`);
 }
 
+// DV_ROOMS=hathora: pair выносит gameplay-WS на эфемерный room-server на
+// Hathora Cloud. Клиент получает расширенный matched с roomHost/roomPort/
+// roomToken — открывает второй WS на Hathora и шлёт туда input/snapshot.
+// Railway-WS остаётся подключённым для lobby/stats/wallet/trophies.
+//
+// Физику server.js НЕ крутит в этом режиме — она живёт в room-server.js.
+// Shadow не регистрируется тут: room-server регистрирует свой ShadowRegistry.
+// Broker.joinRoom всё равно зовём — по нему идёт peer_left при leave/disconnect.
+//
+// Fail-safe: если createRoom упал (сеть, квоты, Hathora down) — падаем в
+// pairLocal, матч не теряется. Факт инцидента уходит в лог.
+async function pairHathora(host, guest){
+  if (!ROOM_SECRET){
+    console.warn("[ws] pairHathora: ROOM_SECRET пуст — fallback to pairLocal");
+    return pairLocal(host, guest);
+  }
+  const roomId  = crypto.randomBytes(6).toString("hex");
+  const matchId = "pm-" + crypto.randomBytes(8).toString("hex");
+  const stakes  = rollStakes();
+  let room;
+  try {
+    room = await hathoraClient.createRoom({ region: HATHORA_REGION });
+  } catch (e){
+    console.warn(`[ws] hathora createRoom failed (${e && e.message || e}) — fallback to pairLocal`);
+    return pairLocal(host, guest);
+  }
+  await broker.setStakes(matchId, stakes, MATCH_STAKES_TTL_MS);
+  host.role  = "host";  guest.role = "guest";
+  host.roomId = guest.roomId = roomId;
+  host.activeMatchId = guest.activeMatchId = matchId;
+  clearQueueTimer(host);
+  clearQueueTimer(guest);
+  await broker.joinRoom(roomId, host._client);
+  await broker.joinRoom(roomId, guest._client);
+  const hostToken  = signRoomToken(ROOM_SECRET, { userId: host.user.id,  roomId, role: "host",  matchId }, ROOM_TOKEN_TTL_MS);
+  const guestToken = signRoomToken(ROOM_SECRET, { userId: guest.user.id, roomId, role: "guest", matchId }, ROOM_TOKEN_TTL_MS);
+  const stakesMsg = { win: stakes.win, loss: stakes.loss };
+  const common = {
+    type: "matched", room: roomId, matchId, stakes: stakesMsg, net: "auth",
+    roomHost: room.host, roomPort: room.port
+  };
+  send(host,  { ...common, role: "host",  opponent: safeUser(guest.user), roomToken: hostToken });
+  send(guest, { ...common, role: "guest", opponent: safeUser(host.user),  roomToken: guestToken });
+  console.log(`[ws] hathora-matched host=${host.user.id} guest=${guest.user.id} room=${roomId} match=${matchId} hathoraRoom=${room.roomId} at=${room.host}:${room.port}`);
+}
+
 // Cross-instance pair: нас забрали из очереди на другом инстансе. Пришло
 // сообщение в наш dv:inst:<id> канал. Мы — host (ждали в очереди).
 async function onRemotePair(info){
@@ -811,7 +870,8 @@ async function onQueue(ws){
   if (res && res.kind === "local"){
     const partner = res.partner.ws; // client wraps ws
     if (partner && partner.readyState === 1){
-      await pairLocal(partner, ws);
+      if (DV_ROOMS === "hathora") await pairHathora(partner, ws);
+      else                        await pairLocal(partner, ws);
       return;
     }
     // Partner умер в узкой гонке между LocalBroker.enqueue (там уже есть
@@ -1073,7 +1133,7 @@ wss.on("connection", async (ws, req) => {
     console.log(`[discord-volley] listening on :${PORT}`);
     console.log(`[discord-volley] public: ${APP_URL}`);
     console.log(`[discord-volley] redirect_uri: ${REDIRECT_URI}`);
-    console.log(`[discord-volley] NODE_ENV=${NODE_ENV} broker=${broker.kind} instance=${INSTANCE_ID}`);
+    console.log(`[discord-volley] NODE_ENV=${NODE_ENV} broker=${broker.kind} instance=${INSTANCE_ID} rooms=${DV_ROOMS}`);
   });
 })().catch(e => {
   console.error("[fatal] startup failed:", e);
