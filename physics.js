@@ -180,6 +180,53 @@
     return { hit: true, isSpike, fxX, fxY };
   }
 
+  // Pure-вход для бота/удалённого peer'а: детерминированный ax из (left,right)
+  // и однотактный jump без coyote/buffer-grace (у бота нет human-latency, он
+  // видит idle земли напрямую). Мутирует p.{vx,vy,onGround}. Возвращает
+  // {jumped} — клиент играет sfx.jump на true.
+  function applyInput(p, left, right, jump){
+    let ax = 0;
+    if(left)  ax -= 1;
+    if(right) ax += 1;
+    p.vx = ax * MOVE;
+    if(jump && p.onGround){
+      p.vy = -JUMP;
+      p.onGround = false;
+      return { jumped: true };
+    }
+    return { jumped: false };
+  }
+
+  // Human-control с coyote + jump-buffer: нажатие за JUMP_BUFFER до посадки
+  // всё равно триггерит прыжок (buffer), нажатие в COYOTE после схода с
+  // ребра — тоже (coyote). jumpBufferT — state caller'а (game.js/server-side
+  // инстанс), возвращаем новое значение. Мутирует p.{vx,vy,onGround,coyoteT}.
+  // inputs = {left, right, jumpHeld}. Возвращает {jumpBufferT, jumped}.
+  function applyHumanInput(p, dt, inputs, jumpBufferT){
+    const left = inputs.left, right = inputs.right, jumpHeld = inputs.jumpHeld;
+    let ax = 0;
+    if(left)  ax -= 1;
+    if(right) ax += 1;
+    p.vx = ax * MOVE;
+
+    // Autohop: зажатый прыжок постоянно держит буфер полным — как только
+    // p.onGround, следующая же проверка ниже триггерит повторный прыжок.
+    if(jumpHeld) jumpBufferT = JUMP_BUFFER;
+    else         jumpBufferT = Math.max(0, jumpBufferT - dt);
+
+    if(p.onGround) p.coyoteT = COYOTE;
+    else           p.coyoteT = Math.max(0, p.coyoteT - dt);
+
+    if(jumpBufferT > 0 && p.coyoteT > 0){
+      p.vy = -JUMP;
+      p.onGround = false;
+      jumpBufferT = 0;
+      p.coyoteT  = 0;
+      return { jumpBufferT, jumped: true };
+    }
+    return { jumpBufferT, jumped: false };
+  }
+
   const PHYSICS = Object.freeze({
     GRAV, MOVE, JUMP, BALL_R, PLR_R, NET_W, NET_H,
     E_WALL, E_NET, E_GROUND, E_PLAYER_IDLE,
@@ -190,7 +237,9 @@
     collideBallWalls,
     collideBallGround,
     collideBallNet,
-    collideBallPlayer
+    collideBallPlayer,
+    applyInput,
+    applyHumanInput
   });
   if(typeof module !== "undefined" && module.exports){
     module.exports = PHYSICS;

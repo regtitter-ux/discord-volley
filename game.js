@@ -2398,45 +2398,21 @@ const Game = (function(){
     Wallet.award("match.win", 50);
   }
 
+  // Бот/удалённый peer: pure-часть в DVPhysics. sfx.jump — клиентский звук.
   function applyInput(p, left, right, jump){
-    let ax = 0;
-    if(left)  ax -= 1;
-    if(right) ax += 1;
-    p.vx = ax * MOVE;
-    if(jump && p.onGround){
-      p.vy = -JUMP;
-      p.onGround = false;
-      sfx.jump();
-    }
+    const ev = DVPhysics.applyInput(p, left, right, jump);
+    if(ev.jumped) sfx.jump();
   }
 
-  // Human control with coyote time + jump buffer. Buffer: a press within
-  // JUMP_BUFFER seconds before landing still triggers a jump. Coyote: a press
-  // within COYOTE seconds after walking off a ledge still jumps. Both make the
-  // controls feel forgiving without changing visible physics.
+  // Human-control: coyote/jump-buffer в DVPhysics, jumpBufferT храним
+  // локально (state caller'а). На Этапе 2 сервер будет держать свой
+  // jumpBufferT per-peer и гонять тот же код.
   function applyHumanInput(p, dt){
-    const left = keys.left, right = keys.right, jumpHeld = keys.jump;
-    let ax = 0;
-    if(left)  ax -= 1;
-    if(right) ax += 1;
-    p.vx = ax * MOVE;
-
-    // Autohop: пока W зажата — буфер постоянно полон, и как только игрок
-    // касается земли, он тут же прыгает снова. Отпустил — буфер распадается
-    // за JUMP_BUFFER секунд (это и есть grace-period для pre-land пресса).
-    if(jumpHeld) jumpBufferT = JUMP_BUFFER;
-    else         jumpBufferT = Math.max(0, jumpBufferT - dt);
-
-    if(p.onGround) p.coyoteT = COYOTE;
-    else           p.coyoteT = Math.max(0, p.coyoteT - dt);
-
-    if(jumpBufferT > 0 && p.coyoteT > 0){
-      p.vy = -JUMP;
-      p.onGround = false;
-      jumpBufferT = 0;
-      p.coyoteT  = 0;
-      sfx.jump();
-    }
+    const ev = DVPhysics.applyHumanInput(p, dt,
+      { left: keys.left, right: keys.right, jumpHeld: keys.jump },
+      jumpBufferT);
+    jumpBufferT = ev.jumpBufferT;
+    if(ev.jumped) sfx.jump();
   }
 
   function integratePlayer(p, dt, xMin, xMax){
