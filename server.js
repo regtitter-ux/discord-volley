@@ -28,6 +28,8 @@ const crypto       = require("crypto");
 const path         = require("path");
 const fs           = require("fs");
 const http         = require("http");
+const net          = require("net");
+const { spawn }    = require("child_process");
 const { WebSocketServer } = require("ws");
 
 const {
@@ -625,12 +627,100 @@ const AUTH_PHYSICS = process.env.DV_AUTH_PHYSICS === "1";
 // этот же server.js как раньше. ROOM_SECRET обязателен для hathora-пути:
 // Railway подписывает, room-server верифицирует.
 const DV_ROOMS   = process.env.DV_ROOMS === "hathora" ? "hathora" : "local";
+// DV_LOCAL_ROOMS=1 — Stage 7.4: вместо удалённой Hathora создаём room-server.js
+// как child-process на свободном порту (127.0.0.1). Для integration-тестов
+// и dev-preview без Hathora account.
+const DV_LOCAL_ROOMS = process.env.DV_LOCAL_ROOMS === "1";
 const ROOM_SECRET = process.env.ROOM_SECRET || "";
 const ROOM_TOKEN_TTL_MS = Number(process.env.ROOM_TOKEN_TTL_MS) || 60000;
 const HATHORA_REGION    = process.env.HATHORA_REGION || "Frankfurt";
 if (DV_ROOMS === "hathora" && !ROOM_SECRET){
   console.warn("[ws] DV_ROOMS=hathora но ROOM_SECRET пуст — pairHathora будет падать в local");
 }
+
+// roomId → child_process. Стартуется в spawnLocalRoomServer при
+// DV_LOCAL_ROOMS=1, убивается при leaveRoom (оба пира ушли → закрытие
+// комнаты) и на server.js shutdown. idle-timeout 5мин в room-server'е —
+// независимая страховка от повисших процессов.
+const localRoomChildren = new Map();
+
+async function _getFreePort(){
+  return await new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.unref();
+    srv.on("error", reject);
+    srv.listen(0, () => {
+      const port = srv.address().port;
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+async function spawnLocalRoomServer({ roomId, matchId }){
+  const port = await _getFreePort();
+  const args = [
+    path.join(__dirname, "room-server.js"),
+    "--port",   String(port),
+    "--secret", ROOM_SECRET
+  ];
+  if (matchId) args.push("--match-id", matchId);
+  const child = spawn(process.execPath, args, {
+    cwd: __dirname,
+    env: {
+      ...process.env,
+      ROOM_SECRET,
+      ROOM_MATCH_ID: matchId || ""
+    },
+    stdio: ["ignore", "pipe", "pipe"]
+  });
+  const tag = `[room:${port}]`;
+  const logs = [];
+  const passthrough = (stream) => (buf) => {
+    const s = String(buf);
+    logs.push(s);
+    for (const line of s.split(/\r?\n/)){
+      if (line) stream.write(`${tag} ${line}\n`);
+    }
+  };
+  child.stdout.on("data", passthrough(process.stdout));
+  child.stderr.on("data", passthrough(process.stderr));
+  await new Promise((resolve, reject) => {
+    const to = setTimeout(() => reject(
+      new Error(`room-server not ready in 10s. logs:\n${logs.join("")}`)
+    ), 10000);
+    const onData = (buf) => {
+      if (/ready on :/.test(String(buf))){
+        clearTimeout(to);
+        child.stdout.off("data", onData);
+        resolve();
+      }
+    };
+    child.stdout.on("data", onData);
+    child.once("exit", code => {
+      clearTimeout(to);
+      reject(new Error(`room-server exited early code=${code}. logs:\n${logs.join("")}`));
+    });
+  });
+  localRoomChildren.set(roomId, child);
+  child.once("exit", () => {
+    if (localRoomChildren.get(roomId) === child) localRoomChildren.delete(roomId);
+  });
+  return { host: "127.0.0.1", port, roomId: `local-${matchId || roomId}` };
+}
+
+function killLocalRoomChild(roomId){
+  const child = localRoomChildren.get(roomId);
+  if (!child) return;
+  localRoomChildren.delete(roomId);
+  try { child.kill(); } catch {}
+  setTimeout(() => { try { child.kill("SIGKILL"); } catch {} }, 2000).unref?.();
+}
+
+process.on("exit", () => {
+  for (const child of localRoomChildren.values()){
+    try { child.kill(); } catch {}
+  }
+});
 const shadow = new ShadowRegistry({
   shadow: process.env.DV_SHADOW_PHYSICS === "1",
   auth:   AUTH_PHYSICS
@@ -816,9 +906,13 @@ async function pairHathora(host, guest){
   const stakes  = rollStakes();
   let room;
   try {
-    room = await hathoraClient.createRoom({ region: HATHORA_REGION });
+    if (DV_LOCAL_ROOMS){
+      room = await spawnLocalRoomServer({ roomId, matchId });
+    } else {
+      room = await hathoraClient.createRoom({ region: HATHORA_REGION });
+    }
   } catch (e){
-    console.warn(`[ws] hathora createRoom failed (${e && e.message || e}) — fallback to pairLocal`);
+    console.warn(`[ws] room-create failed (${e && e.message || e}) — fallback to pairLocal`);
     return pairLocal(host, guest);
   }
   await broker.setStakes(matchId, stakes, MATCH_STAKES_TTL_MS);
@@ -961,6 +1055,10 @@ async function leaveRoom(ws, reason){
     await broker.leaveRoom(roomId, ws._client);
     shadow.unregisterRole(ws.wsId);
     shadow.closeRoom(roomId);
+    // Stage 7.4: если комната стартовалась как child-process (DV_LOCAL_ROOMS=1
+    // или Hathora=local_spawn), грохаем процесс. Для Hathora-cloud такого
+    // child'а нет (room-server живёт в их контейнере), Map не знает о нём.
+    killLocalRoomChild(roomId);
   } else {
     shadow.unregisterRole(ws.wsId);
   }
