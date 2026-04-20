@@ -31,6 +31,14 @@
   const STEP_HI        = 1/120;
   const STEP_LO        = 1/60;
 
+  // World config: размеры поля, центр сетки, линия земли. Клиент использует
+  // для рендера и bounds-clamp, сервер (Этап 6+ shadow/auth) — для physics
+  // bounds. Менять только с миграцией (тесты + клиент-сервер sync).
+  const WORLD_W  = 1080;
+  const WORLD_H  = 540;
+  const NET_X    = WORLD_W * 0.5;
+  const GROUND_Y = WORLD_H - 30;
+
   // Pure-кинематика игрока: гравитация, интегрирование позиции, зажимы по
   // X, посадка на землю. Мутирует p.{x,y,vy,onGround}. Возвращает событие
   // посадки с импактной vy — клиент лепит на него squash-анимацию и
@@ -254,6 +262,7 @@
     MAX_BSPD, SERVE_SPAWN_Y, POST_POINT_TIME,
     COYOTE, JUMP_BUFFER, STUCK_SPEED, STUCK_TIME,
     STEP_HI, STEP_LO,
+    WORLD_W, WORLD_H, NET_X, GROUND_Y,
     integratePlayerKinematics,
     collideBallWalls,
     collideBallGround,

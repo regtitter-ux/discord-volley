@@ -992,7 +992,8 @@ $("btn-lobby-cancel").addEventListener("click", ()=>{
 });
 
 /* ---------------- Canvas sizing ---------------- */
-const WORLD_W = 1080, WORLD_H = 540;
+// World config — источник истины в physics.js (shared с сервером).
+const { WORLD_W, WORLD_H } = window.DVPhysics;
 let scale = 1, offsetX = 0, offsetY = 0;
 
 // Кап DPR: на 3x-Retina (iPhone) честный рендер в 3× увеличивает площадь
@@ -1320,10 +1321,9 @@ const Game = (function(){
     MAX_BSPD, SERVE_SPAWN_Y, POST_POINT_TIME,
     COYOTE, JUMP_BUFFER,
     STUCK_SPEED, STUCK_TIME,
-    STEP_HI, STEP_LO
+    STEP_HI, STEP_LO,
+    NET_X, GROUND_Y
   } = DVPhysics;
-  const NET_X    = WORLD_W*0.5;
-  const GROUND_Y = WORLD_H - 30;   // ground line; player's feet rest HERE
   // На desktop крутим физику на 120 Гц (гладко на 120/144 Гц мониторах).
   // На тач-устройствах — 60 Гц: рендер-интерполяция между prev/curr всё равно
   // сглаживает движение, а мобильный CPU перестаёт тратить по 2 шага физики
@@ -3410,12 +3410,9 @@ function makeAI(difficulty, rand){
   })[difficulty] || {};
   let t = 0;
   let target = WORLD_W * 0.75;
-  // Физ-константы берём из общего DVPhysics (physics.js), чтобы AI и
-  // движок не разъезжались при тюнинге. NET_X/GROUND_Y — derived из
-  // размеров поля, живут здесь же.
-  const { GRAV, PLR_R } = DVPhysics;
-  const NET_X    = WORLD_W * 0.5;
-  const GROUND_Y = WORLD_H - 30;
+  // Физ-константы + world config — из общего DVPhysics (physics.js),
+  // чтобы AI и движок не разъезжались при тюнинге.
+  const { GRAV, PLR_R, NET_X, GROUND_Y } = DVPhysics;
   // AI aims to strike the ball at its ideal hit zone — just above the player's head.
   const STRIKE_Y = GROUND_Y - PLR_R * 2.4;
 
