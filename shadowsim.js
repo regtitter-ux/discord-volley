@@ -64,6 +64,8 @@ function makeSim(){
     lastHitSide: 0,
     matchOver: false,
     matchWinner: 0,
+    _matchOverFired: false,  // Stage 7.5: страхуем от double-fire onMatchOver
+    onMatchOver: null,       // Stage 7.5: room-server cb для webhook на Railway
     targetScore: 11,     // host может прислать другое в будущем; пока дефолт
     // Stats
     frames:        { stateFromHost: 0, inputFromGuest: 0 },
@@ -101,6 +103,21 @@ function _awardPoint(sim, side, reason){
   if ((sim.score1 >= t || sim.score2 >= t) && Math.abs(sim.score1 - sim.score2) >= 2){
     sim.matchOver = true;
     sim.matchWinner = sim.score1 > sim.score2 ? 1 : 2;
+    // Stage 7.5: хук для webhook-уведомления Railway. Эмитим ровно один
+    // раз на matchOver-transition (см. sim._matchOverFired), даже если
+    // sim переживёт ещё несколько тиков до закрытия комнаты.
+    if (!sim._matchOverFired && typeof sim.onMatchOver === "function"){
+      sim._matchOverFired = true;
+      try {
+        sim.onMatchOver({
+          winnerSide: sim.matchWinner,
+          score1: sim.score1,
+          score2: sim.score2
+        });
+      } catch (e){
+        console.error("[shadow] onMatchOver hook threw:", e && e.message || e);
+      }
+    }
   }
 }
 function _restartRound(sim){
@@ -179,6 +196,7 @@ class ShadowRegistry {
     if (this.sims.has(roomId)) return;
     const sim = makeSim();
     if (opts && opts.authoritative) sim.authoritative = true;
+    if (opts && typeof opts.onMatchOver === "function") sim.onMatchOver = opts.onMatchOver;
     this.sims.set(roomId, sim);
   }
   // Привязываем sendRaw пира к симу, чтобы server.js не знал про бинарный
