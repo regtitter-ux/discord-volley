@@ -678,7 +678,19 @@ const AUTH_PHYSICS = process.env.DV_AUTH_PHYSICS === "1";
 // адрес room-server'а (второй WS). Дефолт local — весь gameplay идёт через
 // этот же server.js как раньше. ROOM_SECRET обязателен для hathora-пути:
 // Railway подписывает, room-server верифицирует.
-const DV_ROOMS   = process.env.DV_ROOMS === "hathora" ? "hathora" : "local";
+//
+// DV_ROOMS_ROLLBACK=1 — Stage 7.6: kill-switch для экстренного отката. Если
+// Hathora лёг/деплой сломался/фичу хотим раскатать обратно — ставим флаг в
+// Railway dashboard, перезапускаем инстанс, матчи снова идут через pairLocal.
+// Префлит-флаг важнее DV_ROOMS, т.к. Hathora-процессы могут быть недоступны
+// и фолбэк внутри pairHathora добавил бы лишний latency/таймауты на каждую
+// пару. Проще отсечь на корню.
+const _DV_ROOMS_RAW = process.env.DV_ROOMS === "hathora" ? "hathora" : "local";
+const DV_ROOMS_ROLLBACK = process.env.DV_ROOMS_ROLLBACK === "1";
+const DV_ROOMS = (DV_ROOMS_ROLLBACK && _DV_ROOMS_RAW === "hathora") ? "local" : _DV_ROOMS_RAW;
+if (DV_ROOMS_ROLLBACK && _DV_ROOMS_RAW === "hathora"){
+  console.warn("[ws] DV_ROOMS_ROLLBACK=1 — игнорируем DV_ROOMS=hathora, едем через pairLocal");
+}
 // DV_LOCAL_ROOMS=1 — Stage 7.4: вместо удалённой Hathora создаём room-server.js
 // как child-process на свободном порту (127.0.0.1). Для integration-тестов
 // и dev-preview без Hathora account.
@@ -1304,7 +1316,7 @@ wss.on("connection", async (ws, req) => {
     console.log(`[discord-volley] listening on :${PORT}`);
     console.log(`[discord-volley] public: ${APP_URL}`);
     console.log(`[discord-volley] redirect_uri: ${REDIRECT_URI}`);
-    console.log(`[discord-volley] NODE_ENV=${NODE_ENV} broker=${broker.kind} instance=${INSTANCE_ID} rooms=${DV_ROOMS}`);
+    console.log(`[discord-volley] NODE_ENV=${NODE_ENV} broker=${broker.kind} instance=${INSTANCE_ID} rooms=${DV_ROOMS}${DV_ROOMS_ROLLBACK ? " (rollback)" : ""}`);
   });
 })().catch(e => {
   console.error("[fatal] startup failed:", e);

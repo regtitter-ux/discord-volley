@@ -1,0 +1,31 @@
+# Stage 7.6: образ room-runtime для Hathora Cloud. Эфемерный spawn-per-match,
+# 1 контейнер обслуживает 1 матч, по завершении — idle-timeout 5мин шлёт
+# SIGTERM и процесс уходит (Hathora biling'овый цикл).
+#
+# Railway/монолит продолжает ехать из Dockerfile (server.js + sqlite + API).
+# Разные dockerfile'ы дают минимальные образы: room-server.js не тянет
+# express/cookie-parser/cookie-signature, но для простоты npm ci ставит
+# весь dependency-tree — лишние пакеты лежат молча, оверхед пренебрежим.
+
+FROM node:22-alpine
+
+WORKDIR /app
+
+COPY package.json package-lock.json* ./
+RUN npm ci --omit=dev --no-audit --no-fund \
+    && npm cache clean --force
+
+# Только код, нужный room-server'у. Клиент (game.js, index.html, assets/)
+# в образ room-runtime не тащим — он не обслуживает HTTP-статик, только WS.
+COPY room-server.js room-auth.js shadowsim.js physics.js codec.js ./
+
+ENV NODE_ENV=production
+# Hathora проксирует наружу порт, заявленный в hathora.toml/dashboard.
+# Внутри контейнера room-server слушает $PORT (дефолт 8080).
+ENV PORT=8080
+EXPOSE 8080
+
+# ROOM_SECRET и ROOM_RAILWAY_URL — через env на Hathora dashboard. matchId
+# проверяется по подписанному room-token'у клиента, отдельный --match-id
+# не нужен (см. room-server.js verifyRoomToken).
+CMD ["node", "room-server.js", "--port", "8080"]
