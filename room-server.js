@@ -119,9 +119,15 @@ function main(){
     if (req.url === "/healthz"){ res.writeHead(200); res.end("ok"); return; }
     res.writeHead(404); res.end();
   });
-  const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+  // perMessageDeflate: false — zlib на 61-байтовых снапшотах 60 Гц даёт
+  // отрицательное сжатие + compression jitter, особенно болезненный на
+  // Hathora edge через TLS.
+  const wss = new WebSocketServer({ server: httpServer, path: "/ws", perMessageDeflate: false });
 
   wss.on("connection", (ws) => {
+    // TCP_NODELAY: Nagle по умолчанию включён и мог буферизовать мелкие
+    // фреймы до 40 мс. На edge-линке это прямая просадка плавности.
+    try { ws._socket && ws._socket.setNoDelay(true); } catch {}
     ws.wsId = crypto.randomBytes(6).toString("hex");
     ws._joined = false;
     ws._roomId = null;

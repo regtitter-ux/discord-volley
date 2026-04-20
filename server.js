@@ -660,7 +660,10 @@ app.get("*", (req, res, next) => {
        → пир получает {type:"peer", payload} */
 
 const httpServer = http.createServer(app);
-const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
+// perMessageDeflate: false — на hot-path 30 Гц бинарных снапшотов (~61 байт)
+// zlib-сжатие даёт отрицательный выигрыш по размеру и буферизует мелкие
+// фреймы, добавляя джиттер. Отключаем явно, не полагаясь на клиентский offer.
+const wss = new WebSocketServer({ server: httpServer, path: "/ws", perMessageDeflate: false });
 
 // Broker — абстракция над (local | redis). Инициализируется в startup
 // async IIFE ниже. Все multi-instance примитивы (очередь, relay, stakes,
@@ -1155,6 +1158,10 @@ wss.on("connection", async (ws, req) => {
     try { ws.close(4401, "unauthorized"); } catch {}
     return;
   }
+  // TCP_NODELAY на underlying сокете — Nagle по умолчанию включён и может
+  // задерживать 61-байтные снапшоты до ~40 мс ради батчинга. На hot-path
+  // это чистая просадка плавности. ws@8 отдаёт Node.js-сокет через _socket.
+  try { ws._socket && ws._socket.setNoDelay(true); } catch {}
   ws.user          = user;
   ws.roomId        = null;
   ws.activeMatchId = null;
