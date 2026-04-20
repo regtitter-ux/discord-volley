@@ -1747,26 +1747,16 @@ const Game = (function(){
   // Ball spawns above the visible area over the serving player and falls in
   // under gravity. No freeze — physics run continuously so the drop is visible.
   function serveBall(){
-    // Подающий НЕ возвращается в центр зоны — мяч падает прямо над его
-    // текущей позицией. Клампим по краям поля и по своей половине, чтобы
-    // при игре в движении рядом с сеткой мяч не оказался на чужой стороне.
+    // Pure-часть (спавн-координаты, clamp по своей половине) — в DVPhysics.
+    // Тут — только клиентский wrap: prev/render-поля интерполятора, trail,
+    // sfx/визуал через Fx.serve.
     const server = servingSide === 1 ? p1 : p2;
-    const sx = (server && typeof server.x === "number")
-      ? server.x
-      : (servingSide === 1 ? WORLD_W*0.25 : WORLD_W*0.75);
-    const minX = (servingSide === 1) ? BALL_R : NET_X + NET_W/2 + BALL_R;
-    const maxX = (servingSide === 1) ? NET_X - NET_W/2 - BALL_R : WORLD_W - BALL_R;
-    const bx = Math.max(minX, Math.min(maxX, sx));
-    ball = {
-      x: bx,
-      y: SERVE_SPAWN_Y,
-      vx: 0, vy: 0,
-      r: BALL_R,
-      angle: 0,
-      touches: { left:0, right:0 },
-      prevX: bx, prevY: SERVE_SPAWN_Y, prevAngle: 0,
-      renderX: bx, renderY: SERVE_SPAWN_Y, renderAngle: 0
-    };
+    const serverX = (server && typeof server.x === "number") ? server.x : null;
+    const core = DVPhysics.serveBall(servingSide, serverX, WORLD_W, NET_X);
+    ball = Object.assign(core, {
+      prevX: core.x,  prevY: core.y,  prevAngle: 0,
+      renderX: core.x, renderY: core.y, renderAngle: 0
+    });
     trailHead = 0; trailCount = 0;
     hitFlash = 0;
     squash.ball = 0;

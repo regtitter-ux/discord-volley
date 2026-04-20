@@ -227,6 +227,27 @@
     return { jumpBufferT, jumped: false };
   }
 
+  // Pure-кинематика подачи: мяч падает прямо над подающим (sx), зажатый в
+  // его же половину поля, чтобы рядом с сеткой он не оказался на чужой
+  // стороне. servingSide: 1 = левый (p1), -1 = правый (p2). serverX=null —
+  // подающего нет (matchOver/initial spawn), тогда используем четверть поля.
+  // worldW/netX — размеры приходят от caller'а (это world config, не физика).
+  // Возвращает core-поля ball'а; prev/render-поля клиент добавляет сам.
+  function serveBall(servingSide, serverX, worldW, netX){
+    const minX = (servingSide === 1) ? BALL_R          : netX + NET_W/2 + BALL_R;
+    const maxX = (servingSide === 1) ? netX - NET_W/2 - BALL_R : worldW - BALL_R;
+    const fallbackX = (servingSide === 1) ? worldW*0.25 : worldW*0.75;
+    const sx = (typeof serverX === "number") ? serverX : fallbackX;
+    const bx = Math.max(minX, Math.min(maxX, sx));
+    return {
+      x: bx, y: SERVE_SPAWN_Y,
+      vx: 0, vy: 0,
+      r: BALL_R,
+      angle: 0,
+      touches: { left: 0, right: 0 }
+    };
+  }
+
   const PHYSICS = Object.freeze({
     GRAV, MOVE, JUMP, BALL_R, PLR_R, NET_W, NET_H,
     E_WALL, E_NET, E_GROUND, E_PLAYER_IDLE,
@@ -239,7 +260,8 @@
     collideBallNet,
     collideBallPlayer,
     applyInput,
-    applyHumanInput
+    applyHumanInput,
+    serveBall
   });
   if(typeof module !== "undefined" && module.exports){
     module.exports = PHYSICS;
