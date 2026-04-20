@@ -20,7 +20,13 @@ const TICK_HZ        = 60;
 const TICK_MS        = 1000 / TICK_HZ;
 const STATS_LOG_MS   = 30000;     // summary лог раз в 30 с
 const DRIFT_WARN_PX  = 50;        // одноразовый варн, если drift > X
-const SNAP_HZ        = 30;
+// Stage 8: snapshot rate 30 → 60 Hz. Половина inter-arrival gap на клиенте
+// (16 мс vs 33 мс) → interpolation-буфер на клиенте получает вдвое больше
+// опорных точек, сглаживая jitter от Hathora edge (TLS + сетевой хоп в
+// Frankfurt). Трафик растёт с ~1.8 до ~3.7 KB/s на пира — пренебрежимо на
+// любом современном канале. Фактически на 60 Гц сим-тика это значит:
+// каждый tickLoop эмитит snapshot (snapAcc стал равен TICK_MS).
+const SNAP_HZ        = 60;
 const SNAP_STEP      = 1 / SNAP_HZ;
 
 function makePlayer(side, worldW, groundY){
