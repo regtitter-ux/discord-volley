@@ -54,13 +54,75 @@
     return { landed: false, impactVy: 0 };
   }
 
+  // Pure-отскок мяча от боковых стен. Нет event'а — стена молчит, sfx
+  // клиенту не нужны.
+  function collideBallWalls(ball, worldW){
+    if(ball.x < ball.r){               ball.x = ball.r;             ball.vx = -ball.vx * E_WALL; }
+    if(ball.x > worldW - ball.r){       ball.x = worldW - ball.r;    ball.vx = -ball.vx * E_WALL; }
+  }
+
+  // Pure-отскок от пола: приземление + friction по vx. Возвращает {hit,
+  // impactSpeed} — клиент решает, бомбить ли sfx/particles и awardPoint.
+  function collideBallGround(ball, groundY){
+    if(ball.y + ball.r >= groundY && ball.vy > 0){
+      const impactSpeed = Math.abs(ball.vy);
+      ball.y  = groundY - ball.r;
+      ball.vy = -impactSpeed * E_GROUND;
+      ball.vx *= 0.96;
+      return { hit: true, impactSpeed };
+    }
+    return { hit: false, impactSpeed: 0 };
+  }
+
+  // Pure-столкновение мяча с сеткой (AABB + radius). Мутирует ball на
+  // корректной нормали, возвращает hit-event для sfx/squash на клиенте.
+  // netX — центр сетки по X, groundY — пол; NET_W/NET_H/E_NET читаем из
+  // модульных констант.
+  function collideBallNet(ball, netX, groundY){
+    const left  = netX - NET_W*0.5, right = netX + NET_W*0.5;
+    const top   = groundY - NET_H,  bot   = groundY;
+    const cx = Math.max(left, Math.min(ball.x, right));
+    const cy = Math.max(top,  Math.min(ball.y, bot));
+    let nx = ball.x - cx, ny = ball.y - cy;
+    const d2 = nx*nx + ny*ny;
+    if(d2 >= ball.r*ball.r) return { hit: false, hitPower: 0 };
+    let d = Math.sqrt(d2);
+    if(d < 0.0001){
+      // Ball center inside net AABB — pick shortest escape axis.
+      // Top of net is the only face we prefer strongly (so deflections
+      // go UP toward play, not sideways into a post).
+      const overT = ball.y - top;
+      const overL = ball.x - left;
+      const overR = right - ball.x;
+      if(overT <= overL && overT <= overR){ nx = 0; ny = -1; }
+      else if(overL < overR){ nx = -1; ny = 0; }
+      else                  { nx = 1;  ny = 0; }
+      d = 0.0001;
+    }else{
+      nx /= d; ny /= d;
+    }
+    ball.x = cx + nx * ball.r;
+    ball.y = cy + ny * ball.r;
+    const vn = ball.vx*nx + ball.vy*ny;
+    if(vn < 0){
+      const hitPower = -vn;
+      ball.vx -= (1+E_NET) * vn * nx;
+      ball.vy -= (1+E_NET) * vn * ny;
+      return { hit: true, hitPower };
+    }
+    return { hit: false, hitPower: 0 };
+  }
+
   const PHYSICS = Object.freeze({
     GRAV, MOVE, JUMP, BALL_R, PLR_R, NET_W, NET_H,
     E_WALL, E_NET, E_GROUND, E_PLAYER_IDLE,
     MAX_BSPD, SERVE_SPAWN_Y, POST_POINT_TIME,
     COYOTE, JUMP_BUFFER, STUCK_SPEED, STUCK_TIME,
     STEP_HI, STEP_LO,
-    integratePlayerKinematics
+    integratePlayerKinematics,
+    collideBallWalls,
+    collideBallGround,
+    collideBallNet
   });
   if(typeof module !== "undefined" && module.exports){
     module.exports = PHYSICS;

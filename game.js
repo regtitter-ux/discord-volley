@@ -2103,25 +2103,28 @@ const Game = (function(){
       ball.y += ball.vy * subDt;
       ball.angle += ball.vx * subDt * 0.025;
 
-      // Side walls only — no ceiling, the ball can arc arbitrarily high
-      if(ball.x < ball.r){ ball.x = ball.r; ball.vx = -ball.vx * E_WALL; }
-      if(ball.x > WORLD_W - ball.r){ ball.x = WORLD_W - ball.r; ball.vx = -ball.vx * E_WALL; }
+      // Side walls only — no ceiling, the ball can arc arbitrarily high.
+      DVPhysics.collideBallWalls(ball, WORLD_W);
 
-      collideBallNet();
+      {
+        const netEv = DVPhysics.collideBallNet(ball, NET_X, GROUND_Y);
+        if(netEv.hit && netEv.hitPower > 90){
+          sfx.net();
+          spawnParticles(ball.x, ball.y, 6, "rgba(255,255,255,0.9)", 140);
+          squash.ball = Math.max(squash.ball, 0.08);
+        }
+      }
       if(!roundOver && !state.matchOver){
         collideBallPlayer(p1);
         if(!roundOver) collideBallPlayer(p2);
       }
 
       // Ground: award point on first touch, then keep bouncing for POST_POINT_TIME.
-      if(ball.y + ball.r >= GROUND_Y && ball.vy > 0){
-        const impactSpeed = Math.abs(ball.vy);
-        ball.y = GROUND_Y - ball.r;
-        ball.vy = -impactSpeed * E_GROUND;
-        ball.vx *= 0.96;
-        if(impactSpeed > 80){
+      const groundEv = DVPhysics.collideBallGround(ball, GROUND_Y);
+      if(groundEv.hit){
+        if(groundEv.impactSpeed > 80){
           sfx.bounce();
-          spawnParticles(ball.x, GROUND_Y - 2, Math.min(12, 4 + (impactSpeed/120)|0), "rgba(255,255,255,1)", 180);
+          spawnParticles(ball.x, GROUND_Y - 2, Math.min(12, 4 + (groundEv.impactSpeed/120)|0), "rgba(255,255,255,1)", 180);
           squash.ball = 0.12;
         }
         if(!roundOver && !state.matchOver){
@@ -2444,44 +2447,6 @@ const Game = (function(){
       if(p.side === 1) squash.p1 = 0.18;
       else             squash.p2 = 0.18;
       spawnParticles(p.x, GROUND_Y - 2, Math.min(8, (ev.impactVy/110)|0), "rgba(255,255,255,0.9)", 120);
-    }
-  }
-
-  function collideBallNet(){
-    const left = NET_X - NET_W*0.5, right = NET_X + NET_W*0.5;
-    const top  = GROUND_Y - NET_H,  bot   = GROUND_Y;
-    const cx = Math.max(left, Math.min(ball.x, right));
-    const cy = Math.max(top,  Math.min(ball.y, bot));
-    let nx = ball.x - cx, ny = ball.y - cy;
-    const d2 = nx*nx + ny*ny;
-    if(d2 >= ball.r*ball.r) return;
-    let d = Math.sqrt(d2);
-    if(d < 0.0001){
-      // Ball center inside net AABB — pick shortest escape axis.
-      // Top of net is the only face we prefer strongly (so deflections
-      // go UP toward play, not sideways into a post).
-      const overT = ball.y - top;
-      const overL = ball.x - left;
-      const overR = right - ball.x;
-      if(overT <= overL && overT <= overR){ nx = 0; ny = -1; }
-      else if(overL < overR){ nx = -1; ny = 0; }
-      else                  { nx = 1;  ny = 0; }
-      d = 0.0001;
-    }else{
-      nx /= d; ny /= d;
-    }
-    ball.x = cx + nx * ball.r;
-    ball.y = cy + ny * ball.r;
-    const vn = ball.vx*nx + ball.vy*ny;
-    if(vn < 0){
-      const hitPower = -vn;
-      ball.vx -= (1+E_NET) * vn * nx;
-      ball.vy -= (1+E_NET) * vn * ny;
-      if(hitPower > 90){
-        sfx.net();
-        spawnParticles(ball.x, ball.y, 6, "rgba(255,255,255,0.9)", 140);
-        squash.ball = Math.max(squash.ball, 0.08);
-      }
     }
   }
 
