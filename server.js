@@ -613,7 +613,15 @@ const wss = new WebSocketServer({ server: httpServer, path: "/ws" });
 // online-counter) идут через него; под капотом либо in-memory, либо Redis.
 const { createBroker }    = require("./broker");
 const { ShadowRegistry }  = require("./shadowsim");
-const shadow = new ShadowRegistry(process.env.DV_SHADOW_PHYSICS === "1");
+// DV_SHADOW_PHYSICS=1 — observer (host остаётся авторитетом).
+// DV_AUTH_PHYSICS=1   — сервер сам крутит физику для каждого матча и
+// шлёт бинарные снапшоты обоим клиентам. Клиентский код читает
+// matched.net === "auth" и в этом режиме выключает локальную физику.
+const AUTH_PHYSICS = process.env.DV_AUTH_PHYSICS === "1";
+const shadow = new ShadowRegistry({
+  shadow: process.env.DV_SHADOW_PHYSICS === "1",
+  auth:   AUTH_PHYSICS
+});
 shadow.start();
 let broker = null;
 let INSTANCE_ID = crypto.randomBytes(6).toString("hex");
@@ -761,12 +769,17 @@ async function pairLocal(host, guest){
   await broker.joinRoom(roomId, host._client);
   await broker.joinRoom(roomId, guest._client);
   const stakesMsg = { win: stakes.win, loss: stakes.loss };
-  send(host,  { type: "matched", role: "host",  room: roomId, matchId, stakes: stakesMsg, opponent: safeUser(guest.user) });
-  send(guest, { type: "matched", role: "guest", room: roomId, matchId, stakes: stakesMsg, opponent: safeUser(host.user)  });
+  const net = AUTH_PHYSICS ? "auth" : "host";
+  send(host,  { type: "matched", role: "host",  room: roomId, matchId, stakes: stakesMsg, opponent: safeUser(guest.user), net });
+  send(guest, { type: "matched", role: "guest", room: roomId, matchId, stakes: stakesMsg, opponent: safeUser(host.user),  net });
   shadow.registerRole(host.wsId,  "host");
   shadow.registerRole(guest.wsId, "guest");
-  shadow.openRoom(roomId);
-  console.log(`[ws] matched host=${host.user.id} guest=${guest.user.id} room=${roomId} match=${matchId} stakes=+${stakes.win}/-${stakes.loss}`);
+  shadow.openRoom(roomId, { authoritative: AUTH_PHYSICS });
+  if (AUTH_PHYSICS){
+    shadow.attachPeer(roomId, "host",  host._client.sendRaw);
+    shadow.attachPeer(roomId, "guest", guest._client.sendRaw);
+  }
+  console.log(`[ws] matched host=${host.user.id} guest=${guest.user.id} room=${roomId} match=${matchId} stakes=+${stakes.win}/-${stakes.loss} net=${net}`);
 }
 
 // Cross-instance pair: нас забрали из очереди на другом инстансе. Пришло
@@ -782,7 +795,9 @@ async function onRemotePair(info){
   clearQueueTimer(host.ws);
   await broker.joinRoom(info.roomId, host);
   const stakesMsg = { win: info.stakes.win, loss: info.stakes.loss };
-  send(host.ws, { type: "matched", role: "host", room: info.roomId, matchId: info.matchId, stakes: stakesMsg, opponent: info.guestUser });
+  // Cross-instance = остаёмся на host-auth: у нас только sink хоста, guest
+  // на другом инстансе — authoritative sim некуда воткнуть второй sendRaw.
+  send(host.ws, { type: "matched", role: "host", room: info.roomId, matchId: info.matchId, stakes: stakesMsg, opponent: info.guestUser, net: "host" });
   shadow.registerRole(host.ws.wsId, "host");
   shadow.openRoom(info.roomId);
   console.log(`[ws] remote-matched host=${host.ws.user.id} room=${info.roomId} match=${info.matchId}`);
@@ -819,7 +834,9 @@ async function onQueue(ws){
     ws.activeMatchId = matchId;
     await broker.joinRoom(roomId, ws._client);
     const stakesMsg = { win: stakes.win, loss: stakes.loss };
-    send(ws, { type: "matched", role: "guest", room: roomId, matchId, stakes: stakesMsg, opponent: { id: res.partner.userId } });
+    // Симметрично onRemotePair: cross-instance не умеет server-auth, клиент
+    // переходит в host-auth независимо от локального DV_AUTH_PHYSICS.
+    send(ws, { type: "matched", role: "guest", room: roomId, matchId, stakes: stakesMsg, opponent: { id: res.partner.userId }, net: "host" });
     shadow.registerRole(ws.wsId, "guest");
     shadow.openRoom(roomId);
     await broker.publishPair(res.partner.instance, {
@@ -935,7 +952,15 @@ wss.on("connection", async (ws, req) => {
     if (isBinary) {
       if (!ws.roomId) return;
       if (!raw || raw.length < 2 || raw.length > 256) return;
+      // Observer/auth захватывает бинарку ДО relay. В auth-комнате вход
+      // (input+state) не ретранслируется — сервер сам эмитит снапшоты
+      // обоим через peerSinks. Emote-фрейм (0x03) всё ещё идёт через
+      // relay, чтобы не дублировать peer-дискавери.
       shadow.observeFrame(ws.roomId, ws.wsId, raw);
+      if (shadow.isAuthoritative(ws.roomId) && raw.length >= 1){
+        const op = (raw instanceof Buffer) ? raw[0] : new Uint8Array(raw.buffer || raw, raw.byteOffset || 0, raw.byteLength)[0];
+        if (op === 0x01 || op === 0x02) return;
+      }
       broker.publishRoom(ws.roomId, ws.wsId, raw);
       return;
     }

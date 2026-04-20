@@ -1,19 +1,18 @@
 "use strict";
-// Shadow-physics observer: серверный теневой прогон физики для
-// host-authoritative матчей. Включается только флагом DV_SHADOW_PHYSICS=1.
-// Цель — проверить, что DVPhysics в node-среде сходится с тем, что
-// считает host-клиент, ДО переключения на server-authoritative (Этап 6b).
+// Shadow-physics observer + authoritative runner (server-authoritative netcode).
+// Два режима в одном компоненте — чтобы не раздваивать код физики:
 //
-// Как работает:
-//   1. На создание комнаты регистрируем ShadowSim (p1,p2,ball,score,servingSide).
-//   2. Ловим входящие бинарные фреймы из publishRoom:
-//      - 0x01 input от guest → применяем в applyInput(p2, ...).
-//      - 0x02 state от host  → сравниваем с нашим симом, пишем divergence.
-//   3. Тикаем физику на 60 Гц одним общим setInterval'ом (на все комнаты).
-//   4. Раз в STATS_INTERVAL_MS пишем агрегированный лог drift'а по комнате.
+//   DV_SHADOW_PHYSICS=1 — observer. Host остаётся авторитетом, мы ловим
+//   его бинарные фреймы из publishRoom и сравниваем drift/score. Нужен,
+//   чтобы убедиться, что DVPhysics в node сходится с host-клиентом.
 //
-// Никакого влияния на геймплей — observer'ский путь, host остаётся
-// авторитетом. Выключенный флаг = нулевой оверхед.
+//   DV_AUTH_PHYSICS=1   — authoritative. Сервер САМ считает физику,
+//   принимает бинарные input-фреймы от обоих клиентов, гонит сим 60 Гц,
+//   каждые 33 мс шлёт снапшот обоим пирам. Relay input-фреймов
+//   выключается для этой комнаты (см. server.js).
+//
+// Выключенные оба флага = нулевой оверхед: сим не создаётся, обработчики
+// no-op'ят по guard'у this.enabled.
 const DVPhysics = require("./physics.js");
 const DVCodec   = require("./codec.js");
 
@@ -21,6 +20,8 @@ const TICK_HZ        = 60;
 const TICK_MS        = 1000 / TICK_HZ;
 const STATS_LOG_MS   = 30000;     // summary лог раз в 30 с
 const DRIFT_WARN_PX  = 50;        // одноразовый варн, если drift > X
+const SNAP_HZ        = 30;
+const SNAP_STEP      = 1 / SNAP_HZ;
 
 function makePlayer(side, worldW, groundY){
   const x = side === 1 ? worldW * 0.25 : worldW * 0.75;
@@ -42,6 +43,13 @@ function makeSim(){
     p1: makePlayer(1, W, GROUND_Y),
     p2: makePlayer(-1, W, GROUND_Y),
     ball: DVPhysics.serveBall(1, null, W, NET_X),
+    // Authoritative flag: когда true, tickLoop применяет hostInput/guestInput
+    // как авторитетные и эмитит снапшоты в peerSinks; observer-ветка в
+    // observeFrame(state) становится no-op.
+    authoritative: false,
+    peerSinks: { host: null, guest: null },
+    snapAcc: 0,
+    lastWinnerSide: 0,
     guestInput: { left:false, right:false, jumpHeld:false },
     hostInput:  { left:false, right:false, jumpHeld:false },
     jumpBufG: 0,
@@ -54,6 +62,8 @@ function makeSim(){
     roundTimer: 0,       // POST_POINT_TIME countdown после очка
     rallyHits: 0,
     lastHitSide: 0,
+    matchOver: false,
+    matchWinner: 0,
     targetScore: 11,     // host может прислать другое в будущем; пока дефолт
     // Stats
     frames:        { stateFromHost: 0, inputFromGuest: 0 },
@@ -84,6 +94,7 @@ function _awardPoint(sim, side, reason){
   sim.roundOver = true;
   sim.roundTimer = DVPhysics.POST_POINT_TIME;
   sim.rallyHits = 0;
+  sim.lastWinnerSide = side;
   if (side === 1){ sim.score1++; sim.servingSide = 1;  }
   else           { sim.score2++; sim.servingSide = -1; }
   const t = sim.targetScore;
@@ -100,10 +111,37 @@ function _restartRound(sim){
   sim.rallyHits = 0;
   sim.lastHitSide = 0;
 }
+// Бинарный снапшот для обоих пиров. Клиент отправителя (host/guest)
+// примет его через тот же Codec.decode-путь в onmessage(binary).
+function _emitSnapshot(sim){
+  const hostSink  = sim.peerSinks.host;
+  const guestSink = sim.peerSinks.guest;
+  if (!hostSink && !guestSink) return;
+  const frame = DVCodec.encodeState(
+    sim.p1, sim.p2, sim.ball,
+    sim.score1, sim.score2, sim.rallyHits,
+    sim.matchOver ? 1 : 0,
+    sim.roundOver ? 1 : 0,
+    sim.servingSide,
+    sim.lastWinnerSide | 0,
+    sim.lastHitSide | 0
+  );
+  // sendRaw на WS принимает Buffer/Uint8Array/ArrayBuffer. ws@8 съедает
+  // Uint8Array без копирования, но если в пути есть Buffer.from — не
+  // принципиально, всё это одна и та же память.
+  if (hostSink)  try { hostSink(frame);  } catch {}
+  if (guestSink) try { guestSink(frame); } catch {}
+}
 
 class ShadowRegistry {
-  constructor(enabled){
-    this.enabled = !!enabled;
+  // opts = { shadow: boolean, auth: boolean } — флаги из env. enabled =
+  // OR обоих; per-sim behaviour рулится флагом authoritative на комнате.
+  constructor(opts){
+    const shadow = !!(opts && opts.shadow);
+    const auth   = !!(opts && opts.auth);
+    this.shadowMode = shadow;
+    this.authMode   = auth;
+    this.enabled = shadow || auth;
     this.sims = new Map();     // roomId → sim
     this.wsRole = new Map();   // wsId → 'host' | 'guest'
     this.tickHandle = null;
@@ -115,7 +153,11 @@ class ShadowRegistry {
     this.statsHandle = setInterval(() => this._flushStats(), STATS_LOG_MS);
     this.tickHandle.unref?.();
     this.statsHandle.unref?.();
-    console.log("[shadow] enabled (tick=" + TICK_HZ + "Hz, stats=" + (STATS_LOG_MS/1000) + "s)");
+    const tags = [
+      this.shadowMode ? "shadow" : null,
+      this.authMode   ? "auth"   : null
+    ].filter(Boolean).join("+");
+    console.log(`[shadow] enabled (${tags}, tick=${TICK_HZ}Hz, stats=${STATS_LOG_MS/1000}s)`);
   }
   stop(){
     if (this.tickHandle) clearInterval(this.tickHandle);
@@ -130,10 +172,33 @@ class ShadowRegistry {
     if (!this.enabled) return;
     this.wsRole.delete(wsId);
   }
-  openRoom(roomId){
+  // openRoom(roomId, { authoritative }) — флаг авторитетности ставим при
+  // создании. Смена mid-match не нужна: матч либо auth, либо host-auth.
+  openRoom(roomId, opts){
     if (!this.enabled) return;
     if (this.sims.has(roomId)) return;
-    this.sims.set(roomId, makeSim());
+    const sim = makeSim();
+    if (opts && opts.authoritative) sim.authoritative = true;
+    this.sims.set(roomId, sim);
+  }
+  // Привязываем sendRaw пира к симу, чтобы server.js не знал про бинарный
+  // snapshot-путь. В non-auth режиме sinks игнорятся.
+  attachPeer(roomId, role, sendRawFn){
+    if (!this.enabled) return;
+    const sim = this.sims.get(roomId);
+    if (!sim) return;
+    if (role === "host" || role === "guest") sim.peerSinks[role] = sendRawFn || null;
+  }
+  detachPeer(roomId, role){
+    if (!this.enabled) return;
+    const sim = this.sims.get(roomId);
+    if (!sim) return;
+    if (role === "host" || role === "guest") sim.peerSinks[role] = null;
+  }
+  isAuthoritative(roomId){
+    if (!this.enabled) return false;
+    const sim = this.sims.get(roomId);
+    return !!(sim && sim.authoritative);
   }
   closeRoom(roomId){
     if (!this.enabled) return;
@@ -141,7 +206,8 @@ class ShadowRegistry {
     if (!s) return;
     const durSec = ((Date.now() - s.openedAt) / 1000).toFixed(1);
     const avg = s.driftSamples ? (s.driftSumPx / s.driftSamples).toFixed(1) : "0.0";
-    console.log(`[shadow] room ${roomId} closed after ${durSec}s — host/guest frames=${s.frames.stateFromHost}/${s.frames.inputFromGuest} drift avg=${avg}px max=${s.driftMaxPx.toFixed(1)}px score-mismatch=${s.scoreMismatches} finalScore=${s.score1}:${s.score2}`);
+    const modeTag = s.authoritative ? "auth" : "shadow";
+    console.log(`[shadow] ${modeTag} room ${roomId} closed after ${durSec}s — host/guest frames=${s.frames.stateFromHost}/${s.frames.inputFromGuest} drift avg=${avg}px max=${s.driftMaxPx.toFixed(1)}px score-mismatch=${s.scoreMismatches} finalScore=${s.score1}:${s.score2}`);
     this.sims.delete(roomId);
   }
   // Главный перехват: каждый бинарный фрейм, который идёт через publishRoom.
@@ -155,17 +221,24 @@ class ShadowRegistry {
     if (!role) return;
     const dec = DVCodec.decode(frame);
     if (!dec) return;
-    if (dec.kind === "input" && role === "guest"){
-      // У guest'а физ-side = 2 у хоста; для сим-коллизии p2 — правый.
-      // Клиент guest'а в host-auth отправляет свой left/right в виде с
-      // точки зрения хоста зеркально (см. encodeInput call в game.js).
-      // TODO: проверить зеркалирование на реальных фреймах.
-      sim.guestInput.left  = !!dec.left;
-      sim.guestInput.right = !!dec.right;
-      sim.guestInput.jumpHeld = !!dec.jump;
-      sim.frames.inputFromGuest++;
+    if (dec.kind === "input"){
+      if (role === "guest"){
+        // Guest клиент шлёт (keys.right, keys.left, keys.jump) — т.е. уже
+        // зеркалит под мировые координаты (p2=справа). dec.left → p2 влево.
+        sim.guestInput.left  = !!dec.left;
+        sim.guestInput.right = !!dec.right;
+        sim.guestInput.jumpHeld = !!dec.jump;
+        sim.frames.inputFromGuest++;
+      } else if (role === "host" && sim.authoritative){
+        // В auth-режиме host тоже шлёт свой input серверу, БЕЗ зеркала:
+        // host = p1 = левый, dec.left → p1 влево напрямую.
+        sim.hostInput.left  = !!dec.left;
+        sim.hostInput.right = !!dec.right;
+        sim.hostInput.jumpHeld = !!dec.jump;
+      }
       return;
     }
+    if (sim.authoritative) return; // в auth-режиме state от host'а не ждём
     if (dec.kind === "state" && role === "host"){
       sim.frames.stateFromHost++;
       // Infer host input из vx (на host'е p.vx = ax*MOVE после applyHumanInput).
@@ -209,7 +282,7 @@ class ShadowRegistry {
   }
   _tickAll(){
     const dt = 1 / TICK_HZ;
-    for (const sim of this.sims.values()){
+    for (const [roomId, sim] of this.sims){
       // Post-point фриз: мяч падает/летит, но очков больше не присуждаем,
       // inputs игнорируем. По истечении POST_POINT_TIME вызываем serveBall.
       if (sim.roundOver){
@@ -218,10 +291,14 @@ class ShadowRegistry {
           _restartRound(sim);
         }
       }
-      // Applyhuman-input на оба пира (host inferred, guest — точный).
-      const r1 = DVPhysics.applyHumanInput(sim.p1, dt, sim.hostInput, sim.jumpBufH);
+      // В authoritative-режиме матч может кончиться — дальше физику крутим,
+      // но очков больше не считаем; клиенты получают mo=1 в снапшоте и
+      // закрывают матч overlay'ем.
+      const live = !sim.matchOver;
+      // Applyhuman-input на оба пира (host inferred в shadow, точный в auth).
+      const r1 = DVPhysics.applyHumanInput(sim.p1, dt, live ? sim.hostInput : { left:false, right:false, jumpHeld:false }, sim.jumpBufH);
       sim.jumpBufH = r1.jumpBufferT;
-      const r2 = DVPhysics.applyHumanInput(sim.p2, dt, sim.guestInput, sim.jumpBufG);
+      const r2 = DVPhysics.applyHumanInput(sim.p2, dt, live ? sim.guestInput : { left:false, right:false, jumpHeld:false }, sim.jumpBufG);
       sim.jumpBufG = r2.jumpBufferT;
       // Интеграция кинематики
       DVPhysics.integratePlayerKinematics(sim.p1, dt, 0, sim.NET_X, sim.GROUND_Y);
@@ -243,6 +320,16 @@ class ShadowRegistry {
         // Очко тому, на чью половину НЕ упал мяч.
         const pointSide = sim.ball.x < sim.NET_X ? 2 : 1;
         _awardPoint(sim, pointSide, "ground");
+      }
+      // Authoritative-only: эмитим снапшот обоим пирам на 30 Гц. Сим
+      // работает на 60 Гц, так что аккумулятор выдаёт кадр через каждый
+      // второй тик. Снапшот — world-coord, клиент-гость зеркалит у себя.
+      if (sim.authoritative){
+        sim.snapAcc += dt;
+        if (sim.snapAcc >= SNAP_STEP){
+          sim.snapAcc = 0;
+          _emitSnapshot(sim);
+        }
       }
     }
   }

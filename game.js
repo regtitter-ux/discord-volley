@@ -84,6 +84,12 @@ const state = {
   // mode: 'bot' (SP vs AI) | 'host' (authoritative online left player)
   //     | 'guest' (online right player, driven by host snapshots)
   mode: "bot",
+  // netMode: "host" — legacy host-authoritative (host крутит физику, шлёт
+  //                   снапшоты guest'у; guest шлёт input'ы host'у).
+  //          "auth" — server-authoritative (сервер крутит физику, шлёт
+  //                   снапшоты ОБОИМ; оба шлют input'ы серверу).
+  // Выбирается сервером в matched.net; клиент сам не решает.
+  netMode: "host",
   ws: null,
   peerKeys: { left:false, right:false, jump:false },
   targetScore: 10,
@@ -710,6 +716,9 @@ function onServerMessage(msg){
           loss: msg.stakes && msg.stakes.loss | 0
         };
       }
+      // net: "host" (legacy) | "auth" (server-authoritative, этап 6b).
+      // Если сервер не прислал поле — считаем "host" для обратной совместимости.
+      state.netMode = (msg.net === "auth") ? "auth" : "host";
       startOnlineMatch(msg.role, msg.opponent);
       break;
     case "match_stakes":
@@ -742,11 +751,15 @@ function onServerMessage(msg){
 
 function onPeerPayload(p){
   if(!p || typeof p.kind !== "string") return;
-  if(p.kind === "input" && state.mode === "host"){
+  if(p.kind === "input" && state.mode === "host" && state.netMode !== "auth"){
+    // Legacy host-auth: guest-input доходит сюда напрямую. В server-auth
+    // host вообще не получает input-фреймов — их съедает сервер.
     state.peerKeys.left  = !!p.left;
     state.peerKeys.right = !!p.right;
     state.peerKeys.jump  = !!p.jump;
-  }else if(p.kind === "state" && state.mode === "guest"){
+  }else if(p.kind === "state" && (state.mode === "guest" || state.netMode === "auth")){
+    // Снапшоты: гость в host-auth получает их от host'а; оба клиента в
+    // server-auth получают их от сервера. Форма payload'а одинакова.
     Game.applySnapshot(p);
   }else if(p.kind === "emote"){
     // Эмоция от оппонента. И у хоста, и у гостя оппонент стоит справа (p2)
@@ -805,7 +818,7 @@ function onPeerLeft(reason){
   }
   // Матч ещё не начат (пир отменил сразу после matched) — возвращаем в меню.
   Game.stop();
-  state.mode = "bot";
+  state.mode = "bot"; state.netMode = "host";
   state.opponent = null;
   show("menu");
   // Лёгкое уведомление поверх меню через тот же лобби-оверлей.
@@ -824,7 +837,7 @@ function closeSocket(){
 }
 
 function startBotMatch(){
-  state.mode = "bot";
+  state.mode = "bot"; state.netMode = "host";
   state.opponent = null;
   state.bot = Auth.makeBot();
   // Серверу нужен зафиксированный matchId, чтобы ставки трофеев были
@@ -851,6 +864,8 @@ function requestStakes(matchId){
 function startOnlineMatch(role, opponent){
   hideLobby();
   state.mode = role; // 'host' | 'guest'
+  // state.netMode уже проставлен из msg.net в "matched"-ветке onServerMessage —
+  // здесь оно load-bearing для step()/broadcastSnapshot, не сбрасываем.
   // PvP matchId уже пришёл в matched и лежит в state.stakes.matchId.
   // Подменим session.matchId, чтобы кошелёк слал award-ы с тем же ключом.
   if(state.stakes && state.stakes.matchId){
@@ -1039,22 +1054,33 @@ document.querySelectorAll(".tbtn").forEach(btn=>{
   document.addEventListener(ev, e=>e.preventDefault(), {passive:false});
 });
 
-// Гость шлёт своё состояние клавиш хосту. Отправляем немедленно при каждом
-// изменении (keydown/keyup/touch/blur) + фоновый heartbeat на 30 Гц как
-// страховка на случай, если где-то изменение keys произошло вне наших хуков.
-// Сетевые пакеты уходят только когда маска (left|right|jump) поменялась.
+// Клиент шлёт свои клавиши на серверную физику.
+//   host-auth mode: только guest (его инпут едет к host через relay).
+//                   guest зеркалит left↔right, т.к. у host он — правый p2.
+//   server-auth mode (netMode=="auth"): оба клиента шлют — оба идут в sim
+//                   сервера. Host → p1 (левый), БЕЗ зеркала. Guest → p2
+//                   (правый), с тем же зеркалом left↔right что и раньше.
+// Heartbeat на 30 Гц — страховка на случай, если где-то изменение keys
+// произошло вне наших хуков. Сетевые пакеты уходят только когда маска
+// (left|right|jump) поменялась.
 let _relayLastMask = -1;
 function relayInputIfGuest(){
-  if(state.mode !== "guest") return;
+  const shouldSend =
+    state.mode === "guest" ||
+    (state.mode === "host" && state.netMode === "auth");
+  if(!shouldSend) return;
   if(!state.ws || state.ws.readyState !== 1) return;
   const mask = (keys.left?1:0) | (keys.right?2:0) | (keys.jump?4:0);
   if(mask === _relayLastMask) return;
   _relayLastMask = mask;
   try {
-    // На гостe картинка зеркалирована: он видит себя слева, но в мировых
-    // координатах хоста он — правый игрок. Левая стрелка гостя = движение p2
-    // вправо у хоста, поэтому при отправке меняем left↔right.
-    state.ws.send(Codec.encodeInput(keys.right, keys.left, keys.jump));
+    if(state.mode === "guest"){
+      // Мирор: у хоста/сервера guest = p2 (справа), поэтому left↔right.
+      state.ws.send(Codec.encodeInput(keys.right, keys.left, keys.jump));
+    } else {
+      // Host в server-auth: left/right идут как есть, p1 = левый игрок.
+      state.ws.send(Codec.encodeInput(keys.left, keys.right, keys.jump));
+    }
   } catch(_){}
 }
 setInterval(relayInputIfGuest, 33);
@@ -1131,7 +1157,7 @@ function quitToMenu(){
   if(state.mode !== "bot" && state.ws){
     try { state.ws.send(JSON.stringify({ type: "leave" })); } catch(_){}
   }
-  state.mode = "bot";
+  state.mode = "bot"; state.netMode = "host";
   state.opponent = null;
   state.stakes = null;
   state.session = null;
@@ -1781,8 +1807,9 @@ const Game = (function(){
       // Поражение: bot/host — свой p1 проиграл, списываем трофеи.
       if(state.mode === "bot" || state.mode === "host") reportMatchLoss();
     }
-    // Хост отправляет финальный снапшот, чтобы гость корректно закрыл матч.
-    if(state.mode === "host"){
+    // Хост отправляет финальный снапшот, чтобы гость корректно закрыл матч —
+    // только в legacy host-auth. В server-auth этим рулит сервер.
+    if(state.mode === "host" && state.netMode !== "auth"){
       broadcastSnapshot();
     }
   }
@@ -1828,35 +1855,34 @@ const Game = (function(){
     trailY[trailHead] = ball.y;
     if(trailCount < TRAIL_LEN) trailCount++;
 
-    // В роли гостя физика авторитетна у хоста — мы получаем её снапшотами
-    // и рендерим; локально только визуальные тики (частицы/эмоции/трейл) выше.
-    // Важно выйти ДО post-point countdown: иначе guest со своим roundTimer=0
-    // каждый кадр, пока хост показывает ro=1, вызывал spawnPlayers()/serveBall()
-    // и тем самым «телепортировал» фигурки обратно в спауны — визуально
-    // выглядело как «игрок не двигается».
-    if(state.mode === "guest"){
+    // Server-driven ветка: получаем снапшоты и рендерим; локально только
+    // визуальные тики (частицы/эмоции/трейл) выше + client-side prediction
+    // собственного игрока (p1). Используется гостем в host-auth и обоими
+    // клиентами в server-auth.
+    // Важно выйти ДО post-point countdown: иначе клиент со своим
+    // roundTimer=0 каждый кадр, пока авторитет показывает ro=1, вызывал
+    // spawnPlayers()/serveBall() и тем самым «телепортировал» фигурки.
+    const netDriven = (state.mode === "guest") || (state.netMode === "auth");
+    if(netDriven){
+      // flip — в каких координатах пришёл снапшот относительно нашей камеры.
+      // Гость зеркалит, host в auth-режиме — нет.
+      const flip = (state.mode === "guest");
       // Client-side prediction для своего игрока (p1). На интерконтинентальных
-      // RTT (150–300 мс) ждать ack'а хоста = видеть залипший слайм, отсюда
-      // ощущение «лагов» при дальних матчах. Мы симулируем p1 локально на
-      // тех же константах (MOVE/JUMP/GRAV/integratePlayer), что и хост.
-      // applyHumanInput (а не applyInput) — с coyote/jump-buffer/autohop, как
-      // на хосте через applyHumanInput(p1). Хост у себя трактует наш input
-      // через упрощённый applyInput(p2, peerKeys) — отсюда разница max в
-      // один кадр на таймингах прыжка/отскока, которую снапает reconciliation.
-      // Разница в ощущении — большая: без autohop гость не может зажать W и
-      // прыгать непрерывно, а на хосте это работает.
+      // RTT (150–300 мс) ждать ack'а сервера = видеть залипший слайм, отсюда
+      // ощущение «лагов». Мы симулируем p1 локально на тех же константах
+      // (MOVE/JUMP/GRAV), что и сервер, через applyHumanInput (coyote/
+      // jump-buffer/autohop). Сервер у себя крутит applyHumanInput для p1
+      // напрямую по нашему инпуту — reconciliation в consumeSnapshot снапает
+      // любую разницу в один кадр.
       if(p1 && !state.matchOver){
         applyHumanInput(p1, dt);
       } else if(p1){
-        // Матч закончился — у хоста p1.vx гасится экспоненциально (см.
-        // ветку выше, после integratePlayer). Дублируем ту же константу,
-        // чтобы предсказание гостя не уезжало вечно по инерции.
+        // Матч закончился — у сервера p1.vx гасится экспоненциально. Дублируем
+        // ту же константу, чтобы предсказание не уезжало вечно по инерции.
         const damp = Math.pow(0.4, dt);
         p1.vx *= damp;
       }
       if(p1){
-        // В зеркале гостя собственный слайм занимает левую половину поля —
-        // те же границы, что host использует для своего p1.
         integratePlayer(p1, dt, 0, NET_X - NET_W*0.5);
       }
       // Потребляем все снапшоты, ready-время которых уже наступило (recvT <= targetT).
@@ -1867,7 +1893,6 @@ const Game = (function(){
       while(_snapCount > 0 && _snapSlots[_snapHead].recvT <= targetT){
         const e = _snapSlots[_snapHead];
         consumeSnapshot(e.s);
-        // Копируем поля wrapper'а в snapA — сам wrapper в кольце могут переиспользовать.
         snapA.recvT = e.recvT;
         snapA.s     = e.s;
         snapAValid  = true;
@@ -1876,25 +1901,27 @@ const Game = (function(){
       }
       if(snapAValid && p2 && ball){
         const B = _snapQAt(0);
-        const aP2x = WORLD_W - snapA.s.p1.x, aP2y = snapA.s.p1.y;
-        const aBx  = WORLD_W - snapA.s.b.x,  aBy  = snapA.s.b.y;
-        const aBa  = -snapA.s.b.a;
+        // opp source: для guest — s.p1 (world-левый = opp для guest),
+        //             для host в auth — s.p2 (world-правый = opp для host).
+        // Mirror x/vx/angle только при flip.
+        const aOpp = flip ? snapA.s.p1 : snapA.s.p2;
+        const aP2x = flip ? (WORLD_W - aOpp.x) : aOpp.x;
+        const aP2y = aOpp.y;
+        const aBx  = flip ? (WORLD_W - snapA.s.b.x) : snapA.s.b.x;
+        const aBy  = snapA.s.b.y;
+        const aBa  = flip ? -snapA.s.b.a : snapA.s.b.a;
         if(B){
-          // Интерполяция A→B на доле [0..1] между их recvT. Даёт гладкое
-          // движение без «телепортов» на смене направления мяча — всё, что
-          // видит гость, это интерполяция между двумя реальными кадрами хоста.
           const range = B.recvT - snapA.recvT;
           const alpha = range > 1e-6 ? Math.min(1, Math.max(0, (targetT - snapA.recvT) / range)) : 0;
-          const bP2x = WORLD_W - B.s.p1.x, bP2y = B.s.p1.y;
-          const bBx  = WORLD_W - B.s.b.x,  bBy  = B.s.b.y;
-          const bBa  = -B.s.b.a;
+          const bOpp = flip ? B.s.p1 : B.s.p2;
+          const bP2x = flip ? (WORLD_W - bOpp.x) : bOpp.x;
+          const bP2y = bOpp.y;
+          const bBx  = flip ? (WORLD_W - B.s.b.x) : B.s.b.x;
+          const bBy  = B.s.b.y;
+          const bBa  = flip ? -B.s.b.a : B.s.b.a;
           p2.x = aP2x + (bP2x - aP2x) * alpha;
           p2.y = aP2y + (bP2y - aP2y) * alpha;
-          // Телепорт мяча на подачу: A.ro=true (пост-очко) → B.ro=false
-          // (свежий serveBall). Не интерполируем — сразу ставим мяч в
-          // точку спавна и прячем его на время окна, чтобы визуально
-          // старый мяч «пропал» на точке гола, а новый «появился» на
-          // спавне с первым тиком нового раунда (без видимого полёта).
+          // Телепорт мяча на подачу (см. коммент к roundOver-переходу в консюмере).
           if(snapA.s.ro && !B.s.ro){
             ball.x = bBx; ball.y = bBy; ball.angle = bBa;
             _ballHiddenTeleport = true;
@@ -1906,26 +1933,22 @@ const Game = (function(){
           }
         } else {
           // Буфер пуст (сетевой дроп/спайк) — форвард-экстраполяция от последнего
-          // снапа по его авторитетной скорости. Это fallback; обычно снапшот
-          // приходит в пределах SNAP_STEP и мы возвращаемся на интерполяцию.
-          // dtA клампим: на долгом WS-хитче (>300 мс) экстраполяция уносила p2/мяч
-          // за пределы поля по инерции, и приход следующего снапшота давал рывок
-          // на 200+ пикселей обратно. Замораживаем экстраполяцию на разумной
-          // границе — лучше «подвисший» соперник, чем улетевший и прыгающий.
+          // снапа по его авторитетной скорости.
           const MAX_EXTRAPOLATE = 0.3;
           const dtA = Math.min(MAX_EXTRAPOLATE, Math.max(0, targetT - snapA.recvT));
           if(dtA > 0) _extrapCount++;
           _ballHiddenTeleport = false;
-          const vx2 = -snapA.s.p1.vx, vy2 = snapA.s.p1.vy;
-          const vbx = -snapA.s.b.vx,  vby = snapA.s.b.vy;
-          const p2gnd = !!snapA.s.p1.g;
+          const vx2 = flip ? -aOpp.vx : aOpp.vx;
+          const vy2 = aOpp.vy;
+          const vbx = flip ? -snapA.s.b.vx : snapA.s.b.vx;
+          const p2gnd = !!aOpp.g;
           p2.x = aP2x + vx2 * dtA;
           p2.y = p2gnd ? aP2y : (aP2y + vy2 * dtA + 0.5 * GRAV * dtA * dtA);
           if(p2.x < p2.r) p2.x = p2.r;
           if(p2.x > WORLD_W - p2.r) p2.x = WORLD_W - p2.r;
           if(p2.y + p2.r > GROUND_Y) p2.y = GROUND_Y - p2.r;
           ball.x = aBx + vbx * dtA;
-          ball.y = aBy + vby * dtA + 0.5 * GRAV * dtA * dtA;
+          ball.y = aBy + snapA.s.b.vy * dtA + 0.5 * GRAV * dtA * dtA;
           ball.angle = aBa + vbx * dtA * 0.025;
           if(ball.x < ball.r) ball.x = ball.r;
           if(ball.x > WORLD_W - ball.r) ball.x = WORLD_W - ball.r;
@@ -2047,9 +2070,9 @@ const Game = (function(){
       stuckT = 0;
     }
 
-    // Хост рассылает снапшот на 30 Гц. Физика у нас STEP=1/120, так что
-    // в среднем один снапшот на 4 физтика, но считаем в аккумуляторе.
-    if(state.mode === "host"){
+    // Хост рассылает снапшот на 30 Гц — только в legacy host-auth. В
+    // server-auth авторитет сервер, он сам эмитит снапшоты обоим пирам.
+    if(state.mode === "host" && state.netMode !== "auth"){
       snapAcc += dt;
       if(snapAcc >= SNAP_STEP){
         snapAcc = 0;
@@ -2085,7 +2108,9 @@ const Game = (function(){
     // Публичная точка входа из onPeerPayload. Просто ставит снапшот в очередь —
     // реальная обработка (consumeSnapshot) произойдёт в step() через RENDER_DELAY,
     // давая буфер для интерполяции между двумя известными кадрами.
-    if(state.mode !== "guest" || !p1 || !p2 || !ball) return;
+    // Принимаем снапшоты: guest (host-auth netMode) + оба пира в server-auth.
+    const canApply = (state.mode === "guest") || (state.netMode === "auth");
+    if(!canApply || !p1 || !p2 || !ball) return;
     const now = Clock.now() / 1000;
     // Кольцо заполнено → самый старый слот замещается (drop-oldest).
     if(_snapCount === SNAP_Q_MAX){
@@ -2126,65 +2151,64 @@ const Game = (function(){
     // Занимается: событиями (счёт/подача/удар/matchOver), скоростями p2/мяча,
     // реконсиляцией p1. Позиции p2/мяча НЕ ставит — их ставит интерполяция
     // в step() между двумя снапшотами (snapA → snapQ[0]).
-    if(state.mode !== "guest" || !p1 || !p2 || !ball) return;
-    // Зеркалим по X, чтобы гость видел себя слева. В мировых координатах
-    // хоста гость — p2 (справа), поэтому p1 у нас собираем из s.p2 с
-    // отражением x и vx, а p2 — из s.p1. Счёт и сторону подачи тоже
-    // меняем местами, иначе при первой подаче мяч уедет не туда.
+    const canApply = (state.mode === "guest") || (state.netMode === "auth");
+    if(!canApply || !p1 || !p2 || !ball) return;
+    // flip=true — гость: собственный игрок у него слева, но в мировых
+    //   координатах авторитета он p2 (справа). Зеркалим x и vx, меняем s1↔s2.
+    // flip=false — host в server-auth: мир уже в тех же координатах, что
+    //   клиентская камера (свой = p1, слева). Никакого mirror'а.
+    const flip = (state.mode === "guest");
+    const selfSrc = flip ? s.p2 : s.p1;
+    const oppSrc  = flip ? s.p1 : s.p2;
+    const mapX  = (x) => flip ? WORLD_W - x : x;
+    const mapVx = (v) => flip ? -v : v;
+    const mapBA = (a) => flip ? -a : a;
     //
-    // Собственный игрок (p1 у гостя) предсказывается локально в step() —
-    // не перезаписываем его из снапшота целиком, иначе на высоком RTT
-    // вернётся лаг: хост видит ввод на RTT/2 позже, его снапшот тянет
-    // предсказание назад. Две ветки реконсиляции:
+    // Собственный игрок (p1) предсказывается локально в step() — не
+    // перезаписываем его из снапшота целиком, иначе на высоком RTT вернётся
+    // лаг: сервер видит ввод на RTT/2 позже, его снапшот тянет предсказание
+    // назад. Две ветки реконсиляции:
     //   1) hard snap — только для respawn (big) и катастрофического
     //      дрифта (>P1_HARD_SNAP_PX), это телепорт с ресетом скоростей.
     //   2) EMA-catchup — в штатном режиме плавно подтягиваем предсказание
     //      к авторитетной позиции. При высоком RTT prediction стабильно
-    //      убегает на MOVE*RTT/2 пикселей вперёд от снапшота хоста, и
-    //      агрессивный α даёт визуальный «рывок назад» на каждом снапшоте
-    //      (наблюдали ~600 px/s на RTT≈150 мс). Dead-zone P1_DEAD_PX
-    //      убирает постоянное микро-дёрганье при штатном prediction-лаге
-    //      — при жирном drift тянем только избыток сверх dead-zone и
-    //      делаем это мягче (α=0.10): глазу плавно, за ~5 снапшотов
-    //      (~166 мс) мы сходимся. Скорости не трогаем: ошибка по скорости
-    //      скажется на позиции и утащится тем же EMA на следующих снапшотах.
+    //      убегает на MOVE*RTT/2 пикселей вперёд от снапшота сервера, и
+    //      агрессивный α даёт визуальный «рывок назад» на каждом снапшоте.
     const CORRECT_SNAP_PX = 120;
     const P1_HARD_SNAP_PX = 400;
     const P1_DEAD_PX       = 25;
     const P1_CATCHUP_ALPHA = 0.10;
-    const nx1 = WORLD_W - s.p2.x, ny1 = s.p2.y;
-    const nx2 = WORLD_W - s.p1.x, ny2 = s.p1.y;
-    const nbx = WORLD_W - s.b.x,  nby = s.b.y;
+    const nx1 = mapX(selfSrc.x), ny1 = selfSrc.y;
+    const nx2 = mapX(oppSrc.x),  ny2 = oppSrc.y;
+    const nbx = mapX(s.b.x),     nby = s.b.y;
     const big = (Math.abs(nx2 - p2.x) > CORRECT_SNAP_PX || Math.abs(ny2 - p2.y) > CORRECT_SNAP_PX
               || Math.abs(nbx - ball.x) > CORRECT_SNAP_PX || Math.abs(nby - ball.y) > CORRECT_SNAP_PX);
     const p1Drift = Math.hypot(nx1 - p1.x, ny1 - p1.y);
     _lastP1Drift = p1Drift;
     if(big || p1Drift > P1_HARD_SNAP_PX){
       _bigSnapCount++;
-      p1.x = nx1; p1.y = ny1; p1.vx = -s.p2.vx; p1.vy = s.p2.vy; p1.onGround = !!s.p2.g;
+      p1.x = nx1; p1.y = ny1; p1.vx = mapVx(selfSrc.vx); p1.vy = selfSrc.vy; p1.onGround = !!selfSrc.g;
       p1.prevX = p1.x; p1.prevY = p1.y;
     } else if(p1Drift > P1_DEAD_PX){
-      // prevX/prevY не сбрасываем: render-интерполяция между pre-step и
-      // post-snapshot позицией естественно размажет коррекцию на кадр.
-      // Тянем только избыток сверх dead-zone, чтобы в «стабильном» режиме
-      // prediction-лаг не превращался в вечное подтягивание на каждом снапшоте.
       const excess = (p1Drift - P1_DEAD_PX) / p1Drift;
       p1.x += (nx1 - p1.x) * P1_CATCHUP_ALPHA * excess;
       p1.y += (ny1 - p1.y) * P1_CATCHUP_ALPHA * excess;
     }
-    p2.vx = -s.p1.vx; p2.vy = s.p1.vy; p2.onGround = !!s.p1.g;
-    ball.vx = -s.b.vx; ball.vy = s.b.vy;
+    p2.vx = mapVx(oppSrc.vx); p2.vy = oppSrc.vy; p2.onGround = !!oppSrc.g;
+    ball.vx = mapVx(s.b.vx); ball.vy = s.b.vy;
     if(big){
       // Respawn/телепорт — снапаем интерполяцию к новым позициям, чтобы на
       // следующем кадре не было визуального «тягучего» перехода через пол-экрана.
       p2.x = nx2; p2.y = ny2;
-      ball.x = nbx; ball.y = nby; ball.angle = -s.b.a;
+      ball.x = nbx; ball.y = nby; ball.angle = mapBA(s.b.a);
       p2.prevX = p2.x; p2.prevY = p2.y;
       ball.prevX = ball.x; ball.prevY = ball.y; ball.prevAngle = ball.angle;
     }
     const prevRoundOver = roundOver;
     const prevServingSide = servingSide;
-    servingSide = s.ss === 1 ? 2 : 1;
+    // servingSide local: 1 = our side serves, 2 = opp. В снапшоте ss=1 =
+    // p1 (world-левый) подаёт; при flip это для guest — opp (p2 local).
+    servingSide = flip ? (s.ss === 1 ? 2 : 1) : (s.ss === 1 ? 1 : 2);
     roundOver = !!s.ro;
     // Фидбек подачи у гостя: переход roundOver true→false на хосте = только
     // что сработал serveBall(). Показываем тот же showBig/sfx.serve(), что
@@ -2199,13 +2223,15 @@ const Game = (function(){
     }
     firstSnapshotSeen = true;
     const incomingRh = s.rh || 0;
-    // Гостевые награды за касания мяча. В мировых координатах хоста
-    // гость — p2 (lh===2). Счётчик rh у хоста только растёт в пределах
-    // раунда и сбрасывается в 0 на очко; зеркалим это, смотрим прирост.
+    // Гостевые награды за касания мяча. В мировых координатах авторитета
+    // гость — p2 (lh===2). Счётчик rh только растёт в пределах раунда и
+    // сбрасывается в 0 на очко; зеркалим при необходимости, смотрим прирост.
     if(incomingRh > prevSnapRallyHits){
       const deltaHits = incomingRh - prevSnapRallyHits;
-      // lastHitSide — post-mirror: у хоста lh===1 → у гостя это p2 (справа).
-      const hitterSide = s.lh === 1 ? 2 : (s.lh === 2 ? 1 : 0);
+      // hitterSide local: 1 = self hit, 2 = opp. На flip lh↔hitterSide.
+      const hitterSide = flip
+        ? (s.lh === 1 ? 2 : (s.lh === 2 ? 1 : 0))
+        : (s.lh | 0);
       // Wallet: начисляем только свои касания (hitterSide===1). Идём по
       // delta'е, а не по одному событию: если между снапшотами прошло
       // несколько касаний подряд, каждое из них — повод для награды.
@@ -2234,7 +2260,8 @@ const Game = (function(){
     }
     prevSnapRallyHits = incomingRh;
     rallyHits = incomingRh;
-    const newS1 = s.s2, newS2 = s.s1;
+    const newS1 = flip ? s.s2 : s.s1;
+    const newS2 = flip ? s.s1 : s.s2;
     if(newS1 !== score1 || newS2 !== score2){
       const wasP1 = score1, wasP2 = score2;
       score1 = newS1; score2 = newS2;
@@ -2255,9 +2282,9 @@ const Game = (function(){
       }
     }
     if(s.mo && !state.matchOver){
-      // winnerSide тоже зеркалим: если хост выиграл (s.w===1),
-      // у гостя это сторона 2 (справа, соперник).
-      endMatchAsSnapshot(s.w === 1 ? 2 : 1);
+      // winnerSide local: 1 = self won, 2 = opp. При flip меняем местами.
+      const winnerLocal = flip ? (s.w === 1 ? 2 : 1) : (s.w | 0);
+      endMatchAsSnapshot(winnerLocal);
     }
   }
 
@@ -3122,13 +3149,16 @@ const Game = (function(){
 
   // Синхронизация источника тика с видимостью вкладки. В foreground — rAF,
   // в background — worker-таймер, но только для участников, которые
-  // двигают авторитетное состояние (host/bot). Гостю в фоне делать нечего:
-  // ball/p2 приходят из снапшотов, а CSP своего p1 при hidden-вкладке всё
-  // равно не имеет смысла — ввода нет.
+  // двигают авторитетное состояние (host в legacy host-auth или bot).
+  // В server-auth ни одному клиенту не надо тикать в фоне — авторитет
+  // сервер, всё что нужно — принимать снапшоты при возврате во фронт.
   document.addEventListener("visibilitychange", () => {
     if(document.hidden){
       if(rafId){ cancelAnimationFrame(rafId); rafId = 0; }
-      if(state.inGame && (state.mode === "host" || state.mode === "bot")){
+      const needsBgTick =
+        state.mode === "bot" ||
+        (state.mode === "host" && state.netMode !== "auth");
+      if(state.inGame && needsBgTick){
         // last обновится в первом же _tickCore — это нормально, просто первый
         // dt будет 0 (Clock.now() только что писали в last внутри loop).
         last = Clock.now();
