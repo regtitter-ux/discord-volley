@@ -1410,12 +1410,14 @@ const Game = (function(){
   //     в [40, 140] мс. На локальной игре (RTT ~5 мс, jitter <5 мс) opponent
   //     виден через ~40 мс вместо фиксированных 100; на межконтиненталке сам
   //     поднимется до 120-140 мс и поглотит реальный jitter.
-  //   SNAP_Q_MAX — 12 × 33 мс = 400 мс, отсекает зомби-буфер после хитча сети.
+  //   SNAP_Q_MAX — 16 × 16 мс = 270 мс при 60 Гц (Stage 8) либо 16 × 33 мс =
+  //     530 мс при fallback 30 Гц. Отсекает зомби-буфер после хитча сети,
+  //     drop-oldest не срабатывает на типовых Hathora jitter-спайках.
   // snapQ — ring buffer: на каждый приём снапшота push/shift давали по
-  // аллокации Array-внутренностей. На 30 Гц это 60 аллокаций/сек на хол. пути.
+  // аллокации Array-внутренностей. На 60 Гц это 120 аллокаций/сек на хол. пути.
   // Держим пул wrapper'ов { recvT, s } фиксированного размера, а snapA/snapB
   // отдаём как прямые индексы в пул.
-  const SNAP_Q_MAX = 12;
+  const SNAP_Q_MAX = 16;
   const _snapSlots = new Array(SNAP_Q_MAX);
   for(let i = 0; i < SNAP_Q_MAX; i++) _snapSlots[i] = { recvT: 0, s: null };
   let _snapHead = 0;   // индекс самого старого wrapper'а в кольце
@@ -1428,16 +1430,21 @@ const Game = (function(){
   // кольца), иначе push поверх её слота затёр бы payload.
   const snapA = { recvT: 0, s: null };
   let snapAValid = false;
-  let renderDelay = 0.08;                         // старт: ~2.5× SNAP_STEP
-  // MIN подняли с 35 до 70 мс: на реальных матчах PvP jitter p99 = 100-150 мс
-  // (TCP HoL), а старый min=35 мс давал 14+ extrap'ов за матч — буфер
-  // пустел на каждом HoL-спайке, и позиция оппонента/мяча прыгала рывком
-  // при возврате нормального потока. 70 мс = 2× SNAP_STEP, покрывает
-  // типовой p95≈50 мс с запасом. Компромисс: ~35 мс дополнительного
-  // отставания оппонента/мяча — невидимо глазу, но убирает визуальные
-  // рывки на краю буфера.
-  const RENDER_DELAY_MIN = 0.07;
-  const RENDER_DELAY_MAX = 0.18;
+  // Stage 8: старт 120 мс, покрывает Hathora edge jitter (TLS + Frankfurt hop),
+  // потом p99-адаптация подтянет точно. При низком jitter MIN=50 мс быстро
+  // опустит задержку до того же порядка, что и раньше.
+  let renderDelay = 0.12;
+  // Stage 8 MIN=50 мс (было 70): при 60 Гц snapshot gap ≈ 16 мс, 50 мс это
+  //   ровно 3× период — три опорные точки в буфере до цели рендера. Для
+  //   локальной игры/LAN (jitter <10 мс) даёт минимальный opponent-lag.
+  // Stage 8 MAX=260 мс (было 180): Hathora edge через TLS эпизодически даёт
+  //   p99 ≈ 150-200 мс (TCP HoL + TLS record-batching). Старый max=180 мс
+  //   буфер пустел на хвосте распределения → extrapolation → при возврате
+  //   нормального потока prediction уезжала за 100+ px → hard-snap (визуально
+  //   «фриз-рывок»). Подняв max до 260 мс, мы переживаем такие спайки внутри
+  //   interpolation'а и даём плавную лерп-кривую между A→B.
+  const RENDER_DELAY_MIN = 0.05;
+  const RENDER_DELAY_MAX = 0.26;
   const _snapGaps = [];
   const SNAP_GAP_WINDOW = 24;                     // ~0.8 с истории при 30 Гц
 
@@ -1834,7 +1841,7 @@ const Game = (function(){
     _snapTotalCount = 0; _stepsLastFrame = 0;
     _frameTimeHead = 0; _frameTimeCount = 0;
     _lastSnapRecvT = 0;
-    renderDelay = 0.08;
+    renderDelay = 0.12;
     _ballHiddenTeleport = false;
     for(let i = 0; i < PARTICLE_CAP; i++) particles[i].dead = true;
     for(let i = 0; i < EMOTE_CAP; i++) emotes[i].dead = true;
@@ -2234,11 +2241,14 @@ const Game = (function(){
     slot.s     = s;
     _snapCount++;
     _snapTotalCount++;
-    // Адаптация renderDelay: p95 интер-арривал гэпов за последние SNAP_GAP_WINDOW
-    // снапшотов. Плавно подбираем задержку к реальному jitter сети. Не даём
-    // колебаниям переехать вниз (EMA-сглаживание на убывании), иначе один
-    // быстрый снап утащил бы renderDelay ниже уровня jitter и дал бы hitch
-    // через кадр, когда прилетит обычный «запаздыватель».
+    // Stage 8 адаптация: p99 (было p95) интер-арривал гэпов за SNAP_GAP_WINDOW
+    // снапшотов. p95 игнорирует хвост распределения — на Hathora TLS-edge
+    // именно эти «редкие но болезненные» 100-200 мс спайки давали extrap/
+    // hard-snap. p99 × 1.10 целит чуть выше 99-го перцентиля, покрывая 1/100
+    // худших гэпов без over-buffering на чистой сети.
+    // Не даём колебаниям переехать вниз (EMA-сглаживание на убывании), иначе
+    // один быстрый снап утащил бы renderDelay ниже уровня jitter и дал бы
+    // hitch через кадр, когда прилетит обычный «запаздыватель».
     if(_lastSnapRecvT > 0){
       const gap = now - _lastSnapRecvT;
       _snapDiagPush(gap);
@@ -2246,8 +2256,8 @@ const Game = (function(){
       if(_snapGaps.length > SNAP_GAP_WINDOW) _snapGaps.shift();
       if(_snapGaps.length >= 8){
         const sorted = _snapGaps.slice().sort((a,b) => a - b);
-        const p95 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.95))];
-        const target = Math.max(RENDER_DELAY_MIN, Math.min(RENDER_DELAY_MAX, p95 * 1.15));
+        const p99 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.99))];
+        const target = Math.max(RENDER_DELAY_MIN, Math.min(RENDER_DELAY_MAX, p99 * 1.10));
         // Быстро поднимаемся (чтобы не ловить rubber-band), медленно опускаемся.
         renderDelay = target > renderDelay
           ? target
