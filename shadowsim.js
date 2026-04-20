@@ -43,18 +43,62 @@ function makeSim(){
     p2: makePlayer(-1, W, GROUND_Y),
     ball: DVPhysics.serveBall(1, null, W, NET_X),
     guestInput: { left:false, right:false, jumpHeld:false },
-    hostInput:  { left:false, right:false, jumpHeld:false }, // будет inferred из снапшотов
+    hostInput:  { left:false, right:false, jumpHeld:false },
     jumpBufG: 0,
     jumpBufH: 0,
+    // Match state — независимая реплика счёта и режима. На 6b.1 мы
+    // считаем это в shadow и сравниваем с host'овым s1/s2/rh в снапшоте.
+    score1: 0, score2: 0,
+    servingSide: 1,      // 1 = p1 подаёт, -1 = p2
+    roundOver: false,
+    roundTimer: 0,       // POST_POINT_TIME countdown после очка
+    rallyHits: 0,
+    lastHitSide: 0,
+    targetScore: 11,     // host может прислать другое в будущем; пока дефолт
     // Stats
     frames:        { stateFromHost: 0, inputFromGuest: 0 },
     driftSumPx:    0,    // sum of ball/p1/p2 euclidean drift per state frame
     driftMaxPx:    0,
     driftSamples:  0,
+    scoreMismatches: 0,  // сколько раз state-фрейм принёс s1/s2, не совпавший с нашим
     warnedOnce:    false,
     openedAt:      Date.now(),
     lastStatsAt:   Date.now()
   };
+}
+
+// Helpers: match-rule mutations на sim. Вынесены из метода класса, чтобы
+// tick-loop оставался читаемым и чтобы легко было тестить вне инстанса.
+function _registerHit(sim, side){
+  if (sim.roundOver) return;
+  sim.rallyHits++;
+  sim.lastHitSide = side;
+  if (side === 1){ sim.ball.touches.left++;  sim.ball.touches.right = 0; }
+  else           { sim.ball.touches.right++; sim.ball.touches.left  = 0; }
+  // 4-touch rule: лишнее касание = фол, очко сопернику.
+  if (sim.ball.touches.left  >= 4){ _awardPoint(sim, 2, "foul"); return; }
+  if (sim.ball.touches.right >= 4){ _awardPoint(sim, 1, "foul"); return; }
+}
+function _awardPoint(sim, side, reason){
+  if (sim.roundOver) return;
+  sim.roundOver = true;
+  sim.roundTimer = DVPhysics.POST_POINT_TIME;
+  sim.rallyHits = 0;
+  if (side === 1){ sim.score1++; sim.servingSide = 1;  }
+  else           { sim.score2++; sim.servingSide = -1; }
+  const t = sim.targetScore;
+  if ((sim.score1 >= t || sim.score2 >= t) && Math.abs(sim.score1 - sim.score2) >= 2){
+    sim.matchOver = true;
+    sim.matchWinner = sim.score1 > sim.score2 ? 1 : 2;
+  }
+}
+function _restartRound(sim){
+  sim.roundOver = false;
+  sim.roundTimer = 0;
+  const server = sim.servingSide === 1 ? sim.p1 : sim.p2;
+  sim.ball = DVPhysics.serveBall(sim.servingSide, server.x, sim.W, sim.NET_X);
+  sim.rallyHits = 0;
+  sim.lastHitSide = 0;
 }
 
 class ShadowRegistry {
@@ -97,7 +141,7 @@ class ShadowRegistry {
     if (!s) return;
     const durSec = ((Date.now() - s.openedAt) / 1000).toFixed(1);
     const avg = s.driftSamples ? (s.driftSumPx / s.driftSamples).toFixed(1) : "0.0";
-    console.log(`[shadow] room ${roomId} closed after ${durSec}s — frames host/guest=${s.frames.stateFromHost}/${s.frames.inputFromGuest} drift avg=${avg}px max=${s.driftMaxPx.toFixed(1)}px`);
+    console.log(`[shadow] room ${roomId} closed after ${durSec}s — host/guest frames=${s.frames.stateFromHost}/${s.frames.inputFromGuest} drift avg=${avg}px max=${s.driftMaxPx.toFixed(1)}px score-mismatch=${s.scoreMismatches} finalScore=${s.score1}:${s.score2}`);
     this.sims.delete(roomId);
   }
   // Главный перехват: каждый бинарный фрейм, который идёт через publishRoom.
@@ -139,7 +183,12 @@ class ShadowRegistry {
       sim.driftSamples++;
       if (!sim.warnedOnce && drift > DRIFT_WARN_PX){
         sim.warnedOnce = true;
-        console.log(`[shadow] room ${roomId} first drift ${drift.toFixed(1)}px (p1=${dp1.toFixed(0)} p2=${dp2.toFixed(0)} b=${db.toFixed(0)}) — nat'l, инференс host-инпута через vx груб`);
+        console.log(`[shadow] room ${roomId} first drift ${drift.toFixed(1)}px (p1=${dp1.toFixed(0)} p2=${dp2.toFixed(0)} b=${db.toFixed(0)}) — инференс host-инпута через vx груб`);
+      }
+      // Сравнение счёта: если host'овые s1/s2 не совпали с нашими —
+      // это прямой сигнал, что серверные score-rules расходятся с клиентскими.
+      if (dec.s1 !== sim.score1 || dec.s2 !== sim.score2){
+        sim.scoreMismatches++;
       }
       // Resync к snapshot'у — shadow-режим не претендует быть авторитетом.
       // Без resync drift только растёт (host-input инференс через vx груб).
@@ -149,11 +198,26 @@ class ShadowRegistry {
       sim.p2.onGround = !!dec.p2.g;
       sim.ball.x = dec.b.x; sim.ball.y = dec.b.y; sim.ball.vx = dec.b.vx; sim.ball.vy = dec.b.vy;
       sim.ball.angle = dec.b.a;
+      // Score/round тоже ресинкаем к host'у — иначе наш match lifecycle
+      // отличается от реального и serve/awardPoint спамят с расходящимся
+      // state'ом. На этом этапе host всё ещё авторитет счёта.
+      sim.score1 = dec.s1; sim.score2 = dec.s2;
+      sim.rallyHits = dec.rh;
+      sim.roundOver = !!dec.ro;
+      sim.servingSide = dec.ss;
     }
   }
   _tickAll(){
     const dt = 1 / TICK_HZ;
     for (const sim of this.sims.values()){
+      // Post-point фриз: мяч падает/летит, но очков больше не присуждаем,
+      // inputs игнорируем. По истечении POST_POINT_TIME вызываем serveBall.
+      if (sim.roundOver){
+        sim.roundTimer -= dt;
+        if (sim.roundTimer <= 0){
+          _restartRound(sim);
+        }
+      }
       // Applyhuman-input на оба пира (host inferred, guest — точный).
       const r1 = DVPhysics.applyHumanInput(sim.p1, dt, sim.hostInput, sim.jumpBufH);
       sim.jumpBufH = r1.jumpBufferT;
@@ -162,15 +226,24 @@ class ShadowRegistry {
       // Интеграция кинематики
       DVPhysics.integratePlayerKinematics(sim.p1, dt, 0, sim.NET_X, sim.GROUND_Y);
       DVPhysics.integratePlayerKinematics(sim.p2, dt, sim.NET_X, sim.W, sim.GROUND_Y);
-      // Ball: гравитация, wall/net/ground, коллизии с игроками
+      // Ball: гравитация, wall/net, коллизии с игроками и оценка ground-hit
       sim.ball.vy += DVPhysics.GRAV * dt;
       sim.ball.x += sim.ball.vx * dt;
       sim.ball.y += sim.ball.vy * dt;
       DVPhysics.collideBallWalls(sim.ball, sim.W);
       DVPhysics.collideBallNet(sim.ball, sim.NET_X, sim.GROUND_Y);
-      DVPhysics.collideBallGround(sim.ball, sim.GROUND_Y);
-      DVPhysics.collideBallPlayer(sim.ball, sim.p1, sim.GROUND_Y);
-      DVPhysics.collideBallPlayer(sim.ball, sim.p2, sim.GROUND_Y);
+      // Player-collision сначала (может поднять мяч перед ground-check).
+      // 4-touch rule — лишние касания своего игрока → фол, очко сопернику.
+      const h1 = DVPhysics.collideBallPlayer(sim.ball, sim.p1, sim.GROUND_Y);
+      if (h1.hit) _registerHit(sim, 1);
+      const h2 = DVPhysics.collideBallPlayer(sim.ball, sim.p2, sim.GROUND_Y);
+      if (h2.hit) _registerHit(sim, 2);
+      const gnd = DVPhysics.collideBallGround(sim.ball, sim.GROUND_Y);
+      if (gnd.hit && !sim.roundOver){
+        // Очко тому, на чью половину НЕ упал мяч.
+        const pointSide = sim.ball.x < sim.NET_X ? 2 : 1;
+        _awardPoint(sim, pointSide, "ground");
+      }
     }
   }
   _flushStats(){
@@ -181,12 +254,13 @@ class ShadowRegistry {
       const stateHz = (sim.frames.stateFromHost / dt).toFixed(1);
       const inpHz   = (sim.frames.inputFromGuest / dt).toFixed(1);
       const avg     = sim.driftSamples ? (sim.driftSumPx / sim.driftSamples).toFixed(1) : "0.0";
-      console.log(`[shadow] ${roomId} state=${stateHz}Hz input=${inpHz}Hz drift avg=${avg}px max=${sim.driftMaxPx.toFixed(1)}px samples=${sim.driftSamples}`);
+      console.log(`[shadow] ${roomId} state=${stateHz}Hz input=${inpHz}Hz drift avg=${avg}px max=${sim.driftMaxPx.toFixed(1)}px scoreMismatch=${sim.scoreMismatches} score=${sim.score1}:${sim.score2}`);
       sim.frames.stateFromHost = 0;
       sim.frames.inputFromGuest = 0;
       sim.driftSumPx = 0;
       sim.driftMaxPx = 0;
       sim.driftSamples = 0;
+      sim.scoreMismatches = 0;
       sim.lastStatsAt = now;
     }
   }
