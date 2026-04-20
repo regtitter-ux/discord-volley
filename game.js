@@ -2437,23 +2437,13 @@ const Game = (function(){
   }
 
   function integratePlayer(p, dt, xMin, xMax){
-    const wasInAir = !p.onGround;
-    const impactVy = p.vy;
-    p.vy += GRAV * dt;
-    p.x += p.vx * dt;
-    p.y += p.vy * dt;
-    if(p.x < xMin + p.r) p.x = xMin + p.r;
-    if(p.x > xMax - p.r) p.x = xMax - p.r;
-    // Lands when the bottom of the circle touches the ground line.
-    if(p.y + p.r >= GROUND_Y){
-      p.y = GROUND_Y - p.r;
-      p.vy = 0;
-      p.onGround = true;
-      if(wasInAir && impactVy > 120){
-        if(p.side === 1) squash.p1 = 0.18;
-        else             squash.p2 = 0.18;
-        spawnParticles(p.x, GROUND_Y - 2, Math.min(8, (impactVy/110)|0), "rgba(255,255,255,0.9)", 120);
-      }
+    // Математика — в shared physics.js (тот же код будет крутиться на
+    // сервере на Этапе 2). Здесь — только клиентский визуал на posadku.
+    const ev = DVPhysics.integratePlayerKinematics(p, dt, xMin, xMax, GROUND_Y);
+    if(ev.landed && ev.impactVy > 120){
+      if(p.side === 1) squash.p1 = 0.18;
+      else             squash.p2 = 0.18;
+      spawnParticles(p.x, GROUND_Y - 2, Math.min(8, (ev.impactVy/110)|0), "rgba(255,255,255,0.9)", 120);
     }
   }
 
