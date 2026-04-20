@@ -176,15 +176,15 @@ class ShadowRegistry {
     this.wsRole = new Map();   // wsId → 'host' | 'guest'
     this.tickHandle = null;
     this.statsHandle = null;
-    // DV_TICK_ACCUMULATOR=1 — «Fix Your Timestep» на Node.js setInterval.
-    // На shared-CPU Railway/Hathora GC-паузы и scheduling jitter иногда
-    // откладывают setInterval-колбэк на 30-80 мс. При фикс-dt физика в эти
-    // моменты «замирала» — снапшоты редели, клиент переходил в extrapolation.
-    // С accumulator мы добираем пропущенные тики (cap MAX_CATCHUP), а snap
-    // эмитится только один раз за вызов, чтобы клиентский interp-буфер не
-    // получил пачку снапшотов с gap≈0. Default off — включим после замера
-    // baseline-метрик на проде.
-    this.useAccumulator = process.env.DV_TICK_ACCUMULATOR === "1";
+    // «Fix Your Timestep» на Node.js setInterval. На shared-CPU Railway/
+    // Hathora GC-паузы и scheduling jitter иногда откладывают колбэк
+    // setInterval'а на 30-80 мс. При фикс-dt физика в эти моменты «замирала»
+    // — снапшоты редели, клиент переходил в extrapolation. С accumulator
+    // добираем пропущенные тики (cap MAX_CATCHUP=2), а snap эмитится только
+    // один раз за вызов batch'а, чтобы клиентский interp-буфер не получил
+    // пачку снапшотов с gap≈0. Default on; kill-switch DV_TICK_ACCUMULATOR=0
+    // для быстрого отката через railway/hathora env без повторного деплоя.
+    this.useAccumulator = process.env.DV_TICK_ACCUMULATOR !== "0";
     this._accNs = 0n;
     this._lastTickNs = 0n;
     this._tickStats = { maxLagMs: 0, catchup2: 0, drops: 0, ticks: 0 };
