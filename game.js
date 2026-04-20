@@ -1445,8 +1445,21 @@ const Game = (function(){
   //   interpolation'а и даём плавную лерп-кривую между A→B.
   const RENDER_DELAY_MIN = 0.05;
   const RENDER_DELAY_MAX = 0.26;
-  const _snapGaps = [];
   const SNAP_GAP_WINDOW = 24;                     // ~0.8 с истории при 30 Гц
+  // Ring buffer вместо push/shift массива: push/shift на hot-path 60 Гц
+  // давал O(n) сдвиг 24 элементов и GC-давление (slice + sort каждый snap).
+  // Float32Array + circular indices — 60 раз/сек одна аллокация под sort'ом
+  // вместо двух (push-grow + slice-copy).
+  const _snapGapBuf   = new Float32Array(SNAP_GAP_WINDOW);
+  const _snapGapScratch = new Float32Array(SNAP_GAP_WINDOW);
+  let _snapGapHead  = 0;
+  let _snapGapCount = 0;
+  function _snapGapsPush(gap){
+    _snapGapBuf[_snapGapHead] = gap;
+    _snapGapHead = (_snapGapHead + 1) % SNAP_GAP_WINDOW;
+    if(_snapGapCount < SNAP_GAP_WINDOW) _snapGapCount++;
+  }
+  function _snapGapsReset(){ _snapGapHead = 0; _snapGapCount = 0; }
 
   // Отдельное длинное окно для диагностики TCP head-of-line blocking.
   // _snapGaps короткий (24) и нужен для быстрой адаптации renderDelay к
@@ -1835,7 +1848,7 @@ const Game = (function(){
     // должны утянуть позиции в новом.
     _snapHead = 0; _snapCount = 0;
     snapA.s = null; snapAValid = false;
-    _snapGaps.length = 0;
+    _snapGapsReset();
     _snapDiagHead = 0; _snapDiagCount = 0; _snapDiagMax = 0;
     _lastP1Drift = 0; _bigSnapCount = 0; _extrapCount = 0;
     _snapTotalCount = 0; _stepsLastFrame = 0;
@@ -2037,8 +2050,34 @@ const Game = (function(){
           const bBx  = flip ? (WORLD_W - B.s.b.x) : B.s.b.x;
           const bBy  = B.s.b.y;
           const bBa  = flip ? -B.s.b.a : B.s.b.a;
-          p2.x = aP2x + (bP2x - aP2x) * alpha;
-          p2.y = aP2y + (bP2y - aP2y) * alpha;
+          // Hermite (Catmull-Rom с known tangents) для p2 за window.DV_HERMITE_INTERP:
+          // линейная интерполяция даёт видимые «углы» на дугах прыжка при 60 Гц
+          // снапшотах. Hermite использует авторитетные vx/vy из снапшотов как
+          // тангенсы и даёт плавную кривую. Мяч ОСТАВЛЯЕМ линейным — между A и B
+          // может быть коллизия со стеной/сеткой, где скорости меняют знак, и
+          // Hermite даст overshoot через препятствие (реальный риск по ревью).
+          // Для p2.y включаем только когда оба снапшота в воздухе (!onGround) —
+          // иначе отскок от земли между A и B даёт тот же overshoot.
+          if(typeof window !== "undefined" && window.DV_HERMITE_INTERP){
+            const vax = flip ? -aOpp.vx : aOpp.vx;
+            const vbx = flip ? -bOpp.vx : bOpp.vx;
+            const vay = aOpp.vy;
+            const vby = bOpp.vy;
+            const t  = alpha, tt = t*t, ttt = tt*t;
+            const h00 = 2*ttt - 3*tt + 1;
+            const h10 = ttt - 2*tt + t;
+            const h01 = -2*ttt + 3*tt;
+            const h11 = ttt - tt;
+            p2.x = h00*aP2x + h10*range*vax + h01*bP2x + h11*range*vbx;
+            if(!aOpp.g && !bOpp.g){
+              p2.y = h00*aP2y + h10*range*vay + h01*bP2y + h11*range*vby;
+            } else {
+              p2.y = aP2y + (bP2y - aP2y) * alpha;
+            }
+          } else {
+            p2.x = aP2x + (bP2x - aP2x) * alpha;
+            p2.y = aP2y + (bP2y - aP2y) * alpha;
+          }
           // Телепорт мяча на подачу (см. коммент к roundOver-переходу в консюмере).
           if(snapA.s.ro && !B.s.ro){
             ball.x = bBx; ball.y = bBy; ball.angle = bBa;
@@ -2252,11 +2291,13 @@ const Game = (function(){
     if(_lastSnapRecvT > 0){
       const gap = now - _lastSnapRecvT;
       _snapDiagPush(gap);
-      _snapGaps.push(gap);
-      if(_snapGaps.length > SNAP_GAP_WINDOW) _snapGaps.shift();
-      if(_snapGaps.length >= 8){
-        const sorted = _snapGaps.slice().sort((a,b) => a - b);
-        const p99 = sorted[Math.min(sorted.length - 1, Math.floor(sorted.length * 0.99))];
+      _snapGapsPush(gap);
+      if(_snapGapCount >= 8){
+        // Копируем живой префикс в scratch-буфер и сортируем in-place —
+        // нет аллокации на hot-path 60 Гц (slice+sort давал это 60 раз/сек).
+        for(let i = 0; i < _snapGapCount; i++) _snapGapScratch[i] = _snapGapBuf[i];
+        Array.prototype.sort.call(_snapGapScratch.subarray(0, _snapGapCount), (a,b) => a - b);
+        const p99 = _snapGapScratch[Math.min(_snapGapCount - 1, Math.floor(_snapGapCount * 0.99))];
         const target = Math.max(RENDER_DELAY_MIN, Math.min(RENDER_DELAY_MAX, p99 * 1.10));
         // Быстро поднимаемся (чтобы не ловить rubber-band), медленно опускаемся.
         renderDelay = target > renderDelay
