@@ -599,47 +599,6 @@ if(lbPrevBtn) lbPrevBtn.addEventListener("click", ()=> refreshLeaderboard(lbCurr
 if(lbNextBtn) lbNextBtn.addEventListener("click", ()=> refreshLeaderboard(lbCurrentPage + 1));
 if(lbJumpMeBtn) lbJumpMeBtn.addEventListener("click", ()=> { if(lbMePage) refreshLeaderboard(lbMePage); });
 
-/* ---------------- Matchmaking ----------------
-   Клик по «ИГРАТЬ» запускает поиск: открываем WebSocket, встаём в очередь,
-   показываем лобби с обратным отсчётом. Если в течение QUEUE_TIMEOUT_MS
-   никто не подключился — сервер пришлёт queue_timeout, и мы откатимся в
-   матч против бота. По кнопке «Отмена» — закрываем сокет и уходим обратно
-   в меню (в отличие от таймаута). */
-
-const lobbyOverlay   = $("lobby-overlay");
-const lobbyCountdown = $("lobby-countdown");
-const lobbyTitle     = $("lobby-title");
-const lobbySub       = $("lobby-sub");
-const QUEUE_COUNTDOWN_MS = 30000;
-
-let lobbyTickTimer = 0;
-let lobbyCountdownStart = 0;
-function startLobbyCountdown(){
-  lobbyCountdownStart = performance.now();
-  updateLobbyCountdown();
-  if(lobbyTickTimer) clearInterval(lobbyTickTimer);
-  lobbyTickTimer = setInterval(updateLobbyCountdown, 100);
-}
-function stopLobbyCountdown(){
-  if(lobbyTickTimer){ clearInterval(lobbyTickTimer); lobbyTickTimer = 0; }
-}
-function updateLobbyCountdown(){
-  const elapsed = performance.now() - lobbyCountdownStart;
-  const left = Math.max(0, QUEUE_COUNTDOWN_MS - elapsed);
-  lobbyCountdown.textContent = String(Math.ceil(left / 1000));
-}
-
-function showLobby(){
-  lobbyTitle.textContent = I18n.t("lobby.searching");
-  lobbySub.textContent   = I18n.t("lobby.fallback_hint");
-  lobbyOverlay.classList.remove("hidden");
-  startLobbyCountdown();
-}
-function hideLobby(){
-  lobbyOverlay.classList.add("hidden");
-  stopLobbyCountdown();
-}
-
 // Ожидание open у переданного WebSocket. Если сокет уже открыт — возвращаем
 // его без задержки. На ошибку/close/длинный таймаут возвращаем null, чтобы
 // вызывающий мог сделать fallback.
@@ -665,110 +624,24 @@ const Codec = window.DVCodec;
 
 function attachSocketHandlers(ws){
   ws.addEventListener("message", (ev)=>{
-    // Бинарные фреймы — это всегда relay-payload от соперника (снапшот,
-    // инпут, эмоция); сервер их не оборачивает, так что идём в Codec и
-    // сразу в onPeerPayload. Всё остальное — текстовый JSON-контроль.
-    if(typeof ev.data !== "string"){
-      const p = Codec.decode(ev.data);
-      if(p) onPeerPayload(p);
-      return;
-    }
+    // Бинарные фреймы в онлайн-режиме были peer-relay; в bot-only режиме
+    // сервер не шлёт бинарные payload'ы — просто игнорируем.
+    if(typeof ev.data !== "string") return;
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
     if(!msg || typeof msg.type !== "string") return;
     onServerMessage(msg);
   });
   ws.addEventListener("close", ()=>{
-    // Если мы уже в матче — считаем это как уход соперника.
-    // Исключение: в Hathora-режиме gameplay идёт через state.gameWs, и
-    // закрытие menu-WS не значит disconnect от матча — peer_left всё
-    // равно приедет либо из Railway (control-фрейм), либо через gameWs close.
-    if(state.inGame && state.mode !== "bot"){
-      const gameLive = state.gameWs && state.gameWs.readyState === 1;
-      if(!gameLive) onPeerLeft("disconnect");
-    }else{
-      hideLobby();
-    }
     if(state.ws === ws) state.ws = null;
   });
 }
 
-// Gameplay-WS (Stage 7.3+): отдельный сокет к Hathora room-server'у.
-// Бинарные input/state/emote идут сюда, текстовые control ack'и (join,
-// в будущем match-result) — тоже здесь. Lobby/wallet/trophies остаются
-// на menu-WS.
-function attachGameSocketHandlers(ws){
-  ws.addEventListener("message", (ev)=>{
-    if(typeof ev.data !== "string"){
-      const p = Codec.decode(ev.data);
-      if(p) onPeerPayload(p);
-      return;
-    }
-    // Текстовые фреймы на gameWs: сейчас только {type:"joined"} ack
-    // (обрабатывается в openGameSocket). Неизвестные — игнор.
-  });
-  ws.addEventListener("close", ()=>{
-    if(state.gameWs === ws) state.gameWs = null;
-    if(state.inGame && state.mode !== "bot") onPeerLeft("disconnect");
-  });
-  ws.addEventListener("error", ()=>{});
-}
-
-// Возвращает сокет, в который надо класть gameplay-трафик (input/state/emote).
-// Приоритет: gameWs (Hathora) → menu-WS (legacy local-путь). null, если оба
-// не готовы — вызывающий код просто молча теряет кадр.
-function gameplaySocket(){
-  if(state.gameWs && state.gameWs.readyState === 1) return state.gameWs;
-  if(state.ws     && state.ws.readyState     === 1) return state.ws;
-  return null;
-}
-
-// Открыть второй WS на room-server, отправить join-фрейм, дождаться
-// {type:"joined"} ack. Успех → state.gameWs назначен, резолв ws.
-// Любая осечка (таймаут, close, error, плохой ack) → резолв null,
-// сокет закрыт, state.gameWs не трогаем.
-function openGameSocket(host, port, token){
-  return new Promise((resolve) => {
-    const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    const url = proto + "//" + host + ":" + (port|0) + "/ws";
-    let ws;
-    try { ws = new WebSocket(url); } catch(_){ resolve(null); return; }
-    ws.binaryType = "arraybuffer";
-    let settled = false;
-    const done = (val) => {
-      if(settled) return;
-      settled = true;
-      resolve(val);
-      if(!val){ try { ws.close(); } catch(_){} }
-    };
-    const onAck = (ev) => {
-      if(typeof ev.data !== "string") return;
-      try {
-        const msg = JSON.parse(ev.data);
-        if(msg && msg.type === "joined"){
-          ws.removeEventListener("message", onAck);
-          state.gameWs = ws;
-          attachGameSocketHandlers(ws);
-          done(ws);
-        }
-      } catch(_){}
-    };
-    ws.addEventListener("open", () => {
-      try { ws.send(JSON.stringify({ type: "join", token: String(token||"") })); }
-      catch(_){ done(null); }
-    }, { once: true });
-    ws.addEventListener("message", onAck);
-    ws.addEventListener("error", () => done(null), { once: true });
-    ws.addEventListener("close", () => done(null), { once: true });
-    setTimeout(() => done(null), 8000);
-  });
-}
-
-function closeGameSocket(){
-  const ws = state.gameWs;
-  state.gameWs = null;
-  if(ws){ try { ws.close(); } catch(_){} }
-}
+// В bot-only режиме gameplay-сокета нет; шим сохраняем, чтобы не ломать
+// call-sites в Game-модуле (broadcastSnapshot/emote-relay никогда не
+// активируются, т.к. state.mode всегда "bot").
+function gameplaySocket(){ return null; }
+function closeGameSocket(){ /* no-op */ }
 
 function onServerMessage(msg){
   switch(msg.type){
@@ -790,41 +663,6 @@ function onServerMessage(msg){
         Wallet.set(msg.coins, d);
       }
       break;
-    case "matched":
-      // PvP: сервер выдал matchId + ставки трофеев. Клиент НЕ катает
-      // случайки самостоятельно — используем то, что прислали, иначе
-      // host/guest увидят разные числа и сервер по-любому возьмёт своё.
-      if(msg.matchId){
-        state.stakes = {
-          matchId: msg.matchId,
-          win:  msg.stakes && msg.stakes.win  | 0,
-          loss: msg.stakes && msg.stakes.loss | 0
-        };
-      }
-      // net: "host" (legacy) | "auth" (server-authoritative, этап 6b).
-      // Если сервер не прислал поле — считаем "host" для обратной совместимости.
-      state.netMode = (msg.net === "auth") ? "auth" : "host";
-      // Stage 7.3: если сервер отдал roomHost/roomPort/roomToken — поднимаем
-      // второй WS к Hathora room-server'у и только потом входим в матч.
-      // Без этих полей (DV_ROOMS=local, дефолт) идём старым путём мгновенно.
-      if(msg.roomHost && msg.roomPort && msg.roomToken){
-        openGameSocket(msg.roomHost, msg.roomPort, msg.roomToken).then((game) => {
-          if(!game){
-            // Room-server не ответил joined за 8с. Снимаем ожидания, уведомляем
-            // Railway и возвращаемся в меню — играть всё равно некуда.
-            try { state.ws && state.ws.readyState === 1 &&
-                  state.ws.send(JSON.stringify({ type: "leave" })); } catch(_){}
-            state.stakes = null;
-            hideLobby();
-            show("menu");
-            return;
-          }
-          startOnlineMatch(msg.role, msg.opponent);
-        });
-      } else {
-        startOnlineMatch(msg.role, msg.opponent);
-      }
-      break;
     case "match_stakes":
       if(msg.matchId){
         state.stakes = {
@@ -840,35 +678,6 @@ function onServerMessage(msg){
         Trophies.set(msg.total, d);
       }
       break;
-    case "queue_timeout":
-      hideLobby();
-      startBotMatch();
-      break;
-    case "peer":
-      onPeerPayload(msg.payload);
-      break;
-    case "peer_left":
-      onPeerLeft(msg.reason || "disconnect");
-      break;
-  }
-}
-
-function onPeerPayload(p){
-  if(!p || typeof p.kind !== "string") return;
-  if(p.kind === "input" && state.mode === "host" && state.netMode !== "auth"){
-    // Legacy host-auth: guest-input доходит сюда напрямую. В server-auth
-    // host вообще не получает input-фреймов — их съедает сервер.
-    state.peerKeys.left  = !!p.left;
-    state.peerKeys.right = !!p.right;
-    state.peerKeys.jump  = !!p.jump;
-  }else if(p.kind === "state" && (state.mode === "guest" || state.netMode === "auth")){
-    // Снапшоты: гость в host-auth получает их от host'а; оба клиента в
-    // server-auth получают их от сервера. Форма payload'а одинакова.
-    Game.applySnapshot(p);
-  }else if(p.kind === "emote"){
-    // Эмоция от оппонента. И у хоста, и у гостя оппонент стоит справа (p2)
-    // — гостевая сторона зеркалирует снапшот, так что своя половина всегда p1.
-    Game.triggerEmote(2, p.id);
   }
 }
 
@@ -890,47 +699,6 @@ function reportMatchLoss(){
     state.ws && state.ws.readyState === 1 &&
       state.ws.send(JSON.stringify({ type: "match_loss", matchId: mid || null }));
   } catch(_){}
-}
-
-function onPeerLeft(reason){
-  if(state.mode === "bot") return;
-  // Активный матч (ещё не завершён) — засчитываем форфейт: оставшийся игрок
-  // получает победу (+50 монет) и видит обычный оверлей окончания матча.
-  // Сокет держим открытым — он общий для матчмейкинга, онлайн-счётчика и
-  // кошелька.
-  if(state.inGame && !state.matchOver){
-    // Репортим свою форфейт-победу в лидерборд (endByForfeit внутри выставит
-    // matchOver; reportMatchWin защищён флагом winReported от дублей).
-    reportMatchWin();
-    Game.endByForfeit();
-    // state.mode НЕ трогаем: форфейт — это валидный конец онлайн-матча, и
-    // «Играть снова» должна повторить онлайн-поток (leave → matchmaking),
-    // а не свалиться в бот-ветку (там нет show("game")/resizeCanvas/матч-
-    // мейкинга, и поле рисуется в чужом скейле от прошлого фрейма).
-    // Повторный серверный applyMatchOutcome от нашего будущего leave будет
-    // безопасно отклонён broker.claimOutcome (мы уже в winnerReportedBy).
-    state.opponent = null;
-    return;
-  }
-  // Матч уже завершён, мы на end-match оверлее, а пир нажал «Играть снова»:
-  // не трогаем оверлей — игрок должен сам решить, жать replay или уйти в меню.
-  // Просто чистим ссылку на соперника; следующий btn-replay корректно
-  // стартует свежий матчмейкинг через quitToMenu → startMatchmaking.
-  if(state.inGame && state.matchOver){
-    state.opponent = null;
-    return;
-  }
-  // Матч ещё не начат (пир отменил сразу после matched) — возвращаем в меню.
-  Game.stop();
-  state.mode = "bot"; state.netMode = "host";
-  state.opponent = null;
-  show("menu");
-  // Лёгкое уведомление поверх меню через тот же лобби-оверлей.
-  lobbyTitle.textContent = I18n.t("lobby.disconnected");
-  lobbySub.textContent   = "";
-  lobbyCountdown.textContent = "×";
-  lobbyOverlay.classList.remove("hidden");
-  setTimeout(()=> lobbyOverlay.classList.add("hidden"), 1500);
 }
 
 function closeSocket(){
@@ -965,57 +733,7 @@ function requestStakes(matchId){
   } catch(_){}
 }
 
-function startOnlineMatch(role, opponent){
-  hideLobby();
-  state.mode = role; // 'host' | 'guest'
-  // state.netMode уже проставлен из msg.net в "matched"-ветке onServerMessage —
-  // здесь оно load-bearing для step()/broadcastSnapshot, не сбрасываем.
-  // PvP matchId уже пришёл в matched и лежит в state.stakes.matchId.
-  // Подменим session.matchId, чтобы кошелёк слал award-ы с тем же ключом.
-  if(state.stakes && state.stakes.matchId){
-    state.session = { matchId: state.stakes.matchId, startedAt: Date.now(), seq: 0 };
-  }
-  // Нормализуем пришедшего с сервера пользователя — добиваем color по id,
-  // чтобы fallback-круг оппонента был стабильно окрашен, а не серо-дефолтным.
-  state.opponent = Auth.normalize(opponent) || opponent;
-  state.bot = null;
-  state.peerKeys.left = state.peerKeys.right = state.peerKeys.jump = false;
-  // Важно: модульный _relayLastMask сохраняется между матчами. Если гость
-  // играл прошлый матч и у него в конце была зажата, например, стрелка
-  // (или просто mask оказался 0), в новом матче первое нажатие с тем же
-  // mask-значением не отправится из-за дедупа — и гость не двигается.
-  // Форсим «ни разу не отправляли» состояние.
-  _relayLastMask = -1;
-  $("hud-score-p1").textContent = "0";
-  $("hud-score-p2").textContent = "0";
-  refreshLocalizedDynamicUI();
-  show("game");
-  resizeCanvas();
-  Game.start();
-}
-
-async function startMatchmaking(){
-  showLobby();
-  // Переиспользуем постоянный сокет из меню. Если его ещё нет (boot не успел
-  // или сеть упала) — пытаемся открыть; при неудаче откатываемся к боту.
-  const ws = await ensureMenuSocket();
-  if(!ws){
-    hideLobby();
-    startBotMatch();
-    return;
-  }
-  try { ws.send(JSON.stringify({ type: "queue" })); } catch(_){}
-}
-
-$("btn-play").addEventListener("click", startMatchmaking);
-
-$("btn-lobby-cancel").addEventListener("click", ()=>{
-  hideLobby();
-  if(state.ws){
-    try { state.ws.send(JSON.stringify({ type: "cancel" })); } catch(_){}
-  }
-  // Сокет держим открытым — он общий для матчмейкинга, онлайн-счётчика и кошелька.
-});
+$("btn-play").addEventListener("click", startBotMatch);
 
 /* ---------------- Canvas sizing ---------------- */
 // World config — источник истины в physics.js (shared с сервером).
@@ -1244,27 +962,12 @@ function showEndOverlay(winnerSide, s1, s2, subOverride){
 $("btn-replay").addEventListener("click", ()=>{
   // Новый матч — свежий matchId + свежие ставки трофеев. Иначе сервер
   // увидит повторный match_win по закрытому matchId и проигнорирует.
-  if(state.mode === "bot"){
-    state.session = { matchId: "b-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2,8), startedAt: Date.now(), seq: 0 };
-    state.stakes = null;
-    requestStakes(state.session.matchId);
-    Game.start();
-    return;
-  }
-  // В онлайне «повтор» = выйти из текущего матча и сразу встать в очередь.
-  quitToMenu();
-  startMatchmaking();
+  state.session = { matchId: "b-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2,8), startedAt: Date.now(), seq: 0 };
+  state.stakes = null;
+  requestStakes(state.session.matchId);
+  Game.start();
 });
 function quitToMenu(){
-  // Если мы в онлайне — корректно уведомим сервер через {type:"leave"},
-  // чтобы соперник увидел peer_left сразу. Menu-сокет НЕ закрываем — это
-  // общий сокет для online-счётчика и серверного кошелька, он живёт всю
-  // сессию. А gameWs (Hathora) — сокет этого конкретного матча, его
-  // закрываем: следующий матч получит новый roomHost и новый gameWs.
-  if(state.mode !== "bot" && state.ws){
-    try { state.ws.send(JSON.stringify({ type: "leave" })); } catch(_){}
-  }
-  closeGameSocket();
   state.mode = "bot"; state.netMode = "host";
   state.opponent = null;
   state.stakes = null;
