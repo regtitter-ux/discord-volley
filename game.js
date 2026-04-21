@@ -2312,6 +2312,7 @@ const Game = (function(){
     drawPlayer(p2, playerUser(2));
     drawServeIndicator();
     drawBall();
+    drawBallOffscreenIndicator();
     drawParticles();
     drawEmotes();
     drawBigText();
@@ -2896,6 +2897,47 @@ const Game = (function(){
       ctx.beginPath(); ctx.arc(0, 0, ball.r, 0, Math.PI*2); ctx.fill();
     }
 
+    ctx.restore();
+  }
+
+  // Когда мяч улетает выше видимой области, рисуем у верхней границы
+  // поля стрелку, указывающую вверх, и едущую по X за мячом. Цвет в
+  // тон мяча (amber), обводка под Discord-палитру — заметно, но
+  // вписывается в HUD (serve-indicator треугольники рисованы похоже).
+  function drawBallOffscreenIndicator(){
+    if(!ball) return;
+    if(_ballHiddenTeleport) return;
+    const offTop = -ball.renderY;
+    if(offTop <= ball.r) return;
+    // 0..24 мировых px: плавное появление, чтобы не «щёлкал» при
+    // выходе мяча за край. Дальше держим на полном.
+    const alpha = Math.min(1, (offTop - ball.r) / 24);
+    if(alpha <= 0) return;
+
+    const margin = ball.r * 1.4 + 8;
+    const ix = Math.max(margin, Math.min(WORLD_W - margin, ball.renderX));
+    const iy = 22;
+    const pulse = 1 + 0.08 * Math.sin(matchTime * 7);
+    const w = 28 * pulse, h = 24 * pulse;
+
+    ctx.save();
+    ctx.globalAlpha = alpha;
+    ctx.translate(ix, iy);
+    // Мягкая тень-свечение, чтобы стрелка читалась на небе и на песке.
+    ctx.shadowColor = "rgba(0,0,0,0.35)";
+    ctx.shadowBlur = 6;
+    ctx.shadowOffsetY = 2;
+    ctx.fillStyle = "#f0b232";
+    ctx.strokeStyle = "rgba(15,16,18,0.75)";
+    ctx.lineJoin = "round";
+    ctx.lineWidth = 2.5;
+    ctx.beginPath();
+    ctx.moveTo(0, -h * 0.55);
+    ctx.lineTo(w * 0.5, h * 0.45);
+    ctx.lineTo(-w * 0.5, h * 0.45);
+    ctx.closePath();
+    ctx.fill();
+    ctx.stroke();
     ctx.restore();
   }
 
