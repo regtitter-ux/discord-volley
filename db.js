@@ -40,6 +40,21 @@ function openDb(dataDir){
       updated_at  INTEGER NOT NULL DEFAULT 0
     );
     CREATE INDEX IF NOT EXISTS idx_users_trophies ON users(trophies DESC, updated_at ASC);
+    CREATE TABLE IF NOT EXISTS decorations (
+      id         TEXT PRIMARY KEY,
+      title      TEXT NOT NULL DEFAULT '',
+      price      INTEGER NOT NULL DEFAULT 0,
+      atlas_path TEXT NOT NULL,
+      frames     INTEGER NOT NULL DEFAULT 0,
+      fps        INTEGER NOT NULL DEFAULT 12,
+      frame_w    INTEGER NOT NULL DEFAULT 0,
+      frame_h    INTEGER NOT NULL DEFAULT 0,
+      cols       INTEGER NOT NULL DEFAULT 1,
+      rows       INTEGER NOT NULL DEFAULT 1,
+      sort_order INTEGER NOT NULL DEFAULT 0,
+      updated_at INTEGER NOT NULL DEFAULT 0
+    );
+    CREATE INDEX IF NOT EXISTS idx_decorations_sort ON decorations(sort_order ASC, updated_at ASC);
   `);
 
   // Миграция на лету: добавляем колонки под систему украшений на уже
@@ -167,7 +182,48 @@ function openDb(dataDir){
       SET selected_decoration = ?2,
           updated_at = ?3
       WHERE id = ?1
-    `)
+    `),
+    // Админ-CRUD каталога украшений. sort_order оставляем на будущее (сейчас
+    // выдаём просто в порядке вставки + updated_at для стабильности), но
+    // задел под ручную перестановку уже есть.
+    listDecorations: db.prepare(`
+      SELECT id, title, price, atlas_path, frames, fps,
+             frame_w AS frameW, frame_h AS frameH, cols, rows,
+             sort_order AS sortOrder, updated_at AS updatedAt
+      FROM decorations
+      ORDER BY sort_order ASC, updated_at ASC, id ASC
+    `),
+    getDecoration: db.prepare(`
+      SELECT id, title, price, atlas_path, frames, fps,
+             frame_w AS frameW, frame_h AS frameH, cols, rows,
+             sort_order AS sortOrder, updated_at AS updatedAt
+      FROM decorations
+      WHERE id = ?
+    `),
+    upsertDecoration: db.prepare(`
+      INSERT INTO decorations (id, title, price, atlas_path, frames, fps, frame_w, frame_h, cols, rows, sort_order, updated_at)
+      VALUES (@id, @title, @price, @atlas_path, @frames, @fps, @frame_w, @frame_h, @cols, @rows, @sort_order, @updated_at)
+      ON CONFLICT(id) DO UPDATE SET
+        title      = excluded.title,
+        price      = excluded.price,
+        atlas_path = excluded.atlas_path,
+        frames     = excluded.frames,
+        fps        = excluded.fps,
+        frame_w    = excluded.frame_w,
+        frame_h    = excluded.frame_h,
+        cols       = excluded.cols,
+        rows       = excluded.rows,
+        sort_order = excluded.sort_order,
+        updated_at = excluded.updated_at
+    `),
+    deleteDecoration: db.prepare("DELETE FROM decorations WHERE id = ?"),
+    countDecorations: db.prepare("SELECT COUNT(*) AS n FROM decorations"),
+    // Очистка selected_decoration у всех юзеров, у кого указан удаляемый id.
+    // Купленные оставляем в owned_decorations — так если украшение вернут с тем
+    // же id, пользователь не потеряет покупку.
+    clearSelectedDecorationById: db.prepare(
+      "UPDATE users SET selected_decoration = NULL WHERE selected_decoration = ?"
+    )
   };
 
   function ensureUser(user){
@@ -237,6 +293,71 @@ function openDb(dataDir){
     return { ok: true, ...getDecorations(user.id) };
   }
 
+  function rowToDecoration(r){
+    if (!r) return null;
+    return {
+      id:         r.id,
+      title:      r.title || "",
+      price:      r.price | 0,
+      atlas:      r.atlas_path,
+      frames:     r.frames | 0,
+      fps:        r.fps | 0,
+      frameW:     r.frameW | 0,
+      frameH:     r.frameH | 0,
+      cols:       r.cols | 0,
+      rows:       r.rows | 0,
+      sortOrder:  r.sortOrder | 0,
+      // updatedAt — epoch ms, шире 32 бит; | 0 превратит его в отрицательное
+      // число и cache-buster `?v=-…` станет мусорным. Держим как Number.
+      updatedAt:  Number(r.updatedAt) || 0
+    };
+  }
+
+  function listDecorationCatalog(){
+    return stmts.listDecorations.all().map(rowToDecoration);
+  }
+
+  function getDecorationCatalogEntry(id){
+    if (!id) return null;
+    return rowToDecoration(stmts.getDecoration.get(String(id)));
+  }
+
+  function upsertDecoration(entry){
+    const now = Date.now();
+    stmts.upsertDecoration.run({
+      id:         String(entry.id),
+      title:      String(entry.title || ""),
+      price:      entry.price | 0,
+      atlas_path: String(entry.atlas),
+      frames:     entry.frames | 0,
+      fps:        entry.fps | 0,
+      frame_w:    entry.frameW | 0,
+      frame_h:    entry.frameH | 0,
+      cols:       entry.cols | 0,
+      rows:       entry.rows | 0,
+      sort_order: entry.sortOrder | 0,
+      updated_at: now
+    });
+    return getDecorationCatalogEntry(entry.id);
+  }
+
+  function deleteDecoration(id){
+    if (!id) return false;
+    const key = String(id);
+    const info = stmts.deleteDecoration.run(key);
+    if (!info || !info.changes) return false;
+    // Сбрасываем selected у всех, кто носил удалённое украшение — чтобы
+    // /api/me и hello-фрейм не продолжали слать им payload с путём к уже
+    // удалённому атласу.
+    stmts.clearSelectedDecorationById.run(key);
+    return true;
+  }
+
+  function countDecorations(){
+    const r = stmts.countDecorations.get();
+    return r ? (r.n | 0) : 0;
+  }
+
   function leaderboardPage(page, pageSize){
     const total = stmts.totalRanked.get().n | 0;
     const pages = Math.max(1, Math.ceil(total / pageSize));
@@ -275,6 +396,11 @@ function openDb(dataDir){
     getDecorations,
     buyDecoration,
     setSelectedDecoration,
+    listDecorationCatalog,
+    getDecorationCatalogEntry,
+    upsertDecoration,
+    deleteDecoration,
+    countDecorations,
     leaderboardPage,
     meRank
   };

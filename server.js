@@ -399,72 +399,84 @@ app.get("/api/stats", async (req, res) => {
 });
 
 /* ---------- Decorations ----------
-   Каталог — статический сервер-авторитетный словарь: id, цена в монетах
-   и параметры атласа (размер кадра + сетка + длительность кадра). Клиент
-   использует их, чтобы проиграть анимацию через background-position без
-   догадок. Добавление нового украшения = строка сюда + спрайт-лист в
-   /assets/decorations/<id>/atlas.png. Цены и размеры никогда не приходят
-   с клиента. */
-const DECORATIONS = {
-  deco1: {
-    id:         "deco1",
-    price:      10000,
-    atlas:      "/assets/decorations/deco1/atlas.png",
-    frames:     60,
-    fps:        12,
-    frameW:     96,
-    frameH:     96,
-    cols:       6,
-    rows:       10
-  },
-  deco2: {
-    id:         "deco2",
-    price:      10000,
-    atlas:      "/assets/decorations/deco2/atlas.png",
-    frames:     60,
-    fps:        12,
-    frameW:     96,
-    frameH:     96,
-    cols:       6,
-    rows:       10
-  },
-  deco3: {
-    id:         "deco3",
-    price:      10000,
-    atlas:      "/assets/decorations/deco3/atlas.png",
-    frames:     60,
-    fps:        12,
-    frameW:     96,
-    frameH:     96,
-    cols:       6,
-    rows:       10
-  },
-  deco4: {
-    id:         "deco4",
-    price:      10000,
-    atlas:      "/assets/decorations/deco4/atlas.png",
-    frames:     60,
-    fps:        12,
-    frameW:     96,
-    frameH:     96,
-    cols:       6,
-    rows:       10
-  }
-};
-const DECORATION_IDS = new Set(Object.keys(DECORATIONS));
+   Каталог — персистентный SQLite-источник (таблица decorations). Админ
+   управляет им через /api/admin/decorations (upload multipart + delete),
+   обычный клиент читает через /api/decorations. Атлас лежит либо под
+   /assets/decorations/<id>/atlas.png (встроенные, в репе), либо под
+   /cdn/decorations/<id>/atlas.png (загруженные админом, в DATA_DIR).
+   Цены и размеры никогда не приходят с клиента. */
+const SEED_DECORATIONS = [
+  { id: "deco1", title: "",
+    atlas: "/assets/decorations/deco1/atlas.png",
+    price: 10000, frames: 60, fps: 12, frameW: 96, frameH: 96, cols: 6, rows: 10, sortOrder: 1 },
+  { id: "deco2", title: "",
+    atlas: "/assets/decorations/deco2/atlas.png",
+    price: 10000, frames: 60, fps: 12, frameW: 96, frameH: 96, cols: 6, rows: 10, sortOrder: 2 },
+  { id: "deco3", title: "",
+    atlas: "/assets/decorations/deco3/atlas.png",
+    price: 10000, frames: 60, fps: 12, frameW: 96, frameH: 96, cols: 6, rows: 10, sortOrder: 3 },
+  { id: "deco4", title: "",
+    atlas: "/assets/decorations/deco4/atlas.png",
+    price: 10000, frames: 60, fps: 12, frameW: 96, frameH: 96, cols: 6, rows: 10, sortOrder: 4 }
+];
+
+// Персистентный корень для загруженных админом атласов. Каждый id кладётся
+// в собственную подпапку, чтобы можно было хранить дополнительные файлы в
+// будущем (thumbnail/metadata) без коллизий и чтобы удаление deco было
+// тривиальным rmdir-ом.
+const DECORATIONS_DIR = path.join(DATA_DIR, "decorations");
+try { fs.mkdirSync(DECORATIONS_DIR, { recursive: true }); } catch(_) {}
+
+// Однократный сид при пустой таблице: встроенные deco1..deco4 заходят сами,
+// чтобы существующие прод-пользователи с купленными украшениями не
+// оказались с мёртвым owned_decorations csv. Повторные старты на уже
+// заполненной таблице — no-op.
+if (DB.countDecorations() === 0){
+  for (const d of SEED_DECORATIONS) DB.upsertDecoration(d);
+  console.log(`[decorations] seeded ${SEED_DECORATIONS.length} built-in entries`);
+}
+
+// Клиентский wire-shape каталога. title приходит как есть; если строка
+// пустая — клиент сам возьмёт i18n-fallback по id (`deco.name_<id>`).
+// Cache-buster по updated_at нужен для загруженных атласов: админ
+// перезалил файл под тем же id — браузер обязан увидеть новую версию,
+// несмотря на immutable-кэш статики.
+function decorationToWire(d){
+  if (!d) return null;
+  const isStaticAsset = typeof d.atlas === "string" && d.atlas.startsWith("/assets/");
+  const ver = Number(d.updatedAt) || 0;
+  const atlas = isStaticAsset
+    ? d.atlas
+    : d.atlas + (d.atlas.includes("?") ? "&" : "?") + "v=" + ver;
+  return {
+    id:     d.id,
+    title:  d.title || "",
+    price:  d.price | 0,
+    atlas,
+    frames: d.frames | 0,
+    fps:    d.fps | 0,
+    frameW: d.frameW | 0,
+    frameH: d.frameH | 0,
+    cols:   d.cols | 0,
+    rows:   d.rows | 0
+  };
+}
 
 function decorationCatalogList(){
-  return Object.values(DECORATIONS).map(d => ({ ...d }));
+  return DB.listDecorationCatalog().map(decorationToWire);
 }
 
 // Клиент получает украшение вместе с /api/me и в WS hello — ему нужны
 // параметры атласа (frameW/cols/fps), чтобы отрисовать. Если выбранное
-// украшение было удалено из каталога (теоретический случай), возвращаем
-// null — клиент просто отрендерит голый аватар.
+// украшение было удалено из каталога, возвращаем null — клиент просто
+// отрендерит голый аватар.
 function selectedDecorationPayload(id){
   if (!id) return null;
-  const d = DECORATIONS[id];
-  return d ? { ...d } : null;
+  return decorationToWire(DB.getDecorationCatalogEntry(id));
+}
+
+function isKnownDecoration(id){
+  return !!DB.getDecorationCatalogEntry(id);
 }
 
 app.get("/api/decorations", (req, res) => {
@@ -489,10 +501,11 @@ app.post("/api/decorations/buy", (req, res) => {
   const u = getSession(req);
   if (!u) return res.status(401).json({ error: "unauthorized" });
   const id = String(req.query.id || "");
-  if (!DECORATION_IDS.has(id)) return res.status(400).json({ error: "unknown_decoration" });
+  const entry = DB.getDecorationCatalogEntry(id);
+  if (!entry) return res.status(400).json({ error: "unknown_decoration" });
   const cur = DB.getDecorations(u.id);
   if (cur.owned.includes(id)) return res.json({ ok: true, already_owned: true, ...cur });
-  const price = DECORATIONS[id].price | 0;
+  const price = entry.price | 0;
   if ((cur.coins | 0) < price) return res.status(402).json({ error: "insufficient_coins", coins: cur.coins });
   const r = DB.buyDecoration(u, id, price);
   if (!r.ok) return res.status(409).json({ error: "buy_failed", coins: r.coins });
@@ -506,7 +519,17 @@ app.post("/api/decorations/buy", (req, res) => {
    Белый список ID с админ-правами. Хардкод на сервере — клиенту верить
    нельзя: is_admin во флаге /api/me нужен только для UI (показать кнопку
    «+»), реальная проверка прав стоит на каждой admin-ручке. */
-const ADMIN_IDS = new Set(["743913502997086219"]);
+// Основной админ — хардкод (Discord-snowflake владельца). DV_ADMIN_IDS
+// (csv) — дополнительные id без редеплоя (прод-фоллбек + тестовые прогоны).
+const ADMIN_IDS = (function(){
+  const set = new Set(["743913502997086219"]);
+  const extra = String(process.env.DV_ADMIN_IDS || "").split(",");
+  for (const raw of extra){
+    const s = raw.trim();
+    if (s) set.add(s);
+  }
+  return set;
+})();
 function isAdmin(u){ return !!(u && ADMIN_IDS.has(String(u.id))); }
 
 // Поиск пользователя по произвольному хендлу: сперва пробуем как точный ID
@@ -548,13 +571,228 @@ app.post("/api/admin/coins", (req, res) => {
   res.json({ ok: true, id, coins });
 });
 
+/* ---------- Admin decorations CRUD ----------
+   Админ-ручки каталога украшений: список, upsert через multipart (id + поля
+   + файл атласа), удаление. ID — sanitized под `[a-z0-9_-]{2,32}`, чтобы не
+   было path traversal (имя id используется как имя подпапки). Атлас
+   валидируется по PNG-сигнатуре и лимиту размера — файл с произвольным
+   content-type не прилетит на диск. Писать только для isAdmin. */
+const Busboy = require("busboy");
+const DECO_ID_RE = /^[a-z0-9_-]{2,32}$/;
+const DECO_ATLAS_MAX_BYTES = Number(process.env.DV_ATLAS_MAX_BYTES) || 10 * 1024 * 1024;
+const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+
+function parseMultipartUpload(req){
+  return new Promise((resolve, reject) => {
+    let bb;
+    try {
+      bb = Busboy({
+        headers: req.headers,
+        limits: { fileSize: DECO_ATLAS_MAX_BYTES, files: 1, fields: 32, fieldSize: 4096 }
+      });
+    } catch (e) { reject(e); return; }
+    const fields = {};
+    let file = null;
+    bb.on("field", (name, val) => {
+      if (typeof name === "string" && name.length <= 64) fields[name] = String(val);
+    });
+    bb.on("file", (name, stream, info) => {
+      if (name !== "atlas"){ stream.resume(); return; }
+      const chunks = [];
+      let size = 0;
+      let truncated = false;
+      stream.on("data", (c) => { chunks.push(c); size += c.length; });
+      stream.on("limit", () => { truncated = true; });
+      stream.on("end", () => {
+        file = {
+          buffer:   Buffer.concat(chunks, size),
+          filename: info && info.filename ? String(info.filename) : "",
+          mime:     info && (info.mimeType || info.mime) ? String(info.mimeType || info.mime) : "",
+          size,
+          truncated
+        };
+      });
+      stream.on("error", reject);
+    });
+    bb.on("error", reject);
+    bb.on("close", () => resolve({ fields, file }));
+    req.pipe(bb);
+  });
+}
+
+function sanitizeDecoId(raw){
+  const s = String(raw || "").trim().toLowerCase();
+  return DECO_ID_RE.test(s) ? s : null;
+}
+
+function atlasPathUnder(id){
+  // path.join(DECORATIONS_DIR, id, "atlas.png") — id уже прошёл DECO_ID_RE,
+  // так что traversal невозможен; дополнительный assert на всякий случай.
+  const full = path.join(DECORATIONS_DIR, id, "atlas.png");
+  if (!full.startsWith(DECORATIONS_DIR + path.sep)) return null;
+  return full;
+}
+
+function adminDecoToWire(d){
+  if (!d) return null;
+  return {
+    id:        d.id,
+    title:     d.title || "",
+    price:     d.price | 0,
+    atlas:     d.atlas,
+    frames:    d.frames | 0,
+    fps:       d.fps | 0,
+    frameW:    d.frameW | 0,
+    frameH:    d.frameH | 0,
+    cols:      d.cols | 0,
+    rows:      d.rows | 0,
+    sortOrder: d.sortOrder | 0,
+    updatedAt: Number(d.updatedAt) || 0,
+    builtin:   typeof d.atlas === "string" && d.atlas.startsWith("/assets/")
+  };
+}
+
+app.get("/api/admin/decorations", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const me = getSession(req);
+  if (!isAdmin(me)) return res.status(403).json({ error: "forbidden" });
+  res.json({ catalog: DB.listDecorationCatalog().map(adminDecoToWire) });
+});
+
+// Статик-роут для загруженных атласов: отдаём DATA_DIR/decorations/<id>/
+// под URL /cdn/decorations/<id>/. fallthrough:false, чтобы 404 на отсутствующий
+// файл не улетел в SPA-fallback (иначе клиент получил бы index.html вместо
+// изображения и молча рендерил бы пустоту). immutable допустим: клиент
+// добавляет ?v=<updatedAt> к URL, так что после upsert’а браузер
+// автоматически перезапрашивает файл — старого кэша не будет.
+app.use("/cdn/decorations", express.static(DECORATIONS_DIR, {
+  fallthrough: false,
+  setHeaders: (res) => {
+    res.setHeader("Cache-Control", "public, max-age=31536000, immutable");
+  }
+}));
+
+app.post("/api/admin/decorations", async (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const me = getSession(req);
+  if (!isAdmin(me)) return res.status(403).json({ error: "forbidden" });
+  const ct = String(req.headers["content-type"] || "").toLowerCase();
+  if (!ct.startsWith("multipart/form-data")){
+    return res.status(415).json({ error: "multipart_required" });
+  }
+
+  let parsed;
+  try { parsed = await parseMultipartUpload(req); }
+  catch (e) {
+    console.error("[admin] upload parse error:", e);
+    return res.status(400).json({ error: "bad_multipart" });
+  }
+  const { fields, file } = parsed;
+
+  const id = sanitizeDecoId(fields.id);
+  if (!id) return res.status(400).json({ error: "bad_id" });
+
+  const existing = DB.getDecorationCatalogEntry(id);
+  const isBuiltin = existing && typeof existing.atlas === "string" && existing.atlas.startsWith("/assets/");
+
+  // Числовые поля: если есть в payload — валидируем, иначе (только при update)
+  // оставляем текущее значение. При create — все обязательны.
+  const pickInt = (key, min, max) => {
+    if (fields[key] == null || fields[key] === ""){
+      if (existing) return existing[key] | 0;
+      return null;
+    }
+    const n = parseInt(fields[key], 10);
+    if (!Number.isFinite(n) || n < min || n > max) return NaN;
+    return n;
+  };
+  const price  = pickInt("price",  0,       10_000_000);
+  const frames = pickInt("frames", 1,       512);
+  const fps    = pickInt("fps",    1,       60);
+  const frameW = pickInt("frameW", 1,       2048);
+  const frameH = pickInt("frameH", 1,       2048);
+  const cols   = pickInt("cols",   1,       64);
+  const rows   = pickInt("rows",   1,       64);
+  const sortOrderRaw = fields.sortOrder == null || fields.sortOrder === ""
+    ? (existing ? existing.sortOrder | 0 : 100)
+    : parseInt(fields.sortOrder, 10);
+  const sortOrder = Number.isFinite(sortOrderRaw) ? sortOrderRaw : 100;
+
+  for (const [k, v] of Object.entries({ price, frames, fps, frameW, frameH, cols, rows })){
+    if (v == null)       return res.status(400).json({ error: "missing_field", field: k });
+    if (Number.isNaN(v)) return res.status(400).json({ error: "bad_field",     field: k });
+  }
+  if (frames > cols * rows){
+    return res.status(400).json({ error: "frames_exceed_grid" });
+  }
+
+  const title = String(fields.title || "").slice(0, 80);
+
+  // Атлас: обязателен при создании и при upsert встроенного (иначе встроенные
+  // нельзя «переопределить» локальным файлом — оставляем поведение «админ
+  // хочет заменить встроенный атлас своим файлом → обязан загрузить файл»).
+  // При update загруженного без файла — сохраняем текущий atlas_path.
+  let atlasPath = existing && !isBuiltin ? existing.atlas : null;
+  if (file){
+    if (file.truncated) return res.status(413).json({ error: "atlas_too_large" });
+    if (file.size < 16) return res.status(400).json({ error: "atlas_empty" });
+    if (!file.buffer.slice(0, 8).equals(PNG_SIGNATURE)){
+      return res.status(400).json({ error: "atlas_not_png" });
+    }
+    const dest = atlasPathUnder(id);
+    if (!dest) return res.status(400).json({ error: "bad_id" });
+    try {
+      fs.mkdirSync(path.dirname(dest), { recursive: true });
+      fs.writeFileSync(dest, file.buffer);
+    } catch (e) {
+      console.error("[admin] atlas write failed:", e);
+      return res.status(500).json({ error: "atlas_write_failed" });
+    }
+    atlasPath = `/cdn/decorations/${id}/atlas.png`;
+  } else if (!atlasPath){
+    return res.status(400).json({ error: "atlas_required" });
+  }
+
+  const entry = DB.upsertDecoration({
+    id, title, price,
+    atlas: atlasPath,
+    frames, fps, frameW, frameH, cols, rows,
+    sortOrder
+  });
+  console.log(`[admin] ${me.id} ${existing ? "updated" : "created"} decoration ${id}`);
+  res.json({ ok: true, decoration: adminDecoToWire(entry) });
+});
+
+app.delete("/api/admin/decorations/:id", (req, res) => {
+  res.setHeader("Cache-Control", "no-store");
+  const me = getSession(req);
+  if (!isAdmin(me)) return res.status(403).json({ error: "forbidden" });
+  const id = sanitizeDecoId(req.params.id);
+  if (!id) return res.status(400).json({ error: "bad_id" });
+  const existed = DB.deleteDecoration(id);
+  if (!existed) return res.status(404).json({ error: "not_found" });
+  // Удаляем файл только для загруженных — встроенные под /assets/ трогать
+  // не нужно (их вообще нет в DECORATIONS_DIR). fs.rmSync recursive:true с
+  // force:true не швырнёт ENOENT, если папки нет.
+  try {
+    const dir = path.join(DECORATIONS_DIR, id);
+    if (dir.startsWith(DECORATIONS_DIR + path.sep)){
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  } catch(e) {
+    console.error("[admin] atlas cleanup failed for", id, ":", e);
+  }
+  console.log(`[admin] ${me.id} deleted decoration ${id}`);
+  res.json({ ok: true, id });
+});
+
 app.post("/api/decorations/select", (req, res) => {
   res.setHeader("Cache-Control", "no-store");
   const u = getSession(req);
   if (!u) return res.status(401).json({ error: "unauthorized" });
   const raw = req.query.id;
   const id = (raw === "" || raw == null || raw === "null") ? null : String(raw);
-  if (id && !DECORATION_IDS.has(id)) return res.status(400).json({ error: "unknown_decoration" });
+  if (id && !isKnownDecoration(id)) return res.status(400).json({ error: "unknown_decoration" });
   const r = DB.setSelectedDecoration(u, id);
   if (!r.ok) return res.status(403).json({ error: "not_owned" });
   res.json({

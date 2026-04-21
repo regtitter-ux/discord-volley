@@ -69,6 +69,12 @@
         <button class="icon-btn btn-admin hidden" id="btn-admin-add" data-i18n-title="admin.open" title="Изменить баланс" aria-label="Изменить баланс">
           <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M11 5h2v6h6v2h-6v6h-2v-6H5v-2h6z"/></svg>
         </button>
+        <!-- Admin shop — рядом с «+», те же правила видимости. Открывает модалку
+             управления каталогом украшений (загрузка нового атласа, цена,
+             удаление) — всё через admin-ручки, без редеплоя. -->
+        <button class="icon-btn btn-admin hidden" id="btn-admin-shop" data-i18n-title="admin.shop_open" title="Магазин украшений" aria-label="Магазин украшений">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true"><path fill="currentColor" d="M7 4h10l1.5 3H5.5L7 4zm-3 5h16v2H4V9zm1 3h14v8a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1v-8zm4 3v3h2v-3H9zm4 0v3h2v-3h-2z"/></svg>
+        </button>
         <div class="wallet wallet-trophies" id="trophies-menu" data-i18n-title="trophies.label" title="Кубки">
           <img class="coin trophy-ico" src="assets/trophy.svg" width="18" height="18" alt="" aria-hidden="true" decoding="async">
           <span class="wallet-value" id="trophies-value-menu">0</span>
@@ -232,6 +238,79 @@
         <input type="text" class="admin-input" id="admin-amount" data-i18n-placeholder="admin.amount" placeholder="Сумма (с + или −)" inputmode="text" required>
         <div class="admin-msg" id="admin-msg" aria-live="polite"></div>
         <button type="submit" class="btn btn-primary" data-i18n="admin.apply">Применить</button>
+      </form>
+    </div>
+  </div>
+
+  <!-- Admin shop: загрузка / редактирование / удаление украшений без
+       редеплоя. Всё упирается в /api/admin/decorations; сервер сам
+       санитизит id, валидирует PNG и принимает файл только от админа. -->
+  <div class="overlay hidden" id="admin-shop-modal" role="dialog" aria-modal="true" aria-labelledby="admin-shop-title">
+    <div class="overlay-box admin-shop-box">
+      <button class="icon-btn decorations-close" id="btn-admin-shop-close" data-i18n-aria="admin.close" aria-label="Закрыть">
+        <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true"><path fill="currentColor" d="M6.4 5 5 6.4 10.6 12 5 17.6 6.4 19l5.6-5.6 5.6 5.6 1.4-1.4L13.4 12 19 6.4 17.6 5 12 10.6z"/></svg>
+      </button>
+      <h3 id="admin-shop-title" data-i18n="admin.shop_title">Магазин украшений</h3>
+
+      <div class="admin-shop-list" id="admin-shop-list" role="list"></div>
+
+      <button type="button" class="btn btn-ghost admin-shop-new" id="btn-admin-shop-new" data-i18n="admin.shop_new">+ Новое украшение</button>
+
+      <form class="admin-shop-form hidden" id="admin-shop-form" autocomplete="off">
+        <div class="admin-shop-form-head" id="admin-shop-form-head" data-i18n="admin.shop_new_title">Новое украшение</div>
+        <div class="admin-shop-grid">
+          <label class="admin-shop-field admin-shop-field-wide">
+            <span data-i18n="admin.shop_id">ID</span>
+            <input type="text" id="admin-shop-id" pattern="[a-z0-9_-]{2,32}" maxlength="32" required>
+            <small data-i18n="admin.shop_id_hint">латиница, цифры, _ и −</small>
+          </label>
+          <label class="admin-shop-field admin-shop-field-wide">
+            <span data-i18n="admin.shop_title_lbl">Название</span>
+            <input type="text" id="admin-shop-title-in" maxlength="80">
+          </label>
+          <label class="admin-shop-field">
+            <span data-i18n="admin.shop_price">Цена</span>
+            <input type="number" id="admin-shop-price" min="0" required>
+          </label>
+          <label class="admin-shop-field">
+            <span data-i18n="admin.shop_sort">Порядок</span>
+            <input type="number" id="admin-shop-sort" value="100">
+          </label>
+          <label class="admin-shop-field">
+            <span data-i18n="admin.shop_frames">Кадров</span>
+            <input type="number" id="admin-shop-frames" min="1" max="512" required>
+          </label>
+          <label class="admin-shop-field">
+            <span data-i18n="admin.shop_fps">FPS</span>
+            <input type="number" id="admin-shop-fps" min="1" max="60" value="12" required>
+          </label>
+          <label class="admin-shop-field">
+            <span data-i18n="admin.shop_framew">Ширина кадра</span>
+            <input type="number" id="admin-shop-framew" min="1" max="2048" value="96" required>
+          </label>
+          <label class="admin-shop-field">
+            <span data-i18n="admin.shop_frameh">Высота кадра</span>
+            <input type="number" id="admin-shop-frameh" min="1" max="2048" value="96" required>
+          </label>
+          <label class="admin-shop-field">
+            <span data-i18n="admin.shop_cols">Cols</span>
+            <input type="number" id="admin-shop-cols" min="1" max="64" required>
+          </label>
+          <label class="admin-shop-field">
+            <span data-i18n="admin.shop_rows">Rows</span>
+            <input type="number" id="admin-shop-rows" min="1" max="64" required>
+          </label>
+        </div>
+        <label class="admin-shop-file">
+          <span data-i18n="admin.shop_atlas">Атлас (PNG-спрайтлист)</span>
+          <input type="file" id="admin-shop-atlas" accept="image/png,.png">
+          <small id="admin-shop-atlas-hint" data-i18n="admin.shop_atlas_hint">для нового украшения — обязателен; при правке — оставь пустым, чтобы не менять</small>
+        </label>
+        <div class="admin-shop-msg" id="admin-shop-msg" aria-live="polite"></div>
+        <div class="admin-shop-actions">
+          <button type="button" class="btn btn-ghost" id="btn-admin-shop-cancel" data-i18n="admin.shop_cancel">Отмена</button>
+          <button type="submit" class="btn btn-primary" id="btn-admin-shop-save" data-i18n="admin.shop_save">Сохранить</button>
+        </div>
       </form>
     </div>
   </div>

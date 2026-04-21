@@ -451,3 +451,40 @@ body.is-touch #cv{height:calc(100% - 84px - var(--safe-bot))}
 .admin-msg{min-height:18px;font-size:13px;color:var(--muted);text-align:center}
 .admin-msg.is-err{color:var(--red)}
 .admin-msg.is-ok{color:var(--green)}
+
+/* ---------- Admin shop (decorations CRUD) ---------- */
+#admin-shop-modal{z-index:60}
+.admin-shop-box{max-width:560px;padding:22px 20px 18px;text-align:left}
+.admin-shop-box h3{font-size:20px;margin-bottom:12px;text-align:center}
+.admin-shop-list{display:flex;flex-direction:column;gap:6px;max-height:44vh;overflow-y:auto;padding-right:4px;margin:0 -4px 10px -4px}
+.admin-shop-row{display:flex;align-items:center;gap:10px;padding:8px 10px;border-radius:10px;background:var(--bg-3)}
+.admin-shop-row.is-builtin{opacity:.9}
+.admin-shop-thumb{width:42px;height:42px;flex-shrink:0;border-radius:8px;background:var(--bg-2) center/cover no-repeat}
+.admin-shop-meta{flex:1;min-width:0;display:flex;flex-direction:column;gap:3px}
+.admin-shop-meta-title{font-weight:600;font-size:13px;color:var(--text);white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+.admin-shop-meta-sub{font-size:11px;color:var(--muted);display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.admin-shop-meta-sub .tag{padding:1px 6px;border-radius:999px;background:var(--bg-2);color:var(--muted);font-size:10px;letter-spacing:.02em;text-transform:uppercase}
+.admin-shop-actions-row{display:flex;gap:6px;flex-shrink:0}
+.admin-shop-actions-row .btn{padding:6px 10px;font-size:12px;border-radius:8px}
+.admin-shop-new{width:100%;margin-bottom:10px}
+.admin-shop-form{display:flex;flex-direction:column;gap:10px;padding:12px;border-radius:12px;background:var(--bg-3)}
+.admin-shop-form-head{font-weight:700;font-size:14px;text-align:center;color:var(--text)}
+.admin-shop-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:8px}
+.admin-shop-field{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}
+.admin-shop-field-wide{grid-column:1 / -1}
+.admin-shop-field input{padding:9px 10px;border-radius:8px;background:var(--bg-2);border:1px solid rgba(255,255,255,.06);color:var(--text);font:inherit}
+.admin-shop-field input:focus{outline:none;border-color:var(--blurple);background:var(--bg-hover)}
+.admin-shop-field small{font-size:10px;color:var(--muted);opacity:.8}
+.admin-shop-file{display:flex;flex-direction:column;gap:4px;font-size:12px;color:var(--muted)}
+.admin-shop-file input[type="file"]{font:inherit;color:var(--text)}
+.admin-shop-file small{font-size:11px;opacity:.8}
+.admin-shop-msg{min-height:18px;font-size:13px;color:var(--muted);text-align:center}
+.admin-shop-msg.is-err{color:var(--red)}
+.admin-shop-msg.is-ok{color:var(--green)}
+.admin-shop-actions{display:flex;gap:8px;justify-content:flex-end}
+.admin-shop-actions .btn{min-width:110px}
+@media (max-width:720px){
+  .admin-shop-box{max-width:calc(100% - 32px);padding:18px 14px 14px}
+  .admin-shop-grid{grid-template-columns:1fr}
+  .admin-shop-actions .btn{min-width:90px;flex:1}
+}
