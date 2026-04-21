@@ -43,6 +43,7 @@
       "admin.shop_frameh":     "Высота кадра",
       "admin.shop_cols":       "Колонок",
       "admin.shop_rows":       "Строк",
+      "admin.shop_advanced":   "Параметры атласа (60 кадров 96×96, 6×10, 12 FPS)",
       "admin.shop_atlas":      "Атлас (PNG или WebP)",
       "admin.shop_atlas_hint": "для нового украшения — обязателен; при правке — оставь пустым, чтобы не менять. WebP весит меньше",
       "admin.shop_save":       "Сохранить",

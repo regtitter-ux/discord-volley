@@ -3802,10 +3802,22 @@ const AdminShop = (function(){
     editingId = null;
     formHead.textContent = I18n.t("admin.shop_new_title");
     idIn.disabled = false;
+    idIn.value = "";
+    titleIn.value = "";
+    priceIn.value = "";
     sortIn.value = "100";
-    fpsIn.value  = "12";
+    // Дефолты под стандартный Discord-коллекшен-атлас (60 кадров сеткой 6×10,
+    // 96×96, 12 FPS). Поля всё ещё доступны через <details>, если попадётся
+    // нестандартный источник.
+    framesIn.value = "60";
+    fpsIn.value    = "12";
     frameWIn.value = "96";
     frameHIn.value = "96";
+    colsIn.value   = "6";
+    rowsIn.value   = "10";
+    atlasIn.value = "";
+    const advanced = document.getElementById("admin-shop-advanced");
+    if (advanced) advanced.open = false;
     showForm();
     setTimeout(()=> idIn.focus(), 30);
   }
@@ -3826,6 +3838,16 @@ const AdminShop = (function(){
     colsIn.value   = String(d.cols | 0);
     rowsIn.value   = String(d.rows | 0);
     atlasIn.value = "";
+    // Раскрываем «расширенные параметры» только если запись отличается от
+    // стандартного 60-кадрового 6×10 96×96 @12fps — иначе незачем мозолить
+    // глаза и ронять высоту модалки.
+    const advanced = document.getElementById("admin-shop-advanced");
+    if (advanced){
+      const nonDefault = (d.frames|0) !== 60 || (d.fps|0) !== 12
+        || (d.frameW|0) !== 96 || (d.frameH|0) !== 96
+        || (d.cols|0) !== 6 || (d.rows|0) !== 10;
+      advanced.open = nonDefault;
+    }
     showForm();
     setTimeout(()=> titleIn.focus(), 30);
   }

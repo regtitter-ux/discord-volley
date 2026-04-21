@@ -276,31 +276,36 @@
             <span data-i18n="admin.shop_sort">Порядок</span>
             <input type="number" id="admin-shop-sort" value="100">
           </label>
-          <label class="admin-shop-field">
-            <span data-i18n="admin.shop_frames">Кадров</span>
-            <input type="number" id="admin-shop-frames" min="1" max="512" required>
-          </label>
-          <label class="admin-shop-field">
-            <span data-i18n="admin.shop_fps">FPS</span>
-            <input type="number" id="admin-shop-fps" min="1" max="60" value="12" required>
-          </label>
-          <label class="admin-shop-field">
-            <span data-i18n="admin.shop_framew">Ширина кадра</span>
-            <input type="number" id="admin-shop-framew" min="1" max="2048" value="96" required>
-          </label>
-          <label class="admin-shop-field">
-            <span data-i18n="admin.shop_frameh">Высота кадра</span>
-            <input type="number" id="admin-shop-frameh" min="1" max="2048" value="96" required>
-          </label>
-          <label class="admin-shop-field">
-            <span data-i18n="admin.shop_cols">Cols</span>
-            <input type="number" id="admin-shop-cols" min="1" max="64" required>
-          </label>
-          <label class="admin-shop-field">
-            <span data-i18n="admin.shop_rows">Rows</span>
-            <input type="number" id="admin-shop-rows" min="1" max="64" required>
-          </label>
         </div>
+        <details class="admin-shop-advanced" id="admin-shop-advanced">
+          <summary data-i18n="admin.shop_advanced">Параметры атласа (60 кадров 96×96, 6×10, 12 FPS)</summary>
+          <div class="admin-shop-grid">
+            <label class="admin-shop-field">
+              <span data-i18n="admin.shop_frames">Кадров</span>
+              <input type="number" id="admin-shop-frames" min="1" max="512" value="60" required>
+            </label>
+            <label class="admin-shop-field">
+              <span data-i18n="admin.shop_fps">FPS</span>
+              <input type="number" id="admin-shop-fps" min="1" max="60" value="12" required>
+            </label>
+            <label class="admin-shop-field">
+              <span data-i18n="admin.shop_framew">Ширина кадра</span>
+              <input type="number" id="admin-shop-framew" min="1" max="2048" value="96" required>
+            </label>
+            <label class="admin-shop-field">
+              <span data-i18n="admin.shop_frameh">Высота кадра</span>
+              <input type="number" id="admin-shop-frameh" min="1" max="2048" value="96" required>
+            </label>
+            <label class="admin-shop-field">
+              <span data-i18n="admin.shop_cols">Cols</span>
+              <input type="number" id="admin-shop-cols" min="1" max="64" value="6" required>
+            </label>
+            <label class="admin-shop-field">
+              <span data-i18n="admin.shop_rows">Rows</span>
+              <input type="number" id="admin-shop-rows" min="1" max="64" value="10" required>
+            </label>
+          </div>
+        </details>
         <label class="admin-shop-file">
           <span data-i18n="admin.shop_atlas">Атлас (PNG или WebP)</span>
           <input type="file" id="admin-shop-atlas" accept="image/png,image/webp,.png,.webp">
