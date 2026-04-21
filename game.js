@@ -3797,15 +3797,31 @@ const AdminShop = (function(){
     setMsg("", "");
   }
 
+  // Авто-подсказка ID/sortOrder на основе последней записи в каталоге:
+  // серверный list отсортирован по sort_order ASC, так что catalog[last] —
+  // «самое недавнее». Если id кончается числом (deco4 → deco5) —
+  // инкрементим трейлинг. Иначе оставляем пусто, чтобы админ ввёл сам.
+  function suggestNextDefaults(){
+    const items = Array.isArray(catalog) ? catalog : [];
+    if (!items.length) return { id: "deco1", sortOrder: 1 };
+    const last = items[items.length - 1];
+    const m = /^(.*?)(\d+)$/.exec(last.id || "");
+    const nextId = m ? (m[1] + (parseInt(m[2], 10) + 1)) : "";
+    const maxSort = items.reduce((a, d) => Math.max(a, d.sortOrder | 0), 0);
+    return { id: nextId, sortOrder: maxSort + 1 };
+  }
+
   function openNew(){
     hideForm();
     editingId = null;
     formHead.textContent = I18n.t("admin.shop_new_title");
     idIn.disabled = false;
-    idIn.value = "";
+    const next = suggestNextDefaults();
+    idIn.value = next.id;
+    sortIn.value = String(next.sortOrder);
     titleIn.value = "";
-    priceIn.value = "";
-    sortIn.value = "100";
+    // Типичная цена украшения — 10k; если нужно иначе, админ перебьёт руками.
+    priceIn.value = "10000";
     // Дефолты под стандартный Discord-коллекшен-атлас (60 кадров сеткой 6×10,
     // 96×96, 12 FPS). Поля всё ещё доступны через <details>, если попадётся
     // нестандартный источник.
@@ -3819,7 +3835,9 @@ const AdminShop = (function(){
     const advanced = document.getElementById("admin-shop-advanced");
     if (advanced) advanced.open = false;
     showForm();
-    setTimeout(()=> idIn.focus(), 30);
+    // Фокус на title: id и price уже заполнены, админу остаётся только
+    // назвать украшение и выбрать файл атласа.
+    setTimeout(()=> titleIn.focus(), 30);
   }
 
   function openEdit(d){
