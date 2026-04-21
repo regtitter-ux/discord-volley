@@ -2312,12 +2312,16 @@ const Game = (function(){
     drawPlayer(p2, playerUser(2));
     drawServeIndicator();
     drawBall();
-    drawBallOffscreenIndicator();
     drawParticles();
     drawEmotes();
     drawBigText();
 
     ctx.restore();
+
+    // Off-screen мяч-индикатор живёт в canvas-space (вне world-clip),
+    // чтобы его можно было прижать к нижнему краю HUD-панельки, а не
+    // к верхней границе мира (которая при cover-fit уходит за canvas).
+    drawBallOffscreenIndicator();
   }
 
   // Tiny blinking dots scattered across the sky.
@@ -2900,37 +2904,55 @@ const Game = (function(){
     ctx.restore();
   }
 
-  // Когда мяч улетает выше видимой области, рисуем у верхней границы
-  // поля стрелку, указывающую вверх, и едущую по X за мячом. Цвет в
-  // тон мяча (amber), обводка под Discord-палитру — заметно, но
-  // вписывается в HUD (serve-indicator треугольники рисованы похоже).
+  // Когда мяч улетает выше видимой области, рисуем прямо под HUD-панелькой
+  // со счётом стрелку, указывающую вверх, и едущую по X за мячом. Работаем
+  // в canvas-space (после ctx.restore()), чтобы стрелка гарантированно
+  // оказалась ниже HUD DOM-элемента, а не упиралась в верхнюю границу мира
+  // (при cover-fit она выезжает за canvas). Цвет в тон мяча (amber).
+  const _hudBarEl = document.querySelector(".hud");
   function drawBallOffscreenIndicator(){
     if(!ball) return;
     if(_ballHiddenTeleport) return;
     const offTop = -ball.renderY;
     if(offTop <= ball.r) return;
-    // 0..24 мировых px: плавное появление, чтобы не «щёлкал» при
-    // выходе мяча за край. Дальше держим на полном.
     const alpha = Math.min(1, (offTop - ball.r) / 24);
     if(alpha <= 0) return;
 
-    const margin = ball.r * 1.4 + 8;
-    const ix = Math.max(margin, Math.min(WORLD_W - margin, ball.renderX));
-    const iy = 22;
+    const canvasRect = canvas.getBoundingClientRect();
+    if(!canvasRect.width || !canvasRect.height) return;
+    const physPerCss = canvas.width / canvasRect.width;
+
+    // Нижний край HUD в канвас-физических пикселях + отступ. Fallback на
+    // фикс. значение, если по какой-то причине HUD не нашёлся.
+    let iy;
+    if(_hudBarEl){
+      const hr = _hudBarEl.getBoundingClientRect();
+      iy = (hr.bottom - canvasRect.top + 10) * physPerCss;
+    } else {
+      iy = 64 * physPerCss;
+    }
+
+    // X мяча в canvas-space (поверх world-transform). Мяч может быть
+    // ball.renderX > WORLD_W / < 0 при сильном боковом вылете — клампим,
+    // чтобы стрелка жила в кадре.
+    const bxWorld = Math.max(0, Math.min(WORLD_W, ball.renderX));
+    const bxCanvas = offsetX + bxWorld * scale;
     const pulse = 1 + 0.08 * Math.sin(matchTime * 7);
-    const w = 28 * pulse, h = 24 * pulse;
+    const w = 30 * physPerCss * pulse;
+    const h = 26 * physPerCss * pulse;
+    const edgePad = w * 0.5 + 8 * physPerCss;
+    const ix = Math.max(edgePad, Math.min(canvas.width - edgePad, bxCanvas));
 
     ctx.save();
     ctx.globalAlpha = alpha;
     ctx.translate(ix, iy);
-    // Мягкая тень-свечение, чтобы стрелка читалась на небе и на песке.
     ctx.shadowColor = "rgba(0,0,0,0.35)";
-    ctx.shadowBlur = 6;
-    ctx.shadowOffsetY = 2;
+    ctx.shadowBlur = 6 * physPerCss;
+    ctx.shadowOffsetY = 2 * physPerCss;
     ctx.fillStyle = "#f0b232";
     ctx.strokeStyle = "rgba(15,16,18,0.75)";
     ctx.lineJoin = "round";
-    ctx.lineWidth = 2.5;
+    ctx.lineWidth = 2.5 * physPerCss;
     ctx.beginPath();
     ctx.moveTo(0, -h * 0.55);
     ctx.lineTo(w * 0.5, h * 0.45);
