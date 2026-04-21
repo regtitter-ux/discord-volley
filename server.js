@@ -581,6 +581,19 @@ const Busboy = require("busboy");
 const DECO_ID_RE = /^[a-z0-9_-]{2,32}$/;
 const DECO_ATLAS_MAX_BYTES = Number(process.env.DV_ATLAS_MAX_BYTES) || 10 * 1024 * 1024;
 const PNG_SIGNATURE = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
+// WebP: "RIFF" + 4-byte size + "WEBP" в первых 12 байтах. WebP даёт тот же
+// результат в CSS background-image, но заметно меньше веса для 60-кадровых
+// атласов — поэтому админ-аплоад принимает оба формата.
+const WEBP_RIFF_SIG = Buffer.from("RIFF", "ascii");
+const WEBP_WEBP_SIG = Buffer.from("WEBP", "ascii");
+function detectAtlasFormat(buf){
+  if (!Buffer.isBuffer(buf)) return null;
+  if (buf.length >= 8 && buf.slice(0, 8).equals(PNG_SIGNATURE)) return "png";
+  if (buf.length >= 12
+      && buf.slice(0, 4).equals(WEBP_RIFF_SIG)
+      && buf.slice(8, 12).equals(WEBP_WEBP_SIG)) return "webp";
+  return null;
+}
 
 function parseMultipartUpload(req){
   return new Promise((resolve, reject) => {
@@ -625,10 +638,11 @@ function sanitizeDecoId(raw){
   return DECO_ID_RE.test(s) ? s : null;
 }
 
-function atlasPathUnder(id){
-  // path.join(DECORATIONS_DIR, id, "atlas.png") — id уже прошёл DECO_ID_RE,
+function atlasPathUnder(id, ext){
+  // id уже прошёл DECO_ID_RE, ext — строго "png" | "webp" после detect'a,
   // так что traversal невозможен; дополнительный assert на всякий случай.
-  const full = path.join(DECORATIONS_DIR, id, "atlas.png");
+  if (ext !== "png" && ext !== "webp") return null;
+  const full = path.join(DECORATIONS_DIR, id, `atlas.${ext}`);
   if (!full.startsWith(DECORATIONS_DIR + path.sep)) return null;
   return full;
 }
@@ -736,19 +750,28 @@ app.post("/api/admin/decorations", async (req, res) => {
   if (file){
     if (file.truncated) return res.status(413).json({ error: "atlas_too_large" });
     if (file.size < 16) return res.status(400).json({ error: "atlas_empty" });
-    if (!file.buffer.slice(0, 8).equals(PNG_SIGNATURE)){
-      return res.status(400).json({ error: "atlas_not_png" });
+    const ext = detectAtlasFormat(file.buffer);
+    if (!ext){
+      return res.status(400).json({ error: "atlas_bad_format" });
     }
-    const dest = atlasPathUnder(id);
+    const dest = atlasPathUnder(id, ext);
     if (!dest) return res.status(400).json({ error: "bad_id" });
     try {
       fs.mkdirSync(path.dirname(dest), { recursive: true });
       fs.writeFileSync(dest, file.buffer);
+      // Сменили формат (png→webp или наоборот) — подчищаем старый файл,
+      // иначе оба атласа осядут в папке, а `?v=<ts>` не спасёт от того, что
+      // в DB теперь указывает на новый ext, а старый так и лежит занятым.
+      const otherExt = ext === "png" ? "webp" : "png";
+      const otherDest = atlasPathUnder(id, otherExt);
+      if (otherDest && fs.existsSync(otherDest)){
+        try { fs.unlinkSync(otherDest); } catch(_){}
+      }
     } catch (e) {
       console.error("[admin] atlas write failed:", e);
       return res.status(500).json({ error: "atlas_write_failed" });
     }
-    atlasPath = `/cdn/decorations/${id}/atlas.png`;
+    atlasPath = `/cdn/decorations/${id}/atlas.${ext}`;
   } else if (!atlasPath){
     return res.status(400).json({ error: "atlas_required" });
   }

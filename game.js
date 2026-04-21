@@ -3848,7 +3848,7 @@ const AdminShop = (function(){
       case "bad_id":            return "admin.shop_err_id";
       case "missing_field":
       case "bad_field":         return "admin.shop_err_field";
-      case "atlas_not_png":     return "admin.shop_err_png";
+      case "atlas_bad_format":  return "admin.shop_err_format";
       case "atlas_too_large":   return "admin.shop_err_big";
       case "frames_exceed_grid":return "admin.shop_err_grid";
       case "atlas_required":    return "admin.shop_err_atlas_req";

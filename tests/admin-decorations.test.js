@@ -15,6 +15,12 @@ const PNG_SIG = Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]);
 function fakePng(extra = 32){
   return Buffer.concat([PNG_SIG, Buffer.alloc(extra)]);
 }
+// RIFF + 4-byte little-endian размера + WEBP — минимально корректная "шапка"
+// для нашей magic-byte проверки. Серверу достаточно первых 12 байт.
+function fakeWebp(extra = 32){
+  const head = Buffer.from("RIFF\x00\x00\x00\x00WEBP", "ascii");
+  return Buffer.concat([head, Buffer.alloc(extra)]);
+}
 
 async function loginAs(id){
   return await devLogin(srv.baseUrl, id, id);
@@ -122,19 +128,19 @@ test("POST /api/admin/decorations: upsert создаёт и обновляет; 
   assert.equal(j2.decoration.price, 3500);
 });
 
-test("POST /api/admin/decorations: валидация (PNG-signature, frames_exceed_grid, atlas_required)", async () => {
+test("POST /api/admin/decorations: валидация (atlas_bad_format, frames_exceed_grid, atlas_required)", async () => {
   const admin = await loginAs("admin-1");
 
-  // Не-PNG файл
-  const notPng = Buffer.from("hello-not-png-12345678");
+  // Не-PNG и не-WebP файл
+  const notImg = Buffer.from("hello-not-image-12345678");
   const fd1 = buildForm({
     id: "badpng", price: 100, frames: 1, fps: 12, frameW: 16, frameH: 16, cols: 1, rows: 1
-  }, notPng);
+  }, notImg);
   const r1 = await fetch(srv.baseUrl + "/api/admin/decorations", {
     method: "POST", headers: { Cookie: admin }, body: fd1
   });
   assert.equal(r1.status, 400);
-  assert.equal((await r1.json()).error, "atlas_not_png");
+  assert.equal((await r1.json()).error, "atlas_bad_format");
 
   // Create без файла → atlas_required
   const fd2 = buildForm({
@@ -204,6 +210,67 @@ test("DELETE /api/admin/decorations/:id: удаляет запись + сбра�
   const pub = await apiJson("/api/decorations", { headers: { Cookie: user } });
   const found = pub.body.catalog.find(d => d.id === "ghostdec");
   assert.equal(found, undefined);
+});
+
+test("POST /api/admin/decorations: WebP-атлас принимается, URL заканчивается на .webp", async () => {
+  const admin = await loginAs("admin-1");
+
+  const fd = buildForm({
+    id: "webpdec", title: "WebP Deco", price: 500,
+    frames: 1, fps: 12, frameW: 32, frameH: 32, cols: 1, rows: 1
+  }, fakeWebp(64));
+  const r = await fetch(srv.baseUrl + "/api/admin/decorations", {
+    method: "POST", headers: { Cookie: admin }, body: fd
+  });
+  assert.equal(r.status, 200);
+  const j = await r.json();
+  assert.match(j.decoration.atlas, /^\/cdn\/decorations\/webpdec\/atlas\.webp$/);
+
+  // Публичный каталог отдаёт тот же URL + cache-buster
+  const user = await loginAs("user-webp");
+  const pub = await apiJson("/api/decorations", { headers: { Cookie: user } });
+  const entry = pub.body.catalog.find(d => d.id === "webpdec");
+  assert.ok(entry, "webpdec must be in public catalog");
+  assert.match(entry.atlas, /^\/cdn\/decorations\/webpdec\/atlas\.webp\?v=\d+$/);
+
+  // Файл реально доступен
+  const atlasResp = await fetch(srv.baseUrl + entry.atlas);
+  assert.equal(atlasResp.status, 200);
+  const buf = Buffer.from(await atlasResp.arrayBuffer());
+  assert.equal(buf.slice(0, 4).toString("ascii"), "RIFF");
+  assert.equal(buf.slice(8, 12).toString("ascii"), "WEBP");
+});
+
+test("POST /api/admin/decorations: смена формата png→webp подчищает старый файл", async () => {
+  const admin = await loginAs("admin-1");
+
+  // Загружаем как PNG
+  const fd1 = buildForm({
+    id: "swapfmt", title: "Swap", price: 0,
+    frames: 1, fps: 12, frameW: 16, frameH: 16, cols: 1, rows: 1
+  }, fakePng(64));
+  const r1 = await fetch(srv.baseUrl + "/api/admin/decorations", {
+    method: "POST", headers: { Cookie: admin }, body: fd1
+  });
+  assert.equal(r1.status, 200);
+  const j1 = await r1.json();
+  assert.match(j1.decoration.atlas, /atlas\.png$/);
+
+  // Та же запись, но теперь WebP
+  const fd2 = buildForm({
+    id: "swapfmt", title: "Swap", price: 0,
+    frames: 1, fps: 12, frameW: 16, frameH: 16, cols: 1, rows: 1
+  }, fakeWebp(64));
+  const r2 = await fetch(srv.baseUrl + "/api/admin/decorations", {
+    method: "POST", headers: { Cookie: admin }, body: fd2
+  });
+  assert.equal(r2.status, 200);
+  const j2 = await r2.json();
+  assert.match(j2.decoration.atlas, /atlas\.webp$/);
+
+  // Старый URL должен отдать 404 (а не stale-картинку) — файл снесён
+  const staleResp = await fetch(srv.baseUrl + "/cdn/decorations/swapfmt/atlas.png");
+  assert.equal(staleResp.status, 404);
 });
 
 test("POST /api/admin/decorations: 415 на не-multipart запрос", async () => {
