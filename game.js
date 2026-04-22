@@ -760,6 +760,10 @@ let _resizeCount = 0; // счётчик для тестов: сколько ра
 function resizeCanvas(){
   if (_resizeScheduled) return;
   _resizeCanvasNow();
+  // Любой ресайз → инвалидируем кеш rect'ов, которым пользуется
+  // drawBallOffscreenIndicator. Фоллбэк на условие — на случай если Game
+  // IIFE ещё не подгрузилась на момент первого вызова.
+  if (typeof window.__dvInvalidateLayout === "function") window.__dvInvalidateLayout();
   _resizeScheduled = true;
   requestAnimationFrame(() => { _resizeScheduled = false; });
 }
@@ -2910,6 +2914,35 @@ const Game = (function(){
   // оказалась ниже HUD DOM-элемента, а не упиралась в верхнюю границу мира
   // (при cover-fit она выезжает за canvas). Цвет в тон мяча (amber).
   const _hudBarEl = document.querySelector(".hud");
+  // Layout-кеш: getBoundingClientRect на canvas+HUD внутри rAF-цикла даёт
+  // forced reflow, если в том же кадре где-то был DOM-write (а HUD со счётом
+  // как раз пишется textContent при каждом очке). Читаем rect'ы один раз
+  // после resize/scroll — в стабильном кадре 0 layout-query.
+  let _layoutDirty = true;
+  let _cachedCanvasTop = 0;
+  let _cachedPhysPerCss = 1;
+  let _cachedHudBottomCss = 0;
+  let _cachedHudValid = false;
+  function _invalidateLayoutCache(){ _layoutDirty = true; }
+  // Пробрасываем наружу IIFE: resizeCanvas() и ResizeObserver определены в
+  // модульном scope и не видят локальный _invalidateLayoutCache.
+  window.__dvInvalidateLayout = _invalidateLayoutCache;
+  window.addEventListener("scroll", _invalidateLayoutCache, { passive: true });
+  function _refreshLayoutCache(){
+    const canvasRect = canvas.getBoundingClientRect();
+    if(!canvasRect.width || !canvasRect.height) return false;
+    _cachedCanvasTop  = canvasRect.top;
+    _cachedPhysPerCss = canvas.width / canvasRect.width;
+    if(_hudBarEl){
+      const hr = _hudBarEl.getBoundingClientRect();
+      _cachedHudBottomCss = hr.bottom;
+      _cachedHudValid = true;
+    } else {
+      _cachedHudValid = false;
+    }
+    _layoutDirty = false;
+    return true;
+  }
   function drawBallOffscreenIndicator(){
     if(!ball) return;
     if(_ballHiddenTeleport) return;
@@ -2918,19 +2951,14 @@ const Game = (function(){
     const alpha = Math.min(1, (offTop - ball.r) / 24);
     if(alpha <= 0) return;
 
-    const canvasRect = canvas.getBoundingClientRect();
-    if(!canvasRect.width || !canvasRect.height) return;
-    const physPerCss = canvas.width / canvasRect.width;
+    if(_layoutDirty && !_refreshLayoutCache()) return;
+    const physPerCss = _cachedPhysPerCss;
 
     // Нижний край HUD в канвас-физических пикселях + отступ. Fallback на
     // фикс. значение, если по какой-то причине HUD не нашёлся.
-    let iy;
-    if(_hudBarEl){
-      const hr = _hudBarEl.getBoundingClientRect();
-      iy = (hr.bottom - canvasRect.top + 10) * physPerCss;
-    } else {
-      iy = 64 * physPerCss;
-    }
+    const iy = _cachedHudValid
+      ? (_cachedHudBottomCss - _cachedCanvasTop + 10) * physPerCss
+      : 64 * physPerCss;
 
     // X мяча в canvas-space (поверх world-transform). Мяч может быть
     // ball.renderX > WORLD_W / < 0 при сильном боковом вылете — клампим,
