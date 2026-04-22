@@ -128,17 +128,23 @@ function openDb(dataDir){
           avatar_url  = COALESCE(?4, avatar_url)
       WHERE id = ?1
     `),
+    // UPDATE ... RETURNING — одна синхронная операция вместо двух (UPDATE +
+    // SELECT). На hot-path rally.hit это снимает один sync SQLite round-trip
+    // на каждый +1 coin; при ~4 rally.hit/сек на матч и десятках матчей
+    // event loop получает вдвое меньше блокирующих I/O-пауз.
     addCoins: db.prepare(`
       UPDATE users
       SET coins = MAX(0, coins + ?2),
           updated_at = ?3
       WHERE id = ?1
+      RETURNING coins
     `),
     addTrophies: db.prepare(`
       UPDATE users
       SET trophies = MAX(0, trophies + ?2),
           updated_at = ?3
       WHERE id = ?1
+      RETURNING trophies
     `),
     getCoins: db.prepare("SELECT coins FROM users WHERE id = ?"),
     getTrophies: db.prepare("SELECT trophies FROM users WHERE id = ?"),
@@ -254,16 +260,27 @@ function openDb(dataDir){
     return r ? (r.trophies | 0) : 0;
   }
 
+  // Hot-path wallet writes. Пробуем UPDATE ... RETURNING сразу — если юзер
+  // уже в таблице (99.9% award'ов — rally.hit в уже начатом матче), один
+  // sync-вызов делает всё. Только при cold-miss (первый award у юзера без
+  // записи) платим за ensureUser + retry. Старое поведение было: ensureUser
+  // безусловно (3 ops) + UPDATE + SELECT = 5 ops на КАЖДЫЙ rally.hit.
   function addCoins(user, delta){
+    if (!user || !user.id) return 0;
+    const row = stmts.addCoins.get(user.id, delta | 0, Date.now());
+    if (row) return row.coins | 0;
     ensureUser(user);
-    stmts.addCoins.run(user.id, delta | 0, Date.now());
-    return getCoins(user.id);
+    const r2 = stmts.addCoins.get(user.id, delta | 0, Date.now());
+    return r2 ? (r2.coins | 0) : 0;
   }
 
   function addTrophies(user, delta){
+    if (!user || !user.id) return 0;
+    const row = stmts.addTrophies.get(user.id, delta | 0, Date.now());
+    if (row) return row.trophies | 0;
     ensureUser(user);
-    stmts.addTrophies.run(user.id, delta | 0, Date.now());
-    return getTrophies(user.id);
+    const r2 = stmts.addTrophies.get(user.id, delta | 0, Date.now());
+    return r2 ? (r2.trophies | 0) : 0;
   }
 
   function getDecorations(id){
