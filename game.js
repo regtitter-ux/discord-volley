@@ -2504,17 +2504,20 @@ const Game = (function(){
     // effective[i] = lerp(trail[i+1], trail[i]).
     const a = renderAlpha;
     const inv = 1 / TRAIL_LEN;
+    // fillStyle + globalAlpha вместо "rgba(...," + a + ")" на каждой точке:
+    // снимает 8 string-аллокаций/кадр (~480/сек) из GC hot-path.
+    ctx.fillStyle = "#ffffff";
     for(let i = 1; i < trailCount - 1; i++){
       const cIdx = (trailHead - i + TRAIL_LEN) % TRAIL_LEN;
       const oIdx = (trailHead - (i+1) + TRAIL_LEN) % TRAIL_LEN;
       const x = trailX[oIdx] + (trailX[cIdx] - trailX[oIdx]) * a;
       const y = trailY[oIdx] + (trailY[cIdx] - trailY[oIdx]) * a;
       const t = i * inv;
-      const alpha = (1 - t) * 0.35;
       const r = ball.r * (1 - t*0.6);
-      ctx.fillStyle = "rgba(255,255,255," + alpha + ")";
+      ctx.globalAlpha = (1 - t) * 0.35;
       ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill();
     }
+    ctx.globalAlpha = 1;
   }
 
   function drawParticles(){
