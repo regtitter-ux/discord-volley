@@ -3357,6 +3357,11 @@ function makeAI(difficulty, rand){
     return x;
   }
 
+  // Reused output object — decide() вызывается 60–120 раз/сек и свежий литерал
+  // на каждый тик создаёт заметное GC-давление (особенно в bot-mode, где это
+  // единственный per-tick allocator).
+  const out = { left:false, right:false, jump:false };
+
   return {
     decide(p, ball, dt){
       t += dt;
@@ -3371,7 +3376,7 @@ function makeAI(difficulty, rand){
       const home = WORLD_W * 0.75 - 50*cfg.homeBias;
       const aim  = onMySide ? target : home;
 
-      const out = { left:false, right:false, jump:false };
+      out.left = false; out.right = false; out.jump = false;
       const dx = aim - p.x;
       // Easy AI occasionally just stands still ("thinking") to give the player
       // a chance to score cleanly.
