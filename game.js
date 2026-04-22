@@ -2990,9 +2990,16 @@ const Game = (function(){
     ctx.save();
     ctx.globalAlpha = alpha;
     ctx.translate(ix, iy);
-    ctx.shadowColor = "rgba(0,0,0,0.35)";
-    ctx.shadowBlur = 6 * physPerCss;
-    ctx.shadowOffsetY = 2 * physPerCss;
+    // Дешёвая тень через смещённую залитую path вместо shadowBlur — последний
+    // стоит 2–5 ms/кадр на HiDPI, пока стрелка на экране.
+    const shadowOff = 2 * physPerCss;
+    ctx.fillStyle = "rgba(0,0,0,0.35)";
+    ctx.beginPath();
+    ctx.moveTo(0, -h * 0.55 + shadowOff);
+    ctx.lineTo(w * 0.5, h * 0.45 + shadowOff);
+    ctx.lineTo(-w * 0.5, h * 0.45 + shadowOff);
+    ctx.closePath();
+    ctx.fill();
     ctx.fillStyle = "#f0b232";
     ctx.strokeStyle = "rgba(15,16,18,0.75)";
     ctx.lineJoin = "round";
