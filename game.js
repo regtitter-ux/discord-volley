@@ -2381,10 +2381,21 @@ const Game = (function(){
   }
 
   // Soft Blurple halo behind the net, so it reads against the dark backdrop.
+  // Запекаем radial-gradient в 360×360 sprite один раз и bl'итим drawImage:
+  // fillRect+radial-gradient каждый кадр стоит 0.5–1 ms на ЦПУ-растеризации.
+  let _netHaloSprite = null;
   function drawNetHalo(){
     const cx = NET_X, cy = GROUND_Y - NET_H * 0.55;
-    ctx.fillStyle = netHaloGrad();
-    ctx.fillRect(cx - 180, cy - 180, 360, 360);
+    if(!_netHaloSprite){
+      _netHaloSprite = _makeOffscreen(360, 360);
+      const g = _netHaloSprite.getContext("2d");
+      const rg = g.createRadialGradient(180, 180, 0, 180, 180, 180);
+      rg.addColorStop(0, "rgba(88,101,242,0.22)");
+      rg.addColorStop(1, "rgba(88,101,242,0)");
+      g.fillStyle = rg;
+      g.fillRect(0, 0, 360, 360);
+    }
+    ctx.drawImage(_netHaloSprite, cx - 180, cy - 180, 360, 360);
   }
 
   // Каждое облако — набор статичных векторных фигур. Один раз рендерим
@@ -2632,7 +2643,7 @@ const Game = (function(){
 
   // Кэш статичных градиентов: форма фиксирована, цвета не меняются — создаём
   // объекты лениво один раз, вместо пересоздания каждый кадр.
-  let _netHaloGrad = null, _netPostsGrad = null,
+  let _netPostsGrad = null,
       _ballNormalGrad = null, _ballFlashGrad = null;
 
   const BALL_TEX = new Image();
@@ -2680,15 +2691,6 @@ const Game = (function(){
     _backdropSpriteQ = q;
   }
 
-  function netHaloGrad(){
-    if(_netHaloGrad) return _netHaloGrad;
-    const cx = NET_X, cy = GROUND_Y - NET_H * 0.55;
-    const g = ctx.createRadialGradient(cx, cy, 0, cx, cy, 180);
-    g.addColorStop(0, "rgba(88,101,242,0.22)");
-    g.addColorStop(1, "rgba(88,101,242,0)");
-    _netHaloGrad = g;
-    return g;
-  }
   function netPostsGrad(){
     if(_netPostsGrad) return _netPostsGrad;
     const left = NET_X - NET_W*0.5;
