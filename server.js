@@ -1156,6 +1156,24 @@ setInterval(() => {
   });
 }, 5000).unref();
 
+// WS heartbeat ping/pong. Без него мёртвые сокеты (уснувший Wi-Fi, сбой NAT)
+// обнаруживались только по накоплению bufferedAmount > 2MB (sweep выше),
+// т.е. когда в буфер уже успели загрузиться сотни снапшотов → лишнее
+// давление на память и GC живых матчей. Теперь раз в HEARTBEAT_MS шлём
+// ping: если клиент не ответил pong'ом до следующего тика — terminate.
+const WS_HEARTBEAT_MS = Number(process.env.WS_HEARTBEAT_MS) || 20000;
+setInterval(() => {
+  wss.clients.forEach(c => {
+    if (c.readyState !== 1) return;
+    if (c._alive === false){
+      try { c.terminate(); } catch {}
+      return;
+    }
+    c._alive = false;
+    try { c.ping(); } catch {}
+  });
+}, WS_HEARTBEAT_MS).unref();
+
 // Token bucket на входящие сообщения — 120 msg/s с бёрстом 60. Защищает
 // relay и switch от флуда одним клиентом. Сверх бюджета — тихо дропаем
 // (ответ об ошибке сам по себе стоил бы ресурсов).
@@ -1447,6 +1465,10 @@ wss.on("connection", async (ws, req) => {
   ws.activeMatchId = null;
   ws._tokens       = MSG_BURST;
   ws._tokensT      = Date.now();
+  // Heartbeat: pong от клиента сбрасывает флаг в true. Sweep выше каждые
+  // WS_HEARTBEAT_MS проверит, был ли pong, и terminate'нет, если нет.
+  ws._alive = true;
+  ws.on("pong", () => { ws._alive = true; });
   // wsId — стабильный идентификатор клиента на время жизни WebSocket-коннекта,
   // общий для всех инстансов через Redis. В local-режиме тоже нужен:
   // publishRoom использует его как senderId, чтобы не отправлять эхо себе.
