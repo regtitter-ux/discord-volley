@@ -2384,6 +2384,25 @@ const Game = (function(){
   // Запекаем radial-gradient в 360×360 sprite один раз и bl'итим drawImage:
   // fillRect+radial-gradient каждый кадр стоит 0.5–1 ms на ЦПУ-растеризации.
   let _netHaloSprite = null;
+  // Flash-overlay для мяча при hit: прозрачный круг с жёлтым glow внутри.
+  // Размер спрайта привязан к физическому радиусу — при ресайзе инвалидируем.
+  let _ballFlashOverlay = null;
+  let _ballFlashOverlayR = 0;
+  function _getBallFlashOverlay(r){
+    const side = Math.max(8, Math.ceil(r * 2));
+    if(_ballFlashOverlay && _ballFlashOverlayR === side) return _ballFlashOverlay;
+    _ballFlashOverlay = _makeOffscreen(side, side);
+    const g = _ballFlashOverlay.getContext("2d");
+    const cx = side * 0.5, cy = side * 0.5;
+    const rg = g.createRadialGradient(cx, cy, 0, cx, cy, cx);
+    rg.addColorStop(0,    "rgba(255,247,194,1)");
+    rg.addColorStop(0.55, "rgba(255,230,130,0.55)");
+    rg.addColorStop(1,    "rgba(255,200,80,0)");
+    g.fillStyle = rg;
+    g.beginPath(); g.arc(cx, cy, cx, 0, Math.PI*2); g.fill();
+    _ballFlashOverlayR = side;
+    return _ballFlashOverlay;
+  }
   function drawNetHalo(){
     const cx = NET_X, cy = GROUND_Y - NET_H * 0.55;
     if(!_netHaloSprite){
@@ -2932,16 +2951,17 @@ const Game = (function(){
     if(BALL_TEX.complete && BALL_TEX.naturalWidth){
       ctx.drawImage(BALL_TEX, -ball.r, -ball.r, ball.r*2, ball.r*2);
       if(hitFlash > 0){
-        // На PC мяч ~96 px — overlay #fff7c2 с "lighter" при alpha 0.55
-        // заметно обесцвечивает текстуру. На мобилке ~12 px это незаметно.
-        // Снижаем кап и скорость нарастания, чтобы вспышка подчёркивала удар,
-        // а не выжигала оранжевый.
-        ctx.save();
-        ctx.globalCompositeOperation = "lighter";
-        ctx.globalAlpha = Math.min(0.28, hitFlash * 1.4);
-        ctx.fillStyle = "#fff7c2";
-        ctx.beginPath(); ctx.arc(0, 0, ball.r, 0, Math.PI*2); ctx.fill();
-        ctx.restore();
+        // Bake прозрачный градиентный overlay в sprite и blit через drawImage
+        // (source-over) вместо `globalCompositeOperation="lighter"`: смена
+        // композит-режима каждый кадр пока hitFlash>0 форсирует GPU batch flush
+        // и давала классический микрофриз на миг после столкновения.
+        const overlay = _getBallFlashOverlay(ball.r);
+        if(overlay){
+          const prevA = ctx.globalAlpha;
+          ctx.globalAlpha = prevA * Math.min(0.55, hitFlash * 2.0);
+          ctx.drawImage(overlay, -ball.r, -ball.r, ball.r*2, ball.r*2);
+          ctx.globalAlpha = prevA;
+        }
       }
     } else {
       ctx.fillStyle = hitFlash > 0 ? ballFlashGrad() : ballNormalGrad();
