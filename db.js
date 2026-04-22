@@ -165,6 +165,10 @@ function openDb(dataDir){
       FROM users u1 WHERE u1.id = ?
     `),
     getDecorations: db.prepare("SELECT owned_decorations, selected_decoration, coins FROM users WHERE id = ?"),
+    // Комбинированный SELECT для safeUser — объединяет getTrophies +
+    // getDecorations в один sync-вызов. Зовётся при ws connect и pair
+    // (не hot-path, но раньше стоил 2 sync ops, теперь 1).
+    getSafeInfo: db.prepare("SELECT trophies, owned_decorations, selected_decoration FROM users WHERE id = ?"),
     // Атомарная покупка: в одном UPDATE проверяем баланс и отсутствие
     // дубликата в owned_decorations. Если changes = 0 — либо не хватило
     // монет, либо уже куплено; вызывающий код интерпретирует оба случая
@@ -291,6 +295,14 @@ function openDb(dataDir){
     return { owned, selected: r.selected_decoration || null, coins: r.coins | 0 };
   }
 
+  // Один SELECT под safeUser — trophies + selected decoration. Без owned
+  // списка (клиенту в hello/matched не нужен), без coins (приходят отдельно).
+  function getSafeInfo(id){
+    const r = stmts.getSafeInfo.get(id);
+    if (!r) return { trophies: 0, selected: null };
+    return { trophies: r.trophies | 0, selected: r.selected_decoration || null };
+  }
+
   function buyDecoration(user, decoId, price){
     ensureUser(user);
     const info = stmts.buyDecoration.run(user.id, price | 0, String(decoId), Date.now());
@@ -411,6 +423,7 @@ function openDb(dataDir){
     addCoins,
     addTrophies,
     getDecorations,
+    getSafeInfo,
     buyDecoration,
     setSelectedDecoration,
     listDecorationCatalog,

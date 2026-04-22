@@ -1191,14 +1191,15 @@ function takeToken(ws){
 
 function safeUser(u){
   if (!u) return null;
-  const deco = DB.getDecorations(u.id);
+  // Один SELECT вместо двух (trophies + decorations раньше были раздельные).
+  const info = DB.getSafeInfo(u.id);
   return {
     id:          u.id,
     username:    u.username,
     global_name: u.global_name || u.username,
     avatar_url:  u.avatar_url || null,
-    trophies:    userTrophies(u.id),
-    decoration:  selectedDecorationPayload(deco.selected)
+    trophies:    info.trophies,
+    decoration:  selectedDecorationPayload(info.selected)
   };
 }
 
