@@ -2345,15 +2345,37 @@ const Game = (function(){
   }
 
   // Tiny blinking dots scattered across the sky.
+  // Батчим 40 точек в 6 bucket'ов по квантованной альфе: на каждый bucket —
+  // один beginPath + arc×N + fill. До фикса было 40 отдельных state-change'ей
+  // (alpha-set + beginPath + arc + fill) за кадр, что ломало GPU batching.
+  const _SPARKLE_BUCKETS = 6;
+  const _sparkleBucketA = new Float32Array(_SPARKLE_BUCKETS);
+  const _sparkleIdx = new Int8Array(64);
+  for(let i=0;i<_SPARKLE_BUCKETS;i++){
+    _sparkleBucketA[i] = 0.08 + ((i + 0.5) / _SPARKLE_BUCKETS) * 0.18;
+  }
   function drawSparkles(){
     if(!sparkles) return;
+    const n = sparkles.length;
+    if(n > _sparkleIdx.length) return;
+    for(let i=0;i<n;i++){
+      const s = sparkles[i];
+      const tw = 0.5 + 0.5 * Math.sin(matchTime * s.freq + s.phase);
+      let bi = (tw * _SPARKLE_BUCKETS)|0;
+      if(bi < 0) bi = 0; else if(bi >= _SPARKLE_BUCKETS) bi = _SPARKLE_BUCKETS - 1;
+      _sparkleIdx[i] = bi;
+    }
     ctx.fillStyle = "#ffffff";
-    for(const s of sparkles){
-      const tw = 0.35 + 0.65 * (0.5 + 0.5 * Math.sin(matchTime * s.freq + s.phase));
-      ctx.globalAlpha = 0.08 + tw * 0.18;
-      ctx.beginPath();
-      ctx.arc(s.x, s.y, s.r, 0, Math.PI*2);
-      ctx.fill();
+    for(let b=0; b<_SPARKLE_BUCKETS; b++){
+      let started = false;
+      for(let i=0;i<n;i++){
+        if(_sparkleIdx[i] !== b) continue;
+        const s = sparkles[i];
+        if(!started){ ctx.globalAlpha = _sparkleBucketA[b]; ctx.beginPath(); started = true; }
+        ctx.moveTo(s.x + s.r, s.y);
+        ctx.arc(s.x, s.y, s.r, 0, Math.PI*2);
+      }
+      if(started) ctx.fill();
     }
     ctx.globalAlpha = 1;
   }
