@@ -1272,6 +1272,11 @@ const Game = (function(){
   let frameTimeAvg = 16;
   let slowFrames = 0;
   let lowQuality = false;
+  // Счётчик подряд «хороших» кадров после деградации — для recovery.
+  // Нужно достаточно длинное окно (~10 сек @ 60 FPS), чтобы не дёргать
+  // настройки туда-сюда на временно успокоившемся GC-давлении.
+  let goodFramesInLowQ = 0;
+  const LOWQ_RECOVERY_FRAMES = 600;
   let bigText = null;                    // { text, t, dur, color, size }
   // Активные «эмоции» над игроками. Каждая: { emoji, t, dur, side }.
   // side: 1 — игрок (левый), 2 — соперник (правый).
@@ -2000,11 +2005,22 @@ const Game = (function(){
       _snapDiagPush(gap);
       _snapGapsPush(gap);
       if(_snapGapCount >= 8){
-        // Копируем живой префикс в scratch-буфер и сортируем in-place —
-        // нет аллокации на hot-path 60 Гц (slice+sort давал это 60 раз/сек).
-        for(let i = 0; i < _snapGapCount; i++) _snapGapScratch[i] = _snapGapBuf[i];
-        Array.prototype.sort.call(_snapGapScratch.subarray(0, _snapGapCount), (a,b) => a - b);
-        const p99 = _snapGapScratch[Math.min(_snapGapCount - 1, Math.floor(_snapGapCount * 0.99))];
+        // Копируем живой префикс в scratch-буфер и сортируем in-place через
+        // insertion sort. Для n≤24 (SNAP_GAP_WINDOW) O(n²) ≤ ~576 сравнений —
+        // в разы дешевле, чем Array.prototype.sort с per-call closure-компаратором
+        // и subarray-view (тот путь аллоцировал Function+TypedArray view 60 раз/сек).
+        const n = _snapGapCount;
+        for(let i = 0; i < n; i++) _snapGapScratch[i] = _snapGapBuf[i];
+        for(let i = 1; i < n; i++){
+          const v = _snapGapScratch[i];
+          let j = i - 1;
+          while(j >= 0 && _snapGapScratch[j] > v){
+            _snapGapScratch[j + 1] = _snapGapScratch[j];
+            j--;
+          }
+          _snapGapScratch[j + 1] = v;
+        }
+        const p99 = _snapGapScratch[Math.min(n - 1, Math.floor(n * 0.99))];
         const target = Math.max(RENDER_DELAY_MIN, Math.min(RENDER_DELAY_MAX, p99 * 1.10));
         // Быстро поднимаемся (чтобы не ловить rubber-band), медленно опускаемся.
         renderDelay = target > renderDelay
@@ -3035,7 +3051,7 @@ const Game = (function(){
     // фоновые слои. Нужно подряд несколько «плохих» кадров, чтобы не
     // реагировать на разовый GC-пик. В hidden-режиме не считаем — dt там
     // фиксированный 16мс от воркера и к реальному frame-time не относится.
-    if(!document.hidden && !lowQuality){
+    if(!document.hidden){
       const ft = dt * 1000;
       frameTimeAvg = frameTimeAvg * 0.9 + ft * 0.1;
       // Одиночный жирный кадр (>60 мс) — это уже catchup-стутер. На PC в
@@ -3051,20 +3067,38 @@ const Game = (function(){
       const hardFreeze = isTouch ? 200 : 150;
       const hitch      = isTouch ? 100 : 60;
       const avgSlow    = isTouch ? 33  : 22;
-      if(ft > hardFreeze){ lowQuality = true; }
-      else if(ft > hitch){ slowFrames += 20; if(slowFrames > 40) lowQuality = true; }
-      else if(frameTimeAvg > avgSlow){
-        slowFrames++;
-        if(slowFrames > 40) lowQuality = true;
+      if(!lowQuality){
+        if(ft > hardFreeze){ lowQuality = true; }
+        else if(ft > hitch){ slowFrames += 20; if(slowFrames > 40) lowQuality = true; }
+        else if(frameTimeAvg > avgSlow){
+          slowFrames++;
+          if(slowFrames > 40) lowQuality = true;
+        } else {
+          slowFrames = Math.max(0, slowFrames - 1);
+        }
+        // Как только деградировали на десктопе — снижаем физ-рейт со 120 до
+        // 60 Гц. Это убирает второй step-вызов на каждый кадр (коллизии/
+        // integrate/broadcast-аккумулятор), давая host'у в PvP запас на сеть
+        // и рендер. В онлайне хостовой броадкаст идёт от acc в step(), так
+        // что частота снапшотов не меняется — SNAP_STEP=33мс независимо от STEP.
+        if(lowQuality && !isTouch && STEP !== STEP_LO) _switchStep(STEP_LO);
+        if(lowQuality) goodFramesInLowQ = 0;
       } else {
-        slowFrames = Math.max(0, slowFrames - 1);
+        // Recovery: после устойчивых «хороших» кадров поднимаем качество
+        // обратно. Кадр считается хорошим, если и мгновенный ft, и EWMA
+        // ниже порога deg'a с запасом. Хитч или medium-фрейм обнуляют
+        // счётчик — recovery только по длинной чистой серии, иначе мы
+        // запустили бы flip-flop на нестабильной машине.
+        const goodMs = isTouch ? 26 : 18;
+        if(ft < goodMs && frameTimeAvg < goodMs) goodFramesInLowQ++;
+        else goodFramesInLowQ = 0;
+        if(goodFramesInLowQ >= LOWQ_RECOVERY_FRAMES){
+          lowQuality = false;
+          slowFrames = 0;
+          goodFramesInLowQ = 0;
+          if(!isTouch && STEP !== STEP_HI) _switchStep(STEP_HI);
+        }
       }
-      // Как только деградировали на десктопе — снижаем физ-рейт со 120 до
-      // 60 Гц. Это убирает второй step-вызов на каждый кадр (коллизии/
-      // integrate/broadcast-аккумулятор), давая host'у в PvP запас на сеть
-      // и рендер. В онлайне хостовой броадкаст идёт от acc в step(), так
-      // что частота снапшотов не меняется — SNAP_STEP=33мс независимо от STEP.
-      if(lowQuality && !isTouch && STEP !== STEP_LO) _switchStep(STEP_LO);
     }
   }
 
