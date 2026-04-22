@@ -1104,17 +1104,36 @@ function _doBroadcastStats(){
   wss.clients.forEach(c => { if (c.readyState === 1) { try { c.send(msg); } catch {} } });
 }
 
+// Индекс userId → Set<ws> для точечных пушей. wss.clients.forEach в hot
+// admin/deco path при 10k коннектов блокирует event loop на каждой покупке;
+// Map даёт O(k) по числу живых сессий конкретного юзера (обычно 1-2).
+const wssByUserId = new Map();
+function _indexWsUser(ws){
+  if (!ws || !ws.user || !ws.user.id) return;
+  let set = wssByUserId.get(ws.user.id);
+  if (!set){ set = new Set(); wssByUserId.set(ws.user.id, set); }
+  set.add(ws);
+}
+function _unindexWsUser(ws){
+  if (!ws || !ws.user || !ws.user.id) return;
+  const set = wssByUserId.get(ws.user.id);
+  if (!set) return;
+  set.delete(ws);
+  if (set.size === 0) wssByUserId.delete(ws.user.id);
+}
+
 // Точечный пуш нового баланса монет всем живым WS-сессиям этого юзера на
 // текущем инстансе. Используется после HTTP-покупки украшения, чтобы
 // открытое меню в другой вкладке не показывало устаревший баланс до
 // следующего award'а.
 function pushCoinsToUser(userId, coins){
+  const set = wssByUserId.get(userId);
+  if (!set || set.size === 0) return;
   const msg = JSON.stringify({ type: "wallet", coins: coins | 0, delta: 0, kind: "deco.buy" });
-  wss.clients.forEach(c => {
-    if (c.readyState !== 1) return;
-    if (!c.user || c.user.id !== userId) return;
-    try { c.send(msg); } catch {}
-  });
+  for (const ws of set){
+    if (ws.readyState !== 1) continue;
+    try { ws.send(msg); } catch {}
+  }
 }
 function scheduleStatsBroadcast(){
   if (_statsTimer){ _statsPending = true; return; }
@@ -1446,6 +1465,7 @@ wss.on("connection", async (ws, req) => {
     }
   };
   broker.registerClient(ws._client);
+  _indexWsUser(ws);
   _lastStatsTotal = await broker.incrOnline();
 
   send(ws, { type: "hello", user: safeUser(user), online: _lastStatsTotal, coins: userCoins(user.id), trophies: userTrophies(user.id) });
@@ -1562,6 +1582,7 @@ wss.on("connection", async (ws, req) => {
     _lastStatsTotal = await broker.decrOnline();
     await clearQueue(ws);
     await leaveRoom(ws, "disconnect");
+    _unindexWsUser(ws);
     broker.unregisterClient(ws._client);
     // Счётчик онлайна изменился — уведомим всех подключённых клиентов.
     scheduleStatsBroadcast();
