@@ -1060,6 +1060,15 @@ const Game = (function(){
   for(let i = 0; i < PARTICLE_CAP; i++){
     particles[i] = { x:0, y:0, vx:0, vy:0, life:0, age:0, size:0, color:"#fff", dead:true };
   }
+  // Буферы для батчинга drawParticles по (цвет × alpha-бакет) — тот же
+  // приём, что у sparkles. Без этого на rally каждая из до 80 живых
+  // частиц ставила globalAlpha + fillStyle + beginPath + arc + fill =
+  // state-flush GPU-батча на каждую. С бакетами — 1 fill на бакет.
+  const _PART_BUCKETS = 4;
+  const _PART_MAX_COLORS = 8;
+  const _partAlphaIdx = new Int8Array(PARTICLE_CAP);
+  const _partColorKey = new Int8Array(PARTICLE_CAP);
+  const _partColors   = new Array(_PART_MAX_COLORS);
   // Trail — ring buffer из двух Float32Array. shift/unshift давали 120
   // allocations/sec на физ-тике; ring buffer на typed arrays — 0 allocations.
   const TRAIL_LEN = 10;
@@ -1925,13 +1934,49 @@ const Game = (function(){
   }
 
   function drawParticles(){
+    // Первый проход: для каждой живой частицы находим цветовой индекс (линейный
+    // поиск по небольшому массиву — ≤8 уникальных цветов) и альфа-бакет.
+    // Мёртвые/отгоревшие помечаются _partAlphaIdx=-1.
+    let colorsN = 0;
     for(let i = 0; i < PARTICLE_CAP; i++){
       const pt = particles[i];
-      if(pt.dead) continue;
+      if(pt.dead){ _partAlphaIdx[i] = -1; continue; }
       const k = 1 - pt.age/pt.life;
-      ctx.globalAlpha = k;
-      ctx.fillStyle = pt.color;
-      ctx.beginPath(); ctx.arc(pt.x, pt.y, pt.size * k, 0, Math.PI*2); ctx.fill();
+      if(k <= 0){ _partAlphaIdx[i] = -1; continue; }
+      let bi = (k * _PART_BUCKETS) | 0;
+      if(bi < 0) bi = 0; else if(bi >= _PART_BUCKETS) bi = _PART_BUCKETS - 1;
+      _partAlphaIdx[i] = bi;
+      let ci = -1;
+      for(let c = 0; c < colorsN; c++){
+        if(_partColors[c] === pt.color){ ci = c; break; }
+      }
+      if(ci < 0){
+        if(colorsN >= _PART_MAX_COLORS){ _partAlphaIdx[i] = -1; continue; }
+        ci = colorsN++;
+        _partColors[ci] = pt.color;
+      }
+      _partColorKey[i] = ci;
+    }
+    // Второй проход: для каждой (color, bucket) пары — один beginPath + N arc + один fill.
+    for(let c = 0; c < colorsN; c++){
+      ctx.fillStyle = _partColors[c];
+      for(let b = 0; b < _PART_BUCKETS; b++){
+        let started = false;
+        for(let i = 0; i < PARTICLE_CAP; i++){
+          if(_partAlphaIdx[i] !== b || _partColorKey[i] !== c) continue;
+          const pt = particles[i];
+          if(!started){
+            ctx.globalAlpha = (b + 0.5) / _PART_BUCKETS;
+            ctx.beginPath();
+            started = true;
+          }
+          const k = 1 - pt.age/pt.life;
+          const r = pt.size * k;
+          ctx.moveTo(pt.x + r, pt.y);
+          ctx.arc(pt.x, pt.y, r, 0, Math.PI*2);
+        }
+        if(started) ctx.fill();
+      }
     }
     ctx.globalAlpha = 1;
   }
