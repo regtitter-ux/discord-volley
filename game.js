@@ -1091,7 +1091,13 @@ const Game = (function(){
   // Нужно достаточно длинное окно (~10 сек @ 60 FPS), чтобы не дёргать
   // настройки туда-сюда на временно успокоившемся GC-давлении.
   let goodFramesInLowQ = 0;
-  const LOWQ_RECOVERY_FRAMES = 600;
+  // 1200 (~20 с при 60 FPS) вместо 600: на нестабильной машине (iGPU + GC
+  // contention) 10 с чистых кадров подряд почти недостижимы, но recovery
+  // периодически срабатывает на короткой «хорошей» серии и пересобирает
+  // backdrop-sprite + переключает STEP_HI↔STEP_LO — каждый переход
+  // порождает transient-хитч. Удвоенное окно гасит flip-flop, не меняя
+  // поведение на реально восстановившемся железе.
+  const LOWQ_RECOVERY_FRAMES = 1200;
   let bigText = null;                    // { text, t, dur, color, size }
   // Активные «эмоции» над игроками. Каждая: { emoji, t, dur, side }.
   // side: 1 — игрок (левый), 2 — соперник (правый).
@@ -2534,12 +2540,18 @@ const Game = (function(){
     let steps = 0;
     const profile = window.__dvProfile === true;
     const t0 = profile ? performance.now() : 0;
-    while(acc >= STEP && steps < 6){
+    // Кеп 4 вместо 6: на слабых ПК catch-up spiral самоусиливается
+    // (фриз → долг acc → больше step() в следующем кадре → больше физики
+    // и коллизий → новый фриз). Потолок в 4 шага достаточен для восстановления
+    // после ~30 FPS-кадра при STEP=1/120, но не даёт спирали раскрутиться
+    // до полного freeze. Лучше потерять немного точности под нагрузкой, чем
+    // войти в 150+ мс jank.
+    while(acc >= STEP && steps < 4){
       step(STEP);
       acc -= STEP;
       steps++;
     }
-    if(steps === 6) acc = 0;
+    if(steps === 4) acc = 0;
     _stepsLastFrame = steps;
     if(!document.hidden) _frameTimePush(dt * 1000);
     const t1 = profile ? performance.now() : 0;
