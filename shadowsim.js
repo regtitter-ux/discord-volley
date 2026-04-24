@@ -56,6 +56,10 @@ function makeSim(){
     p1: makePlayer(1, W, GROUND_Y),
     p2: makePlayer(-1, W, GROUND_Y),
     ball: DVPhysics.serveBall(1, null, W, NET_X),
+    // Сторона мяча относительно NET_X в прошлом тике (1=слева, 2=справа).
+    // Любое пересечение сетки сбрасывает ball.touches — стенные отскоки на
+    // чужой половине не должны накапливаться в фол.
+    lastBallSide: 1,
     // Authoritative flag: когда true, tickLoop применяет hostInput/guestInput
     // как авторитетные и эмитит снапшоты в peerSinks; observer-ветка в
     // observeFrame(state) становится no-op.
@@ -140,6 +144,7 @@ function _restartRound(sim){
   sim.ball = DVPhysics.serveBall(sim.servingSide, server.x, sim.W, sim.NET_X);
   sim.rallyHits = 0;
   sim.lastHitSide = 0;
+  sim.lastBallSide = (sim.ball.x < sim.NET_X) ? 1 : 2;
 }
 // Бинарный снапшот для обоих пиров. Клиент отправителя (host/guest)
 // примет его через тот же Codec.decode-путь в onmessage(binary).
@@ -386,6 +391,15 @@ class ShadowRegistry {
       sim.ball.vy += DVPhysics.GRAV * dt;
       sim.ball.x += sim.ball.vx * dt;
       sim.ball.y += sim.ball.vy * dt;
+      // Net-crossing reset (см. makeSim.lastBallSide).
+      {
+        const side = (sim.ball.x < sim.NET_X) ? 1 : 2;
+        if (side !== sim.lastBallSide){
+          sim.ball.touches.left = 0;
+          sim.ball.touches.right = 0;
+          sim.lastBallSide = side;
+        }
+      }
       DVPhysics.collideBallWalls(sim.ball, sim.W);
       DVPhysics.collideBallNet(sim.ball, sim.NET_X, sim.GROUND_Y);
       // Player-collision сначала (может поднять мяч перед ground-check).

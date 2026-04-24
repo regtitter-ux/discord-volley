@@ -1013,6 +1013,10 @@ const Game = (function(){
   let p1, p2, ball;
   let score1 = 0, score2 = 0;
   let servingSide = 1;            // 1 left, -1 right
+  // Сторона, на которой мяч был в прошлом физ-тике (1=слева от сетки, 2=справа).
+  // Любое пересечение NET_X обнуляет ball.touches — чтобы отскоки от стены
+  // на чужой половине и возврат к тому же игроку не засчитывались как фол.
+  let lastBallSide = 1;
   let roundOver = false;
   let roundTimer = 0;
   let lastWinnerSide = 0;         // выставляется в endMatch — для перерисовки overlay
@@ -1309,6 +1313,7 @@ const Game = (function(){
     hitFlash = 0;
     squash.ball = 0;
     rallyHits = 0;
+    lastBallSide = (ball.x < NET_X) ? 1 : 2;
     Fx.serve(servingSide);
   }
 
@@ -1500,6 +1505,18 @@ const Game = (function(){
       ball.x += ball.vx * subDt;
       ball.y += ball.vy * subDt;
       ball.angle += ball.vx * subDt * 0.025;
+
+      // Net-crossing reset. Любое пересечение центра сетки по X сбрасывает
+      // счётчик касаний — так отскоки от стены чужой половины, возвращающие
+      // мяч к тому же игроку, не накапливаются в фол.
+      {
+        const side = (ball.x < NET_X) ? 1 : 2;
+        if(side !== lastBallSide){
+          ball.touches.left = 0;
+          ball.touches.right = 0;
+          lastBallSide = side;
+        }
+      }
 
       // Side walls only — no ceiling, the ball can arc arbitrarily high.
       DVPhysics.collideBallWalls(ball, WORLD_W);
