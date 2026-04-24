@@ -215,6 +215,23 @@
     </div>
   </section>
 
+  <!-- Lobby overlay: shown over the menu while searching for an opponent.
+       Если за 5 секунд никто не подключился, клиент тихо откатывается в
+       матч с ботом (game.js: onLobbyTimeoutFallback). -->
+  <div class="overlay hidden" id="lobby-overlay" role="dialog" aria-modal="true">
+    <div class="overlay-box lobby-box">
+      <div class="lobby-spinner" aria-hidden="true">
+        <div class="spinner-ring"></div>
+        <div class="lobby-countdown" id="lobby-countdown">5</div>
+      </div>
+      <h3 id="lobby-title" data-i18n="lobby.searching">Поиск соперника…</h3>
+      <p id="lobby-sub" class="muted" data-i18n="lobby.fallback_hint">Если никого не найдём за 5 секунд — играем с ботом.</p>
+      <div class="overlay-buttons">
+        <button class="btn btn-ghost" id="btn-lobby-cancel" data-i18n="lobby.cancel">Отмена</button>
+      </div>
+    </div>
+  </div>
+
   <!-- Decorations modal -->
   <div class="overlay hidden" id="decorations-modal" role="dialog" aria-modal="true" aria-labelledby="decorations-title">
     <div class="overlay-box decorations-box">

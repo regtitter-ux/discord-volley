@@ -101,13 +101,28 @@ window.DecoAnim = DecoAnim;
 const state = {
   user: null,
   bot: null,
+  opponent: null,
+  // mode: 'bot' (SP vs AI) | 'host' (authoritative online left player)
+  //     | 'guest' (online right player, driven by host snapshots)
   mode: "bot",
+  // netMode: "host" — legacy host-authoritative (host крутит физику, шлёт
+  //                   снапшоты guest'у; guest шлёт input'ы host'у).
+  //          "auth" — server-authoritative (сервер крутит физику, шлёт
+  //                   снапшоты ОБОИМ; оба шлют input'ы серверу).
+  // Выбирается сервером в matched.net; клиент сам не решает.
+  netMode: "host",
   ws: null,
+  // Второй сокет — на Hathora room-server'е, только для gameplay (input,
+  // state, emote). Активен при matched.roomHost != null. Menu-WS (state.ws)
+  // параллельно живёт на Railway для lobby/stats/wallet/trophies/peer_left.
+  gameWs: null,
+  peerKeys: { left:false, right:false, jump:false },
   targetScore: 10,
   inGame: false,
   matchOver: false,
   // Защёлка: match_win/match_loss уходят на сервер не больше одного раза
-  // за матч.
+  // за матч. Разные пути исхода (endMatch/endMatchAsSnapshot/onPeerLeft)
+  // могут пересекаться — без флага рейтинг/ставки дублируются.
   winReported: false,
   lossReported: false,
   // Серверно-зафиксированные ставки трофеев текущего матча.
@@ -324,8 +339,10 @@ Trophies.onChange((delta)=>{
 });
 
 /* ---- Trophy balance per-player HUD ----
-   Под именем у p1 — баланс кубков (из Trophies, обновляется от сервера).
-   У p2 (бот) трофей нет — прячем. */
+   Под именем у каждого игрока — его баланс кубков (оба жёлтые). У p1
+   берём из Trophies (локальный источник истины, обновляется от wallet
+   сервера). У p2 — из state.opponent.trophies, которое сервер прислал
+   в matched.opponent. В бот-матче у p2 трофей нет — прячем. */
 function renderHudTrophies(){
   const p1el  = $("hud-trophies-p1");
   const p1val = $("hud-trophies-val-p1");
@@ -333,8 +350,17 @@ function renderHudTrophies(){
     p1val.textContent = String(Trophies.get());
     p1el.hidden = false;
   }
-  const p2el = $("hud-trophies-p2");
-  if(p2el) p2el.hidden = true;
+  const p2el  = $("hud-trophies-p2");
+  const p2val = $("hud-trophies-val-p2");
+  if(p2el && p2val){
+    const opp = state.opponent;
+    if(state.mode !== "bot" && opp && typeof opp.trophies === "number"){
+      p2val.textContent = String(opp.trophies | 0);
+      p2el.hidden = false;
+    } else {
+      p2el.hidden = true;
+    }
+  }
 }
 
 /* ---------------- Name helpers ---------------- */
@@ -370,9 +396,12 @@ function botDisplayName(bot){
   return shortenName(I18n.t("bot.prefix") + " " + (bot.global_name || bot.username || ""));
 }
 
-// В каких ролях на поле показаны игроки. Игрок всегда слева (p1), бот справа (p2).
+// В каких ролях на поле показаны игроки. У каждого клиента свой «себя слева»:
+// host видит state.user как p1, guest тоже — за счёт зеркалирования снапшотов.
 function playerUser(side){
-  return side === 1 ? state.user : state.bot;
+  if(state.mode === "guest") return side === 1 ? state.user     : state.opponent;
+  if(state.mode === "host")  return side === 1 ? state.user     : state.opponent;
+  return side === 1 ? state.user : state.bot; // bot
 }
 
 // Динамические строки, которые не переключаются через data-i18n, плюс
@@ -385,9 +414,11 @@ function refreshLocalizedDynamicUI(){
   }
   if(right){
     Auth.renderAvatarInto($("hud-avatar-p2"), right);
-    $("hud-name-p2").textContent = botDisplayName(right);
+    $("hud-name-p2").textContent = state.mode === "bot"
+      ? botDisplayName(right)
+      : userDisplayName(right);
   }
-  $("hud-diff").textContent = I18n.t("hud.bot");
+  $("hud-diff").textContent = I18n.t(state.mode === "bot" ? "hud.bot" : "hud.online");
   renderHudTrophies();
   if(window.Game && typeof Game.refreshOverlay === "function") Game.refreshOverlay();
 }
@@ -628,6 +659,72 @@ if(lbPrevBtn) lbPrevBtn.addEventListener("click", ()=> refreshLeaderboard(lbCurr
 if(lbNextBtn) lbNextBtn.addEventListener("click", ()=> refreshLeaderboard(lbCurrentPage + 1));
 if(lbJumpMeBtn) lbJumpMeBtn.addEventListener("click", ()=> { if(lbMePage) refreshLeaderboard(lbMePage); });
 
+/* ---------------- Matchmaking ----------------
+   Клик по «ИГРАТЬ» запускает поиск: открываем WebSocket, встаём в очередь,
+   показываем лобби с обратным отсчётом. Если в течение QUEUE_TIMEOUT_MS
+   никто не подключился — сервер пришлёт queue_timeout, и мы откатимся в
+   матч против бота. По кнопке «Отмена» — закрываем сокет и уходим обратно
+   в меню (в отличие от таймаута). */
+
+const lobbyOverlay   = $("lobby-overlay");
+const lobbyCountdown = $("lobby-countdown");
+const lobbyTitle     = $("lobby-title");
+const lobbySub       = $("lobby-sub");
+// 5-секундный клиентский fallback: если за это время matched не прилетел,
+// тихо отменяем очередь и садим игрока против бота. Сервер держит собственный
+// QUEUE_TIMEOUT_MS (30с по дефолту) как safety-net — если клиент не успел
+// прислать cancel, сервер уберёт игрока из очереди сам. Коротко ждать лучше,
+// чем показывать 30с «поиск» на пустой очереди глобально распределённой игры.
+const QUEUE_COUNTDOWN_MS = 5000;
+
+let lobbyTickTimer = 0;
+let lobbyFallbackTimer = 0;
+let lobbyCountdownStart = 0;
+function startLobbyCountdown(){
+  lobbyCountdownStart = performance.now();
+  updateLobbyCountdown();
+  if(lobbyTickTimer) clearInterval(lobbyTickTimer);
+  lobbyTickTimer = setInterval(updateLobbyCountdown, 100);
+  if(lobbyFallbackTimer) clearTimeout(lobbyFallbackTimer);
+  lobbyFallbackTimer = setTimeout(onLobbyTimeoutFallback, QUEUE_COUNTDOWN_MS);
+}
+function stopLobbyCountdown(){
+  if(lobbyTickTimer){ clearInterval(lobbyTickTimer); lobbyTickTimer = 0; }
+  if(lobbyFallbackTimer){ clearTimeout(lobbyFallbackTimer); lobbyFallbackTimer = 0; }
+}
+function updateLobbyCountdown(){
+  const elapsed = performance.now() - lobbyCountdownStart;
+  const left = Math.max(0, QUEUE_COUNTDOWN_MS - elapsed);
+  lobbyCountdown.textContent = String(Math.ceil(left / 1000));
+}
+
+// Fallback на боте: отправляем cancel серверу (чтобы он не подержал пустую
+// пару и не прислал нам matched уже после бот-матча) и стартуем бот-матч.
+// Защёлка state._waitingQueue: если к моменту fallback-тика matched уже
+// успел прилететь и начать онлайн-матч, флаг снят в startOnlineMatch() и
+// мы сюда просто не заходим. Race «matched прилетел после старта бота»
+// отрезан в onServerMessage(matched) проверкой того же флага.
+function onLobbyTimeoutFallback(){
+  if(!state._waitingQueue) return;
+  state._waitingQueue = false;
+  hideLobby();
+  if(state.ws && state.ws.readyState === 1){
+    try { state.ws.send(JSON.stringify({ type: "cancel" })); } catch(_){}
+  }
+  startBotMatch();
+}
+
+function showLobby(){
+  lobbyTitle.textContent = I18n.t("lobby.searching");
+  lobbySub.textContent   = I18n.t("lobby.fallback_hint");
+  lobbyOverlay.classList.remove("hidden");
+  startLobbyCountdown();
+}
+function hideLobby(){
+  lobbyOverlay.classList.add("hidden");
+  stopLobbyCountdown();
+}
+
 // Ожидание open у переданного WebSocket. Если сокет уже открыт — возвращаем
 // его без задержки. На ошибку/close/длинный таймаут возвращаем null, чтобы
 // вызывающий мог сделать fallback.
@@ -653,17 +750,109 @@ const Codec = window.DVCodec;
 
 function attachSocketHandlers(ws){
   ws.addEventListener("message", (ev)=>{
-    // Бинарные фреймы в онлайн-режиме были peer-relay; в bot-only режиме
-    // сервер не шлёт бинарные payload'ы — просто игнорируем.
-    if(typeof ev.data !== "string") return;
+    // Бинарные фреймы — это всегда relay-payload от соперника (снапшот,
+    // инпут, эмоция); сервер их не оборачивает, так что идём в Codec и
+    // сразу в onPeerPayload. Всё остальное — текстовый JSON-контроль.
+    if(typeof ev.data !== "string"){
+      const p = Codec.decode(ev.data);
+      if(p) onPeerPayload(p);
+      return;
+    }
     let msg;
     try { msg = JSON.parse(ev.data); } catch { return; }
     if(!msg || typeof msg.type !== "string") return;
     onServerMessage(msg);
   });
   ws.addEventListener("close", ()=>{
+    // Если мы уже в матче — считаем это как уход соперника.
+    // Исключение: в Hathora-режиме gameplay идёт через state.gameWs, и
+    // закрытие menu-WS не значит disconnect от матча — peer_left всё
+    // равно приедет либо из Railway (control-фрейм), либо через gameWs close.
+    if(state.inGame && state.mode !== "bot"){
+      const gameLive = state.gameWs && state.gameWs.readyState === 1;
+      if(!gameLive) onPeerLeft("disconnect");
+    }else{
+      hideLobby();
+    }
     if(state.ws === ws) state.ws = null;
   });
+}
+
+// Gameplay-WS (Stage 7.3+): отдельный сокет к Hathora room-server'у.
+// Бинарные input/state/emote идут сюда, текстовые control ack'и (join,
+// в будущем match-result) — тоже здесь. Lobby/wallet/trophies остаются
+// на menu-WS.
+function attachGameSocketHandlers(ws){
+  ws.addEventListener("message", (ev)=>{
+    if(typeof ev.data !== "string"){
+      const p = Codec.decode(ev.data);
+      if(p) onPeerPayload(p);
+      return;
+    }
+    // Текстовые фреймы на gameWs: сейчас только {type:"joined"} ack
+    // (обрабатывается в openGameSocket). Неизвестные — игнор.
+  });
+  ws.addEventListener("close", ()=>{
+    if(state.gameWs === ws) state.gameWs = null;
+    if(state.inGame && state.mode !== "bot") onPeerLeft("disconnect");
+  });
+  ws.addEventListener("error", ()=>{});
+}
+
+// Возвращает сокет, в который надо класть gameplay-трафик (input/state/emote).
+// Приоритет: gameWs (Hathora) → menu-WS (legacy local-путь). null, если оба
+// не готовы — вызывающий код просто молча теряет кадр.
+function gameplaySocket(){
+  if(state.gameWs && state.gameWs.readyState === 1) return state.gameWs;
+  if(state.ws     && state.ws.readyState     === 1) return state.ws;
+  return null;
+}
+
+// Открыть второй WS на room-server, отправить join-фрейм, дождаться
+// {type:"joined"} ack. Успех → state.gameWs назначен, резолв ws.
+// Любая осечка (таймаут, close, error, плохой ack) → резолв null,
+// сокет закрыт, state.gameWs не трогаем.
+function openGameSocket(host, port, token){
+  return new Promise((resolve) => {
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    const url = proto + "//" + host + ":" + (port|0) + "/ws";
+    let ws;
+    try { ws = new WebSocket(url); } catch(_){ resolve(null); return; }
+    ws.binaryType = "arraybuffer";
+    let settled = false;
+    const done = (val) => {
+      if(settled) return;
+      settled = true;
+      resolve(val);
+      if(!val){ try { ws.close(); } catch(_){} }
+    };
+    const onAck = (ev) => {
+      if(typeof ev.data !== "string") return;
+      try {
+        const msg = JSON.parse(ev.data);
+        if(msg && msg.type === "joined"){
+          ws.removeEventListener("message", onAck);
+          state.gameWs = ws;
+          attachGameSocketHandlers(ws);
+          done(ws);
+        }
+      } catch(_){}
+    };
+    ws.addEventListener("open", () => {
+      try { ws.send(JSON.stringify({ type: "join", token: String(token||"") })); }
+      catch(_){ done(null); }
+    }, { once: true });
+    ws.addEventListener("message", onAck);
+    ws.addEventListener("error", () => done(null), { once: true });
+    ws.addEventListener("close", () => done(null), { once: true });
+    setTimeout(() => done(null), 8000);
+  });
+}
+
+function closeGameSocket(){
+  const ws = state.gameWs;
+  state.gameWs = null;
+  if(ws){ try { ws.close(); } catch(_){} }
 }
 
 function onServerMessage(msg){
@@ -686,6 +875,46 @@ function onServerMessage(msg){
         Wallet.set(msg.coins, d);
       }
       break;
+    case "matched":
+      // Race-guard: 5с fallback-таймер мог уже стартовать бот-матч, а matched
+      // прилететь чуть позже (queue попал к партнёру на 4.9с и сервер не
+      // успел). Игнорируем запоздавший matched — игрок уже в бот-матче.
+      if(!state._waitingQueue) break;
+      state._waitingQueue = false;
+      // PvP: сервер выдал matchId + ставки трофеев. Клиент НЕ катает
+      // случайки самостоятельно — используем то, что прислали, иначе
+      // host/guest увидят разные числа и сервер по-любому возьмёт своё.
+      if(msg.matchId){
+        state.stakes = {
+          matchId: msg.matchId,
+          win:  msg.stakes && msg.stakes.win  | 0,
+          loss: msg.stakes && msg.stakes.loss | 0
+        };
+      }
+      // net: "host" (legacy) | "auth" (server-authoritative, этап 6b).
+      // Если сервер не прислал поле — считаем "host" для обратной совместимости.
+      state.netMode = (msg.net === "auth") ? "auth" : "host";
+      // Stage 7.3: если сервер отдал roomHost/roomPort/roomToken — поднимаем
+      // второй WS к Hathora room-server'у и только потом входим в матч.
+      // Без этих полей (DV_ROOMS=local, дефолт) идём старым путём мгновенно.
+      if(msg.roomHost && msg.roomPort && msg.roomToken){
+        openGameSocket(msg.roomHost, msg.roomPort, msg.roomToken).then((game) => {
+          if(!game){
+            // Room-server не ответил joined за 8с. Снимаем ожидания, уведомляем
+            // Railway и возвращаемся в меню — играть всё равно некуда.
+            try { state.ws && state.ws.readyState === 1 &&
+                  state.ws.send(JSON.stringify({ type: "leave" })); } catch(_){}
+            state.stakes = null;
+            hideLobby();
+            show("menu");
+            return;
+          }
+          startOnlineMatch(msg.role, msg.opponent);
+        });
+      } else {
+        startOnlineMatch(msg.role, msg.opponent);
+      }
+      break;
     case "match_stakes":
       if(msg.matchId){
         state.stakes = {
@@ -701,6 +930,40 @@ function onServerMessage(msg){
         Trophies.set(msg.total, d);
       }
       break;
+    case "queue_timeout":
+      // Теоретически недостижимо: клиентский 5с fallback всегда сработает
+      // раньше серверного 30с. Оставлено как safety-net на случай, если
+      // клиентский setTimeout заглох (browser throttling фоновой вкладки).
+      if(!state._waitingQueue) break;
+      state._waitingQueue = false;
+      hideLobby();
+      startBotMatch();
+      break;
+    case "peer":
+      onPeerPayload(msg.payload);
+      break;
+    case "peer_left":
+      onPeerLeft(msg.reason || "disconnect");
+      break;
+  }
+}
+
+function onPeerPayload(p){
+  if(!p || typeof p.kind !== "string") return;
+  if(p.kind === "input" && state.mode === "host" && state.netMode !== "auth"){
+    // Legacy host-auth: guest-input доходит сюда напрямую. В server-auth
+    // host вообще не получает input-фреймов — их съедает сервер.
+    state.peerKeys.left  = !!p.left;
+    state.peerKeys.right = !!p.right;
+    state.peerKeys.jump  = !!p.jump;
+  }else if(p.kind === "state" && (state.mode === "guest" || state.netMode === "auth")){
+    // Снапшоты: гость в host-auth получает их от host'а; оба клиента в
+    // server-auth получают их от сервера. Форма payload'а одинакова.
+    Game.applySnapshot(p);
+  }else if(p.kind === "emote"){
+    // Эмоция от оппонента. И у хоста, и у гостя оппонент стоит справа (p2)
+    // — гостевая сторона зеркалирует снапшот, так что своя половина всегда p1.
+    Game.triggerEmote(2, p.id);
   }
 }
 
@@ -724,6 +987,47 @@ function reportMatchLoss(){
   } catch(_){}
 }
 
+function onPeerLeft(reason){
+  if(state.mode === "bot") return;
+  // Активный матч (ещё не завершён) — засчитываем форфейт: оставшийся игрок
+  // получает победу (+50 монет) и видит обычный оверлей окончания матча.
+  // Сокет держим открытым — он общий для матчмейкинга, онлайн-счётчика и
+  // кошелька.
+  if(state.inGame && !state.matchOver){
+    // Репортим свою форфейт-победу в лидерборд (endByForfeit внутри выставит
+    // matchOver; reportMatchWin защищён флагом winReported от дублей).
+    reportMatchWin();
+    Game.endByForfeit();
+    // state.mode НЕ трогаем: форфейт — это валидный конец онлайн-матча, и
+    // «Играть снова» должна повторить онлайн-поток (leave → matchmaking),
+    // а не свалиться в бот-ветку (там нет show("game")/resizeCanvas/матч-
+    // мейкинга, и поле рисуется в чужом скейле от прошлого фрейма).
+    // Повторный серверный applyMatchOutcome от нашего будущего leave будет
+    // безопасно отклонён broker.claimOutcome (мы уже в winnerReportedBy).
+    state.opponent = null;
+    return;
+  }
+  // Матч уже завершён, мы на end-match оверлее, а пир нажал «Играть снова»:
+  // не трогаем оверлей — игрок должен сам решить, жать replay или уйти в меню.
+  // Просто чистим ссылку на соперника; следующий btn-replay корректно
+  // стартует свежий матчмейкинг через quitToMenu → startMatchmaking.
+  if(state.inGame && state.matchOver){
+    state.opponent = null;
+    return;
+  }
+  // Матч ещё не начат (пир отменил сразу после matched) — возвращаем в меню.
+  Game.stop();
+  state.mode = "bot"; state.netMode = "host";
+  state.opponent = null;
+  show("menu");
+  // Лёгкое уведомление поверх меню через тот же лобби-оверлей.
+  lobbyTitle.textContent = I18n.t("lobby.disconnected");
+  lobbySub.textContent   = "";
+  lobbyCountdown.textContent = "×";
+  lobbyOverlay.classList.remove("hidden");
+  setTimeout(()=> lobbyOverlay.classList.add("hidden"), 1500);
+}
+
 function closeSocket(){
   const ws = state.ws;
   state.ws = null;
@@ -732,7 +1036,8 @@ function closeSocket(){
 }
 
 function startBotMatch(){
-  state.mode = "bot";
+  state.mode = "bot"; state.netMode = "host";
+  state.opponent = null;
   state.bot = Auth.makeBot();
   // Серверу нужен зафиксированный matchId, чтобы ставки трофеев были
   // одни и те же при начислении/списании. Генерим тут, а сервер в ответ
@@ -755,7 +1060,65 @@ function requestStakes(matchId){
   } catch(_){}
 }
 
-$("btn-play").addEventListener("click", startBotMatch);
+function startOnlineMatch(role, opponent){
+  hideLobby();
+  state.mode = role; // 'host' | 'guest'
+  // state.netMode уже проставлен из msg.net в "matched"-ветке onServerMessage —
+  // здесь оно load-bearing для step()/broadcastSnapshot, не сбрасываем.
+  // PvP matchId уже пришёл в matched и лежит в state.stakes.matchId.
+  // Подменим session.matchId, чтобы кошелёк слал award-ы с тем же ключом.
+  if(state.stakes && state.stakes.matchId){
+    state.session = { matchId: state.stakes.matchId, startedAt: Date.now(), seq: 0 };
+  }
+  // Нормализуем пришедшего с сервера пользователя — добиваем color по id,
+  // чтобы fallback-круг оппонента был стабильно окрашен, а не серо-дефолтным.
+  state.opponent = Auth.normalize(opponent) || opponent;
+  state.bot = null;
+  state.peerKeys.left = state.peerKeys.right = state.peerKeys.jump = false;
+  // Важно: модульный _relayLastMask сохраняется между матчами. Если гость
+  // играл прошлый матч и у него в конце была зажата, например, стрелка
+  // (или просто mask оказался 0), в новом матче первое нажатие с тем же
+  // mask-значением не отправится из-за дедупа — и гость не двигается.
+  // Форсим «ни разу не отправляли» состояние.
+  _relayLastMask = -1;
+  $("hud-score-p1").textContent = "0";
+  $("hud-score-p2").textContent = "0";
+  refreshLocalizedDynamicUI();
+  show("game");
+  resizeCanvas();
+  Game.start();
+}
+
+async function startMatchmaking(){
+  // _waitingQueue — защёлка «мы в lobby, ждём matched». Клиентский 5с fallback
+  // и input от сервера (matched/queue_timeout) снимают её — оставшийся в live
+  // события ignoring'ом гасит остальные (см. onLobbyTimeoutFallback + matched-
+  // case ниже). Сбрасываем в старте на случай, если предыдущая сессия по
+  // какой-то причине оставила флаг поднятым.
+  state._waitingQueue = true;
+  showLobby();
+  // Переиспользуем постоянный сокет из меню. Если его ещё нет (boot не успел
+  // или сеть упала) — пытаемся открыть; при неудаче откатываемся к боту.
+  const ws = await ensureMenuSocket();
+  if(!ws){
+    state._waitingQueue = false;
+    hideLobby();
+    startBotMatch();
+    return;
+  }
+  try { ws.send(JSON.stringify({ type: "queue" })); } catch(_){}
+}
+
+$("btn-play").addEventListener("click", startMatchmaking);
+
+$("btn-lobby-cancel").addEventListener("click", ()=>{
+  state._waitingQueue = false;
+  hideLobby();
+  if(state.ws){
+    try { state.ws.send(JSON.stringify({ type: "cancel" })); } catch(_){}
+  }
+  // Сокет держим открытым — он общий для матчмейкинга, онлайн-счётчика и кошелька.
+});
 
 /* ---------------- Canvas sizing ---------------- */
 // World config — источник истины в physics.js (shared с сервером).
@@ -852,6 +1215,7 @@ function classifyKey(e){
 }
 function clearKeys(){
   keys.left = keys.right = keys.jump = false;
+  if(typeof relayInputIfGuest === "function") relayInputIfGuest();
 }
 window.addEventListener("keydown", e=>{
   // Никогда не перехватываем системные комбо Ctrl/Cmd+X (Ctrl+R/W/T,
@@ -862,10 +1226,16 @@ window.addEventListener("keydown", e=>{
   if(!act) return;
   keys[act] = true;
   if(state.inGame) e.preventDefault();
+  // Немедленный relay-пуш: ждать до 33 мс тика интервала на мобиле — это
+  // ощутимая задержка реакции; плюс в фоне браузер может троттлить таймеры.
+  if(typeof relayInputIfGuest === "function") relayInputIfGuest();
 }, {passive:false});
 window.addEventListener("keyup", e=>{
   const act = classifyKey(e);
-  if(act) keys[act] = false;
+  if(act){
+    keys[act] = false;
+    if(typeof relayInputIfGuest === "function") relayInputIfGuest();
+  }
 });
 // blur + visibilitychange + pagehide: если мы теряем фокус/видимость,
 // ключи и тачи надо сбрасывать, иначе зависают (особенно частая жалоба
@@ -879,8 +1249,8 @@ document.addEventListener("visibilitychange", ()=>{
 document.querySelectorAll(".tbtn").forEach(btn=>{
   const k = btn.dataset.key;
   const act = k === "a" ? "left" : k === "d" ? "right" : "jump";
-  const on  = (e)=>{ e.preventDefault(); keys[act] = true;  };
-  const off = (e)=>{ e.preventDefault(); keys[act] = false; };
+  const on  = (e)=>{ e.preventDefault(); keys[act] = true;  if(typeof relayInputIfGuest === "function") relayInputIfGuest(); };
+  const off = (e)=>{ e.preventDefault(); keys[act] = false; if(typeof relayInputIfGuest === "function") relayInputIfGuest(); };
   btn.addEventListener("touchstart", on,  {passive:false});
   btn.addEventListener("touchend",   off, {passive:false});
   btn.addEventListener("touchcancel",off, {passive:false});
@@ -894,6 +1264,38 @@ document.querySelectorAll(".tbtn").forEach(btn=>{
 ["gesturestart","gesturechange","gestureend"].forEach(ev=>{
   document.addEventListener(ev, e=>e.preventDefault(), {passive:false});
 });
+
+// Клиент шлёт свои клавиши на серверную физику.
+//   host-auth mode: только guest (его инпут едет к host через relay).
+//                   guest зеркалит left↔right, т.к. у host он — правый p2.
+//   server-auth mode (netMode=="auth"): оба клиента шлют — оба идут в sim
+//                   сервера. Host → p1 (левый), БЕЗ зеркала. Guest → p2
+//                   (правый), с тем же зеркалом left↔right что и раньше.
+// Heartbeat на 30 Гц — страховка на случай, если где-то изменение keys
+// произошло вне наших хуков. Сетевые пакеты уходят только когда маска
+// (left|right|jump) поменялась.
+let _relayLastMask = -1;
+function relayInputIfGuest(){
+  const shouldSend =
+    state.mode === "guest" ||
+    (state.mode === "host" && state.netMode === "auth");
+  if(!shouldSend) return;
+  const ws = gameplaySocket();
+  if(!ws) return;
+  const mask = (keys.left?1:0) | (keys.right?2:0) | (keys.jump?4:0);
+  if(mask === _relayLastMask) return;
+  _relayLastMask = mask;
+  try {
+    if(state.mode === "guest"){
+      // Мирор: у хоста/сервера guest = p2 (справа), поэтому left↔right.
+      ws.send(Codec.encodeInput(keys.right, keys.left, keys.jump));
+    } else {
+      // Host в server-auth: left/right идут как есть, p1 = левый игрок.
+      ws.send(Codec.encodeInput(keys.left, keys.right, keys.jump));
+    }
+  } catch(_){}
+}
+setInterval(relayInputIfGuest, 33);
 
 /* ---------------- Pause & overlay ---------------- */
 const overlay = $("overlay");
@@ -949,13 +1351,29 @@ function showEndOverlay(winnerSide, s1, s2, subOverride){
 $("btn-replay").addEventListener("click", ()=>{
   // Новый матч — свежий matchId + свежие ставки трофеев. Иначе сервер
   // увидит повторный match_win по закрытому matchId и проигнорирует.
-  state.session = { matchId: "b-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2,8), startedAt: Date.now(), seq: 0 };
-  state.stakes = null;
-  requestStakes(state.session.matchId);
-  Game.start();
+  if(state.mode === "bot"){
+    state.session = { matchId: "b-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2,8), startedAt: Date.now(), seq: 0 };
+    state.stakes = null;
+    requestStakes(state.session.matchId);
+    Game.start();
+    return;
+  }
+  // В онлайне «повтор» = выйти из текущего матча и сразу встать в очередь.
+  quitToMenu();
+  startMatchmaking();
 });
 function quitToMenu(){
-  state.mode = "bot";
+  // Если мы в онлайне — корректно уведомим сервер через {type:"leave"},
+  // чтобы соперник увидел peer_left сразу. Menu-сокет НЕ закрываем — это
+  // общий сокет для online-счётчика и серверного кошелька, он живёт всю
+  // сессию. А gameWs (Hathora) — сокет этого конкретного матча, его
+  // закрываем: следующий матч получит новый roomHost и новый gameWs.
+  if(state.mode !== "bot" && state.ws){
+    try { state.ws.send(JSON.stringify({ type: "leave" })); } catch(_){}
+  }
+  closeGameSocket();
+  state.mode = "bot"; state.netMode = "host";
+  state.opponent = null;
   state.stakes = null;
   state.session = null;
   Game.stop();
@@ -1011,8 +1429,17 @@ document.getElementById("reactions").addEventListener("click", (ev)=>{
   const last = +btn.dataset.last || 0;
   if(now - last < REACT_COOLDOWN) return;
   btn.dataset.last = now;
-  // Локальный игрок всегда рисуется слева (сторона 1).
+  // Локальный игрок всегда рисуется слева (сторона 1), неважно host это или
+  // guest — гостевой клиент зеркалит снапшот, чтобы «я» был p1.
   Game.triggerEmote(1, btn.dataset.emoteId);
+  // Онлайн: пробрасываем эмоцию сопернику через relay.
+  if(state.mode !== "bot"){
+    const ws = gameplaySocket();
+    if(ws){
+      const enc = Codec.encodeEmote(btn.dataset.emoteId);
+      if(enc){ try { ws.send(enc); } catch(_){} }
+    }
+  }
   // Снимаем фокус: иначе при клике мышью фокус остаётся на кнопке, и
   // следующие нажатия клавиш (пробел/Enter) ре-триггерят её, а браузер
   // рисует белое кольцо focus-ring поверх пилюли.
@@ -1054,7 +1481,8 @@ const Game = (function(){
   // на каждый кадр. Типовой бюджет кадра 16.67 мс, двойной step — это
   // удвоенная коллизия+AI+трейл, чего мидрейндж-телефон не вывозит.
   //
-  // На PC под нагрузкой (GPU contention от соседних вкладок/браузеров) 120-гц
+  // На PC под нагрузкой (GPU contention от соседних вкладок/браузеров,
+  // особенно в PvP — там host ещё и broadcastSnapshot крутит 30 Гц) 120-гц
   // step начинает не укладываться в кадр, и мы катимся в catchup-спираль.
   // При срабатывании lowQuality снижаемся до 60 Гц (см. _switchStep) — это
   // ровно та же частота, что на мобиле, и при включённой интерполяции
@@ -1081,6 +1509,113 @@ const Game = (function(){
   let roundTimer = 0;
   let lastWinnerSide = 0;         // выставляется в endMatch — для перерисовки overlay
   let ai;
+  // Аккумулятор для 30 Гц-снапшота хоста. Раздельно от физического acc,
+  // чтобы сеть не зависела от частоты рендера.
+  let snapAcc = 0;
+  const SNAP_STEP = 1/30;
+  // Snapshot interpolation buffer (режим guest).
+  //   snapA — последний потреблённый снапшот; служит «левой» точкой интерполяции
+  //     (правая — _snapQAt(0), если есть).
+  //   renderDelay — адаптивная задержка рендера соперника/мяча в прошлое.
+  //     Считается как max(SNAP_STEP*1.1, p95 интер-арривал гэпов) и клампится
+  //     в [40, 140] мс. На локальной игре (RTT ~5 мс, jitter <5 мс) opponent
+  //     виден через ~40 мс вместо фиксированных 100; на межконтиненталке сам
+  //     поднимется до 120-140 мс и поглотит реальный jitter.
+  //   SNAP_Q_MAX — 16 × 16 мс = 270 мс при 60 Гц (Stage 8) либо 16 × 33 мс =
+  //     530 мс при fallback 30 Гц. Отсекает зомби-буфер после хитча сети,
+  //     drop-oldest не срабатывает на типовых Hathora jitter-спайках.
+  // snapQ — ring buffer: на каждый приём снапшота push/shift давали по
+  // аллокации Array-внутренностей. На 60 Гц это 120 аллокаций/сек на хол. пути.
+  // Держим пул wrapper'ов { recvT, s } фиксированного размера, а snapA/snapB
+  // отдаём как прямые индексы в пул.
+  const SNAP_Q_MAX = 16;
+  const _snapSlots = new Array(SNAP_Q_MAX);
+  for(let i = 0; i < SNAP_Q_MAX; i++) _snapSlots[i] = { recvT: 0, s: null };
+  let _snapHead = 0;   // индекс самого старого wrapper'а в кольце
+  let _snapCount = 0;  // сколько живых элементов в очереди
+  function _snapQAt(i){
+    if(i < 0 || i >= _snapCount) return null;
+    return _snapSlots[(_snapHead + i) % SNAP_Q_MAX];
+  }
+  // snapA — «левая» точка интерполяции. Храним в отдельной ячейке (не внутри
+  // кольца), иначе push поверх её слота затёр бы payload.
+  const snapA = { recvT: 0, s: null };
+  let snapAValid = false;
+  // Stage 8: старт 120 мс, покрывает Hathora edge jitter (TLS + Frankfurt hop),
+  // потом p99-адаптация подтянет точно. При низком jitter MIN=50 мс быстро
+  // опустит задержку до того же порядка, что и раньше.
+  let renderDelay = 0.12;
+  // Stage 8 MIN=50 мс (было 70): при 60 Гц snapshot gap ≈ 16 мс, 50 мс это
+  //   ровно 3× период — три опорные точки в буфере до цели рендера. Для
+  //   локальной игры/LAN (jitter <10 мс) даёт минимальный opponent-lag.
+  // Stage 8 MAX=260 мс (было 180): Hathora edge через TLS эпизодически даёт
+  //   p99 ≈ 150-200 мс (TCP HoL + TLS record-batching). Старый max=180 мс
+  //   буфер пустел на хвосте распределения → extrapolation → при возврате
+  //   нормального потока prediction уезжала за 100+ px → hard-snap (визуально
+  //   «фриз-рывок»). Подняв max до 260 мс, мы переживаем такие спайки внутри
+  //   interpolation'а и даём плавную лерп-кривую между A→B.
+  const RENDER_DELAY_MIN = 0.05;
+  const RENDER_DELAY_MAX = 0.26;
+  const SNAP_GAP_WINDOW = 24;                     // ~0.8 с истории при 30 Гц
+  // Ring buffer вместо push/shift массива: push/shift на hot-path 60 Гц
+  // давал O(n) сдвиг 24 элементов и GC-давление (slice + sort каждый snap).
+  // Float32Array + circular indices — 60 раз/сек одна аллокация под sort'ом
+  // вместо двух (push-grow + slice-copy).
+  const _snapGapBuf   = new Float32Array(SNAP_GAP_WINDOW);
+  const _snapGapScratch = new Float32Array(SNAP_GAP_WINDOW);
+  let _snapGapHead  = 0;
+  let _snapGapCount = 0;
+  function _snapGapsPush(gap){
+    _snapGapBuf[_snapGapHead] = gap;
+    _snapGapHead = (_snapGapHead + 1) % SNAP_GAP_WINDOW;
+    if(_snapGapCount < SNAP_GAP_WINDOW) _snapGapCount++;
+  }
+  function _snapGapsReset(){ _snapGapHead = 0; _snapGapCount = 0; }
+
+  // Отдельное длинное окно для диагностики TCP head-of-line blocking.
+  // _snapGaps короткий (24) и нужен для быстрой адаптации renderDelay к
+  // текущему jitter; для хвоста распределения (p99) 24 сэмпла мало — один
+  // HoL-спайк уже даёт p99=max, без статистической устойчивости. 300 сэмплов
+  // = 10 с истории при 30 Гц: p99 ≈ 3 худших из 300, что достаточно, чтобы
+  // различить «чистый канал» (p99 близок к p95) и «TCP HoL» (p99 заметно
+  // выше p95, редкие 100-500 мс дыры). Ring buffer без shift/push, чтобы
+  // не аллоцировать на hot-path.
+  const SNAP_DIAG_WINDOW = 300;
+  const _snapDiagBuf = new Float32Array(SNAP_DIAG_WINDOW);
+  let _snapDiagHead = 0;
+  let _snapDiagCount = 0;
+  let _snapDiagMax = 0;
+  function _snapDiagPush(gap){
+    _snapDiagBuf[_snapDiagHead] = gap;
+    _snapDiagHead = (_snapDiagHead + 1) % SNAP_DIAG_WINDOW;
+    if(_snapDiagCount < SNAP_DIAG_WINDOW) _snapDiagCount++;
+    if(gap > _snapDiagMax) _snapDiagMax = gap;
+  }
+  function _snapDiagStats(){
+    if(_snapDiagCount < 8) return null;
+    const arr = new Float32Array(_snapDiagCount);
+    for(let i = 0; i < _snapDiagCount; i++) arr[i] = _snapDiagBuf[i];
+    Array.prototype.sort.call(arr, (a,b) => a - b);
+    const at = q => arr[Math.min(_snapDiagCount - 1, Math.floor(_snapDiagCount * q))];
+    return {
+      n: _snapDiagCount,
+      p50: at(0.50), p95: at(0.95), p99: at(0.99),
+      max: arr[_snapDiagCount - 1],
+      maxEver: _snapDiagMax
+    };
+  }
+  let _lastSnapRecvT = 0;
+  // Счётчики для debug-overlay: видимость, что реконсиляция/экстраполяция
+  // реально срабатывают под нагрузкой. _lastP1Drift — мгновенный drift на
+  // последнем снапшоте, _bigSnapCount — hard-snap'ы (катастрофический
+  // дрейф/respawn), _extrapCount — сколько раз буфер опустел и рендерили
+  // экстраполяцией. _snapTotalCount — кумулятив принятых снапшотов, чтобы
+  // в оверлее видеть «поток идёт / поток встал». _stepsLastFrame — сколько
+  // физ-тиков ушло на прошлом кадре (6 = cap, catchup-стутер после хитча).
+  let _lastP1Drift = 0;
+  let _bigSnapCount = 0;
+  let _extrapCount = 0;
+  let _snapTotalCount = 0;
   let _stepsLastFrame = 0;
   // Ring-buffer frame-time'ов для p95 (а не только EWMA). EWMA усредняет
   // спайки до невидимости, хвост распределения точнее показывает stutter.
@@ -1110,6 +1645,14 @@ const Game = (function(){
   let hitFlash = 0;
   let jumpBufferT = 0;
   let stuckT = 0;
+  // Гость: при переходе «ro=true → ro=false» (= хост только что сделал
+  // serveBall()) мяч скачком меняет позицию с точки гола на спавн подачи.
+  // Без этого флага интерполяция A→B между снапшотами плавно «везла» мяч
+  // из точки гола к спавну — выглядело как быстрый полёт. Прячем мяч на
+  // время этого A→B окна, чтобы визуально он пропал в точке гола и
+  // появился уже на спавне при первом кадре нового раунда.
+  let _ballHiddenTeleport = false;
+
   // --- Production polish state ---
   // Pre-allocated pool: на каждый удар spawnParticles делает 4-22 объекта,
   // и при rally из нескольких ударов подряд это стабильный поток new-object
@@ -1177,7 +1720,16 @@ const Game = (function(){
   let sparkles = null;                   // faint twinkling dots
   let matchTime = 0;                     // total in-game seconds (for parallax)
   let rallyHits = 0;                     // consecutive hits for combo feedback
-  let lastHitSide = 0;                   // side (1/2) последнего касания
+  let lastHitSide = 0;                   // side (1/2) последнего касания — для гостевых наград
+  let prevSnapRallyHits = 0;             // на клиенте-госте: последний отрисованный счётчик касаний
+  // Первый принятый snapshot у гостя. Нужен, чтобы показать корректную
+  // подачу на старте: resetMatch() у гостя ставит servingSide=1 и вызывает
+  // serveBall() (= showBig «ПОДАЧА»), но реальная сторона подачи приходит
+  // только с первого снапшота — и если переход roundOver true→false не
+  // срабатывает, гость видит ложную «ПОДАЧА» и без явного индикатора,
+  // чья это подача на самом деле. Флаг позволяет один раз триггернуть
+  // корректный showBig после зеркалирования ss.
+  let firstSnapshotSeen = false;
 
   // Seedable RNG (mulberry32). Math.random десинкнет P2P/rollback-сценарии
   // в будущем, т.к. разные клиенты будут эволюционировать разные «случайные»
@@ -1447,10 +1999,22 @@ const Game = (function(){
     stuckT = 0;
     rallyHits = 0;
     lastHitSide = 0;
+    prevSnapRallyHits = 0;
+    firstSnapshotSeen = false;
     hitFlash = 0;
     matchTime = 0;
-    _stepsLastFrame = 0;
+    // Сбрасываем буфер интерполяции — старые снапшоты прошлого матча не
+    // должны утянуть позиции в новом.
+    _snapHead = 0; _snapCount = 0;
+    snapA.s = null; snapAValid = false;
+    _snapGapsReset();
+    _snapDiagHead = 0; _snapDiagCount = 0; _snapDiagMax = 0;
+    _lastP1Drift = 0; _bigSnapCount = 0; _extrapCount = 0;
+    _snapTotalCount = 0; _stepsLastFrame = 0;
     _frameTimeHead = 0; _frameTimeCount = 0;
+    _lastSnapRecvT = 0;
+    renderDelay = 0.12;
+    _ballHiddenTeleport = false;
     for(let i = 0; i < PARTICLE_CAP; i++) particles[i].dead = true;
     for(let i = 0; i < EMOTE_CAP; i++) emotes[i].dead = true;
     trailHead = 0; trailCount = 0;
@@ -1461,8 +2025,10 @@ const Game = (function(){
     // Сброс счётчиков rate-limit кошелька на новый матч, иначе лимиты
     // «maxPerMatch» останутся от предыдущего.
     Wallet.matchReset();
-    // Новая сессия: свой matchId, seq=0. Если startBotMatch уже подложил
-    // сессию (с matchId под ставки трофеев) — НЕ перезаписываем.
+    // Новая сессия: свой matchId, seq=0. В онлайне именно его мы будем
+    // слать на сервер при каждом награждении/вводе. Если startBotMatch/
+    // startOnlineMatch уже подложил сессию (с matchId под ставки трофеев) —
+    // НЕ перезаписываем, иначе на сервере не сойдётся matchId для match_win.
     if(!state.session) state.session = newSession();
     // Пересеиваем детерминированный RNG от matchId — одна и та же строка
     // даст одну и ту же последовательность на всех клиентах. Подойдёт,
@@ -1483,8 +2049,12 @@ const Game = (function(){
     overlay.classList.add("hidden");
     // Clear any stuck input from the menu
     keys.left = keys.right = keys.jump = false;
+    state.peerKeys.left = state.peerKeys.right = state.peerKeys.jump = false;
     resetMatch();
-    ai = makeAI("medium", rng);
+    // AI только в режиме против бота — в онлайне p2 ведёт либо хост по
+    // локальному вводу соперника, либо сервер-авторитет через снапшоты.
+    ai = state.mode === "bot" ? makeAI("medium", rng) : null;
+    snapAcc = 0;
     last = Clock.now();
     acc = 0;
     cancelAnimationFrame(rafId);
@@ -1514,17 +2084,28 @@ const Game = (function(){
     lastWinnerSide = winnerSide;
     // Keep the simulation running in the background (ball/players coast on
     // inertia, backdrop keeps drifting). Only input is gated — see step().
+    // Повтор доступен всегда: в боте — рестарт, в онлайне — в очередь.
     $("btn-replay").style.display = "";
     showEndOverlay(winnerSide, score1, score2);
     // Drop any keys the user was still holding so players don't keep accelerating.
     keys.left = keys.right = keys.jump = false;
     if(winnerSide === 1){
       sfx.win();
-      Wallet.award("match.win", 50);
-      reportMatchWin();
+      // Приз за матч: в bot/host — своему игроку (p1), в guest матч-монеты
+      // ставит endMatchAsSnapshot после зеркалирования.
+      if(state.mode === "bot" || state.mode === "host"){
+        Wallet.award("match.win", 50);
+        reportMatchWin();
+      }
     }else{
       sfx.lose();
-      reportMatchLoss();
+      // Поражение: bot/host — свой p1 проиграл, списываем трофеи.
+      if(state.mode === "bot" || state.mode === "host") reportMatchLoss();
+    }
+    // Хост отправляет финальный снапшот, чтобы гость корректно закрыл матч —
+    // только в legacy host-auth. В server-auth этим рулит сервер.
+    if(state.mode === "host" && state.netMode !== "auth"){
+      broadcastSnapshot();
     }
   }
 
@@ -1569,6 +2150,135 @@ const Game = (function(){
     trailY[trailHead] = ball.y;
     if(trailCount < TRAIL_LEN) trailCount++;
 
+    // Server-driven ветка: получаем снапшоты и рендерим; локально только
+    // визуальные тики (частицы/эмоции/трейл) выше + client-side prediction
+    // собственного игрока (p1). Используется гостем в host-auth и обоими
+    // клиентами в server-auth.
+    // Важно выйти ДО post-point countdown: иначе клиент со своим
+    // roundTimer=0 каждый кадр, пока авторитет показывает ro=1, вызывал
+    // spawnPlayers()/serveBall() и тем самым «телепортировал» фигурки.
+    const netDriven = (state.mode === "guest") || (state.netMode === "auth");
+    if(netDriven){
+      // flip — в каких координатах пришёл снапшот относительно нашей камеры.
+      // Гость зеркалит, host в auth-режиме — нет.
+      const flip = (state.mode === "guest");
+      // Client-side prediction для своего игрока (p1). На интерконтинентальных
+      // RTT (150–300 мс) ждать ack'а сервера = видеть залипший слайм, отсюда
+      // ощущение «лагов». Мы симулируем p1 локально на тех же константах
+      // (MOVE/JUMP/GRAV), что и сервер, через applyHumanInput (coyote/
+      // jump-buffer/autohop). Сервер у себя крутит applyHumanInput для p1
+      // напрямую по нашему инпуту — reconciliation в consumeSnapshot снапает
+      // любую разницу в один кадр.
+      if(p1 && !state.matchOver){
+        applyHumanInput(p1, dt);
+      } else if(p1){
+        // Матч закончился — у сервера p1.vx гасится экспоненциально. Дублируем
+        // ту же константу, чтобы предсказание не уезжало вечно по инерции.
+        const damp = Math.pow(0.4, dt);
+        p1.vx *= damp;
+      }
+      if(p1){
+        integratePlayer(p1, dt, 0, NET_X - NET_W*0.5);
+      }
+      // Потребляем все снапшоты, ready-время которых уже наступило (recvT <= targetT).
+      // Каждое потребление даёт авторитетные события/скорости; позиции p2/мяча
+      // ставит интерполяция ниже.
+      const nowT = Clock.now() / 1000;
+      const targetT = nowT - renderDelay;
+      while(_snapCount > 0 && _snapSlots[_snapHead].recvT <= targetT){
+        const e = _snapSlots[_snapHead];
+        consumeSnapshot(e.s);
+        snapA.recvT = e.recvT;
+        snapA.s     = e.s;
+        snapAValid  = true;
+        _snapHead = (_snapHead + 1) % SNAP_Q_MAX;
+        _snapCount--;
+      }
+      if(snapAValid && p2 && ball){
+        const B = _snapQAt(0);
+        // opp source: для guest — s.p1 (world-левый = opp для guest),
+        //             для host в auth — s.p2 (world-правый = opp для host).
+        // Mirror x/vx/angle только при flip.
+        const aOpp = flip ? snapA.s.p1 : snapA.s.p2;
+        const aP2x = flip ? (WORLD_W - aOpp.x) : aOpp.x;
+        const aP2y = aOpp.y;
+        const aBx  = flip ? (WORLD_W - snapA.s.b.x) : snapA.s.b.x;
+        const aBy  = snapA.s.b.y;
+        const aBa  = flip ? -snapA.s.b.a : snapA.s.b.a;
+        if(B){
+          const range = B.recvT - snapA.recvT;
+          const alpha = range > 1e-6 ? Math.min(1, Math.max(0, (targetT - snapA.recvT) / range)) : 0;
+          const bOpp = flip ? B.s.p1 : B.s.p2;
+          const bP2x = flip ? (WORLD_W - bOpp.x) : bOpp.x;
+          const bP2y = bOpp.y;
+          const bBx  = flip ? (WORLD_W - B.s.b.x) : B.s.b.x;
+          const bBy  = B.s.b.y;
+          const bBa  = flip ? -B.s.b.a : B.s.b.a;
+          // Hermite (Catmull-Rom с known tangents) для p2 за window.DV_HERMITE_INTERP:
+          // линейная интерполяция даёт видимые «углы» на дугах прыжка при 60 Гц
+          // снапшотах. Hermite использует авторитетные vx/vy из снапшотов как
+          // тангенсы и даёт плавную кривую. Мяч ОСТАВЛЯЕМ линейным — между A и B
+          // может быть коллизия со стеной/сеткой, где скорости меняют знак, и
+          // Hermite даст overshoot через препятствие (реальный риск по ревью).
+          // Для p2.y включаем только когда оба снапшота в воздухе (!onGround) —
+          // иначе отскок от земли между A и B даёт тот же overshoot.
+          if(typeof window !== "undefined" && window.DV_HERMITE_INTERP){
+            const vax = flip ? -aOpp.vx : aOpp.vx;
+            const vbx = flip ? -bOpp.vx : bOpp.vx;
+            const vay = aOpp.vy;
+            const vby = bOpp.vy;
+            const t  = alpha, tt = t*t, ttt = tt*t;
+            const h00 = 2*ttt - 3*tt + 1;
+            const h10 = ttt - 2*tt + t;
+            const h01 = -2*ttt + 3*tt;
+            const h11 = ttt - tt;
+            p2.x = h00*aP2x + h10*range*vax + h01*bP2x + h11*range*vbx;
+            if(!aOpp.g && !bOpp.g){
+              p2.y = h00*aP2y + h10*range*vay + h01*bP2y + h11*range*vby;
+            } else {
+              p2.y = aP2y + (bP2y - aP2y) * alpha;
+            }
+          } else {
+            p2.x = aP2x + (bP2x - aP2x) * alpha;
+            p2.y = aP2y + (bP2y - aP2y) * alpha;
+          }
+          // Телепорт мяча на подачу (см. коммент к roundOver-переходу в консюмере).
+          if(snapA.s.ro && !B.s.ro){
+            ball.x = bBx; ball.y = bBy; ball.angle = bBa;
+            _ballHiddenTeleport = true;
+          } else {
+            ball.x = aBx + (bBx - aBx) * alpha;
+            ball.y = aBy + (bBy - aBy) * alpha;
+            ball.angle = aBa + (bBa - aBa) * alpha;
+            _ballHiddenTeleport = false;
+          }
+        } else {
+          // Буфер пуст (сетевой дроп/спайк) — форвард-экстраполяция от последнего
+          // снапа по его авторитетной скорости.
+          const MAX_EXTRAPOLATE = 0.3;
+          const dtA = Math.min(MAX_EXTRAPOLATE, Math.max(0, targetT - snapA.recvT));
+          if(dtA > 0) _extrapCount++;
+          _ballHiddenTeleport = false;
+          const vx2 = flip ? -aOpp.vx : aOpp.vx;
+          const vy2 = aOpp.vy;
+          const vbx = flip ? -snapA.s.b.vx : snapA.s.b.vx;
+          const p2gnd = !!aOpp.g;
+          p2.x = aP2x + vx2 * dtA;
+          p2.y = p2gnd ? aP2y : (aP2y + vy2 * dtA + 0.5 * GRAV * dtA * dtA);
+          if(p2.x < p2.r) p2.x = p2.r;
+          if(p2.x > WORLD_W - p2.r) p2.x = WORLD_W - p2.r;
+          if(p2.y + p2.r > GROUND_Y) p2.y = GROUND_Y - p2.r;
+          ball.x = aBx + vbx * dtA;
+          ball.y = aBy + snapA.s.b.vy * dtA + 0.5 * GRAV * dtA * dtA;
+          ball.angle = aBa + vbx * dtA * 0.025;
+          if(ball.x < ball.r) ball.x = ball.r;
+          if(ball.x > WORLD_W - ball.r) ball.x = WORLD_W - ball.r;
+          if(ball.y + ball.r > GROUND_Y) ball.y = GROUND_Y - ball.r;
+        }
+      }
+      return;
+    }
+
     // Post-point countdown (ball still bouncing, players can still move).
     // Не запускаем новый раунд после окончания матча — мяч остаётся там,
     // где был забит последний гол, всё докатывается по инерции.
@@ -1587,8 +2297,13 @@ const Game = (function(){
     // Controls — disabled after the match ends; both slimes coast on inertia.
     if(!state.matchOver){
       applyHumanInput(p1, dt);
-      const aIn = ai.decide(p2, ball, dt);
-      applyInput(p2, aIn.left, aIn.right, aIn.jump);
+      if(state.mode === "host"){
+        // Ввод правого игрока приходит по WS от гостя.
+        applyInput(p2, state.peerKeys.left, state.peerKeys.right, state.peerKeys.jump);
+      }else{
+        const aIn = ai.decide(p2, ball, dt);
+        applyInput(p2, aIn.left, aIn.right, aIn.jump);
+      }
     }
 
     // Players
@@ -1692,6 +2407,272 @@ const Game = (function(){
       stuckT = 0;
     }
 
+    // Хост рассылает снапшот на 30 Гц — только в legacy host-auth. В
+    // server-auth авторитет сервер, он сам эмитит снапшоты обоим пирам.
+    if(state.mode === "host" && state.netMode !== "auth"){
+      snapAcc += dt;
+      if(snapAcc >= SNAP_STEP){
+        snapAcc = 0;
+        broadcastSnapshot();
+      }
+    }
+  }
+
+  function broadcastSnapshot(){
+    const ws = gameplaySocket();
+    if(!ws) return;
+    // Backpressure guard: если сокет не успевает флашиться (плохая сеть у
+    // соперника, TCP-буфер забит), не складируем новые снапшоты поверх —
+    // гость всё равно увидит устаревшее состояние, зато у нас send() не
+    // растёт в синхронной очереди и не блокирует event loop. 8 КБ — это
+    // ~130 кадров state (по 61 Б), после которых точно есть отставание.
+    if(ws.bufferedAmount > 8192) return;
+    try {
+      const u = Codec.encodeState(
+        p1, p2, ball,
+        score1, score2, rallyHits,
+        state.matchOver ? 1 : 0,
+        roundOver ? 1 : 0,
+        servingSide,
+        lastWinnerSide,
+        lastHitSide
+      );
+      ws.send(u);
+    } catch(_){}
+  }
+
+  function applySnapshot(s){
+    // Публичная точка входа из onPeerPayload. Просто ставит снапшот в очередь —
+    // реальная обработка (consumeSnapshot) произойдёт в step() через RENDER_DELAY,
+    // давая буфер для интерполяции между двумя известными кадрами.
+    // Принимаем снапшоты: guest (host-auth netMode) + оба пира в server-auth.
+    const canApply = (state.mode === "guest") || (state.netMode === "auth");
+    if(!canApply || !p1 || !p2 || !ball) return;
+    const now = Clock.now() / 1000;
+    // Кольцо заполнено → самый старый слот замещается (drop-oldest).
+    if(_snapCount === SNAP_Q_MAX){
+      _snapHead = (_snapHead + 1) % SNAP_Q_MAX;
+      _snapCount--;
+    }
+    const tailIdx = (_snapHead + _snapCount) % SNAP_Q_MAX;
+    const slot = _snapSlots[tailIdx];
+    slot.recvT = now;
+    slot.s     = s;
+    _snapCount++;
+    _snapTotalCount++;
+    // Stage 8 адаптация: p99 (было p95) интер-арривал гэпов за SNAP_GAP_WINDOW
+    // снапшотов. p95 игнорирует хвост распределения — на Hathora TLS-edge
+    // именно эти «редкие но болезненные» 100-200 мс спайки давали extrap/
+    // hard-snap. p99 × 1.10 целит чуть выше 99-го перцентиля, покрывая 1/100
+    // худших гэпов без over-buffering на чистой сети.
+    // Не даём колебаниям переехать вниз (EMA-сглаживание на убывании), иначе
+    // один быстрый снап утащил бы renderDelay ниже уровня jitter и дал бы
+    // hitch через кадр, когда прилетит обычный «запаздыватель».
+    if(_lastSnapRecvT > 0){
+      const gap = now - _lastSnapRecvT;
+      _snapDiagPush(gap);
+      _snapGapsPush(gap);
+      if(_snapGapCount >= 8){
+        // Копируем живой префикс в scratch-буфер и сортируем in-place через
+        // insertion sort. Для n≤24 (SNAP_GAP_WINDOW) O(n²) ≤ ~576 сравнений —
+        // в разы дешевле, чем Array.prototype.sort с per-call closure-компаратором
+        // и subarray-view (тот путь аллоцировал Function+TypedArray view 60 раз/сек).
+        const n = _snapGapCount;
+        for(let i = 0; i < n; i++) _snapGapScratch[i] = _snapGapBuf[i];
+        for(let i = 1; i < n; i++){
+          const v = _snapGapScratch[i];
+          let j = i - 1;
+          while(j >= 0 && _snapGapScratch[j] > v){
+            _snapGapScratch[j + 1] = _snapGapScratch[j];
+            j--;
+          }
+          _snapGapScratch[j + 1] = v;
+        }
+        const p99 = _snapGapScratch[Math.min(n - 1, Math.floor(n * 0.99))];
+        const target = Math.max(RENDER_DELAY_MIN, Math.min(RENDER_DELAY_MAX, p99 * 1.10));
+        // Быстро поднимаемся (чтобы не ловить rubber-band), медленно опускаемся.
+        renderDelay = target > renderDelay
+          ? target
+          : renderDelay * 0.94 + target * 0.06;
+      }
+    }
+    _lastSnapRecvT = now;
+  }
+
+  function consumeSnapshot(s){
+    // Применение авторитетного снапшота, сдвинутого по времени на RENDER_DELAY.
+    // Занимается: событиями (счёт/подача/удар/matchOver), скоростями p2/мяча,
+    // реконсиляцией p1. Позиции p2/мяча НЕ ставит — их ставит интерполяция
+    // в step() между двумя снапшотами (snapA → snapQ[0]).
+    const canApply = (state.mode === "guest") || (state.netMode === "auth");
+    if(!canApply || !p1 || !p2 || !ball) return;
+    // flip=true — гость: собственный игрок у него слева, но в мировых
+    //   координатах авторитета он p2 (справа). Зеркалим x и vx, меняем s1↔s2.
+    // flip=false — host в server-auth: мир уже в тех же координатах, что
+    //   клиентская камера (свой = p1, слева). Никакого mirror'а.
+    const flip = (state.mode === "guest");
+    const selfSrc = flip ? s.p2 : s.p1;
+    const oppSrc  = flip ? s.p1 : s.p2;
+    const mapX  = (x) => flip ? WORLD_W - x : x;
+    const mapVx = (v) => flip ? -v : v;
+    const mapBA = (a) => flip ? -a : a;
+    //
+    // Собственный игрок (p1) предсказывается локально в step() — не
+    // перезаписываем его из снапшота целиком, иначе на высоком RTT вернётся
+    // лаг: сервер видит ввод на RTT/2 позже, его снапшот тянет предсказание
+    // назад. Две ветки реконсиляции:
+    //   1) hard snap — только для respawn (big) и катастрофического
+    //      дрифта (>P1_HARD_SNAP_PX), это телепорт с ресетом скоростей.
+    //   2) EMA-catchup — в штатном режиме плавно подтягиваем предсказание
+    //      к авторитетной позиции. При высоком RTT prediction стабильно
+    //      убегает на MOVE*RTT/2 пикселей вперёд от снапшота сервера, и
+    //      агрессивный α даёт визуальный «рывок назад» на каждом снапшоте.
+    const CORRECT_SNAP_PX = 120;
+    const P1_HARD_SNAP_PX = 400;
+    const P1_DEAD_PX       = 25;
+    const P1_CATCHUP_ALPHA = 0.10;
+    const nx1 = mapX(selfSrc.x), ny1 = selfSrc.y;
+    const nx2 = mapX(oppSrc.x),  ny2 = oppSrc.y;
+    const nbx = mapX(s.b.x),     nby = s.b.y;
+    const big = (Math.abs(nx2 - p2.x) > CORRECT_SNAP_PX || Math.abs(ny2 - p2.y) > CORRECT_SNAP_PX
+              || Math.abs(nbx - ball.x) > CORRECT_SNAP_PX || Math.abs(nby - ball.y) > CORRECT_SNAP_PX);
+    const p1Drift = Math.hypot(nx1 - p1.x, ny1 - p1.y);
+    _lastP1Drift = p1Drift;
+    if(big || p1Drift > P1_HARD_SNAP_PX){
+      _bigSnapCount++;
+      p1.x = nx1; p1.y = ny1; p1.vx = mapVx(selfSrc.vx); p1.vy = selfSrc.vy; p1.onGround = !!selfSrc.g;
+      p1.prevX = p1.x; p1.prevY = p1.y;
+    } else if(p1Drift > P1_DEAD_PX){
+      const excess = (p1Drift - P1_DEAD_PX) / p1Drift;
+      p1.x += (nx1 - p1.x) * P1_CATCHUP_ALPHA * excess;
+      p1.y += (ny1 - p1.y) * P1_CATCHUP_ALPHA * excess;
+    }
+    p2.vx = mapVx(oppSrc.vx); p2.vy = oppSrc.vy; p2.onGround = !!oppSrc.g;
+    ball.vx = mapVx(s.b.vx); ball.vy = s.b.vy;
+    if(big){
+      // Respawn/телепорт — снапаем интерполяцию к новым позициям, чтобы на
+      // следующем кадре не было визуального «тягучего» перехода через пол-экрана.
+      p2.x = nx2; p2.y = ny2;
+      ball.x = nbx; ball.y = nby; ball.angle = mapBA(s.b.a);
+      p2.prevX = p2.x; p2.prevY = p2.y;
+      ball.prevX = ball.x; ball.prevY = ball.y; ball.prevAngle = ball.angle;
+    }
+    const prevRoundOver = roundOver;
+    const prevServingSide = servingSide;
+    // servingSide local: 1 = our side serves, 2 = opp. В снапшоте ss=1 =
+    // p1 (world-левый) подаёт; при flip это для guest — opp (p2 local).
+    servingSide = flip ? (s.ss === 1 ? 2 : 1) : (s.ss === 1 ? 1 : 2);
+    roundOver = !!s.ro;
+    // Фидбек подачи у гостя: переход roundOver true→false на хосте = только
+    // что сработал serveBall(). Показываем тот же showBig/sfx.serve(), что
+    // и host, чтобы гость понимал, чья сейчас подача. На первом снапшоте
+    // триггерим явно: resetMatch() у гостя по умолчанию показал «ПОДАЧА»
+    // (servingSide=1), но реальная сторона могла прийти другой — обновляем,
+    // если хост-авторитет не совпал с нашим локальным дефолтом.
+    const serveTransition = prevRoundOver && !roundOver;
+    const firstServeCorrection = !firstSnapshotSeen && !roundOver && servingSide !== prevServingSide;
+    if(serveTransition || firstServeCorrection){
+      Fx.serve(servingSide);
+    }
+    firstSnapshotSeen = true;
+    const incomingRh = s.rh || 0;
+    // Гостевые награды за касания мяча. В мировых координатах авторитета
+    // гость — p2 (lh===2). Счётчик rh только растёт в пределах раунда и
+    // сбрасывается в 0 на очко; зеркалим при необходимости, смотрим прирост.
+    if(incomingRh > prevSnapRallyHits){
+      const deltaHits = incomingRh - prevSnapRallyHits;
+      // hitterSide local: 1 = self hit, 2 = opp. На flip lh↔hitterSide.
+      const hitterSide = flip
+        ? (s.lh === 1 ? 2 : (s.lh === 2 ? 1 : 0))
+        : (s.lh | 0);
+      // Wallet: начисляем только свои касания (hitterSide===1). Идём по
+      // delta'е, а не по одному событию: если между снапшотами прошло
+      // несколько касаний подряд, каждое из них — повод для награды.
+      if(hitterSide === 1){
+        for(let i = 0; i < deltaHits; i++){
+          Wallet.award("rally.hit", 1);
+          const combo = prevSnapRallyHits + i + 1;
+          if(combo > 0 && combo % 5 === 0) Wallet.award("rally.combo", combo);
+        }
+      }
+      // Визуальный фидбек. Хост в collideBallPlayer показывает эффекты
+      // локально, но они не летят в снапшот — восстанавливаем их по lh/rh.
+      // isSpike мы без дополнительных полей в снапшоте не определим, поэтому
+      // на госте всегда обычный удар. Spike-инфо — кандидат в wire-format
+      // расширение (этап 2 netcode-плана).
+      Fx.hit(hitterSide, ball.x, ball.y, false);
+      // squash.p1/p2 — гостевой workaround за отсутствие landing-squash
+      // в снапшоте: impact-velocity у хоста срабатывает в integratePlayer,
+      // а гость её не видит. Бампим сквош того, кто ударил, чтобы удар
+      // «ощущался» визуально не хуже, чем у хоста.
+      if(hitterSide === 1)      squash.p1 = Math.max(squash.p1, 0.14);
+      else if(hitterSide === 2) squash.p2 = Math.max(squash.p2, 0.14);
+      lastHitSide = hitterSide;
+      rallyHits = incomingRh;
+      Fx.combo(rallyHits);
+    }
+    prevSnapRallyHits = incomingRh;
+    rallyHits = incomingRh;
+    const newS1 = flip ? s.s2 : s.s1;
+    const newS2 = flip ? s.s1 : s.s2;
+    if(newS1 !== score1 || newS2 !== score2){
+      const wasP1 = score1, wasP2 = score2;
+      score1 = newS1; score2 = newS2;
+      // HUD держим в синхроне даже если счёт не вырос — защита от крайнего
+      // случая (напр. несинхронный reset), чтобы цифры не разъехались с
+      // авторитетом. В штатной игре счёт монотонен, Fx.point ниже всё равно
+      // перезапишет те же числа — идемпотентно.
+      $("hud-score-p1").textContent = String(score1);
+      $("hud-score-p2").textContent = String(score2);
+      const scoredSide = (score1 > wasP1) ? 1 : (score2 > wasP2) ? 2 : 0;
+      // Фидбек на очко у гостя: ровно тот же Fx.point, что в host'ном
+      // awardPoint. reason="foul" не приходит в снапшоте — всегда point/miss.
+      // Wallet.award round.win только когда своя сторона (scoredSide===1);
+      // на хосте это тоже условно, симметрия сохранена.
+      if(scoredSide > 0){
+        Fx.point(scoredSide, false);
+        if(scoredSide === 1) Wallet.award("round.win", 5);
+      }
+    }
+    if(s.mo && !state.matchOver){
+      // winnerSide local: 1 = self won, 2 = opp. При flip меняем местами.
+      const winnerLocal = flip ? (s.w === 1 ? 2 : 1) : (s.w | 0);
+      endMatchAsSnapshot(winnerLocal);
+    }
+  }
+
+  function endMatchAsSnapshot(winnerSide){
+    state.matchOver = true;
+    lastWinnerSide = winnerSide;
+    // После зеркалирования снапшота гость тоже видит «себя» как сторону 1.
+    // «Играть заново» в онлайне = выйти из матча и встать в новую очередь.
+    $("btn-replay").style.display = "";
+    showEndOverlay(winnerSide, score1, score2);
+    keys.left = keys.right = keys.jump = false;
+    if(winnerSide === 1){
+      sfx.win();
+      // В зеркалке гостя side 1 — это его «я», так что матч-приз его.
+      Wallet.award("match.win", 50);
+      // Гость репортит в лидерборд только свои победы.
+      reportMatchWin();
+    }else{
+      sfx.lose();
+      reportMatchLoss();
+    }
+  }
+
+  // Соперник вышел из матча — засчитываем форфейт, победа «нашей» стороне (p1)
+  // c призом, как за честную победу. Вызывается из onPeerLeft при активном
+  // матче. Если матч уже завершён — просто ничего не делаем.
+  function endByForfeit(){
+    if(!state.inGame || state.matchOver) return;
+    state.matchOver = true;
+    lastWinnerSide = 1;
+    $("btn-replay").style.display = "";
+    showEndOverlay(1, score1, score2, I18n.t("game.opponent_left"));
+    keys.left = keys.right = keys.jump = false;
+    sfx.win();
+    Wallet.award("match.win", 50);
   }
 
   // Бот/удалённый peer: pure-часть в DVPhysics. sfx.jump — клиентский звук.
@@ -1727,9 +2708,10 @@ const Game = (function(){
     }
   }
 
-  // Pure-физика — в shared physics.js. Здесь — только application-state:
-  // FX, счётчики touches, 4-touch rule, Wallet.award. rally.hit начисляется
-  // только для p.side===1 (свой игрок).
+  // Pure-физика — в shared physics.js (Этап 2 netcode будет крутить её на
+  // сервере). Здесь — только application-state: FX, счётчики touches, 4-touch
+  // rule, Wallet.award. Гостю lastHitSide/очки прилетают через applySnapshot,
+  // поэтому rally.hit начисляется только в bot/host и только для p.side===1.
   function collideBallPlayer(p){
     const ev = DVPhysics.collideBallPlayer(ball, p, GROUND_Y);
     if(!ev.hit) return;
@@ -1737,7 +2719,8 @@ const Game = (function(){
     rallyHits++;
     lastHitSide = p.side;
     Fx.combo(rallyHits);
-    if(p.side === 1){
+    const isOwnHit = (p.side === 1) && (state.mode === "bot" || state.mode === "host");
+    if(isOwnHit){
       Wallet.award("rally.hit", 1);
       if(rallyHits > 0 && rallyHits % 5 === 0) Wallet.award("rally.combo", rallyHits);
     }
@@ -1758,8 +2741,10 @@ const Game = (function(){
     if(side===1){ score1++; servingSide = 1; }
     else        { score2++; servingSide = -1; }
     Fx.point(side, reason === "foul");
-    // Монеты: +5 за выигранное очко (свой игрок = side 1).
-    if(side === 1) Wallet.award("round.win", 5);
+    // Монеты: +5 за выигранное очко. Bot/host — когда side===1 (свой игрок).
+    // Гостю начисляется в applySnapshot, когда его «свой» счёт (mirror s.s2)
+    // вырос между снапшотами.
+    if(side === 1 && (state.mode === "bot" || state.mode === "host")) Wallet.award("round.win", 5);
     const t = state.targetScore;
     if((score1 >= t || score2 >= t) && Math.abs(score1 - score2) >= 2){
       endMatch(score1 > score2 ? 1 : 2);
@@ -2406,8 +3391,11 @@ const Game = (function(){
     return entry.frames[idx] || null;
   }
 
-  // Фолбэк-юзер для рендера, когда state.user/state.bot временно null.
-  // Без фолбэка drawPlayer кидал TypeError по .avatar_url на каждый кадр.
+  // Фолбэк-юзер для рендера, когда state.opponent/state.user временно
+  // null — например, peer_left мидматч после forfeit: оппонент чистится,
+  // но render продолжается до unmount overlay'ем. Без фолбэка drawPlayer
+  // кидал TypeError по .avatar_url на каждый кадр, забивая консоль и сжирая
+  // CPU перехватами ошибок на слабых устройствах.
   const FALLBACK_USER = { color: "#5865f2", global_name: "?", avatar_url: null };
   function getAvatarCanvas(user, size){
     if(!user) user = FALLBACK_USER;
@@ -2524,6 +3512,7 @@ const Game = (function(){
   }
 
   function drawBall(){
+    if(_ballHiddenTeleport) return;
     const bx = ball.renderX, by = ball.renderY;
     // Soft ground shadow scaled by height above court
     const shf = 1 - Math.min(0.7, (GROUND_Y - by)/GROUND_Y);
@@ -2605,6 +3594,7 @@ const Game = (function(){
   }
   function drawBallOffscreenIndicator(){
     if(!ball) return;
+    if(_ballHiddenTeleport) return;
     const offTop = -ball.renderY;
     if(offTop <= ball.r) return;
     const alpha = Math.min(1, (offTop - ball.r) / 24);
@@ -2764,7 +3754,9 @@ const Game = (function(){
         }
         // Как только деградировали на десктопе — снижаем физ-рейт со 120 до
         // 60 Гц. Это убирает второй step-вызов на каждый кадр (коллизии/
-        // integrate), давая кадровый бюджет обратно.
+        // integrate/broadcast-аккумулятор), давая host'у в PvP запас на сеть
+        // и рендер. В онлайне хостовой броадкаст идёт от acc в step(), так
+        // что частота снапшотов не меняется — SNAP_STEP=33мс независимо от STEP.
         if(lowQuality && !isTouch && STEP !== STEP_LO) _switchStep(STEP_LO);
         if(lowQuality) goodFramesInLowQ = 0;
       } else {
@@ -2830,12 +3822,17 @@ const Game = (function(){
   }
 
   // Синхронизация источника тика с видимостью вкладки. В foreground — rAF,
-  // в background — worker-таймер (rAF троттлится до 1 Гц). Таймеры воркера
-  // не троттлятся — бот-матч продолжается при свёрнутой вкладке.
+  // в background — worker-таймер, но только для участников, которые
+  // двигают авторитетное состояние (host в legacy host-auth или bot).
+  // В server-auth ни одному клиенту не надо тикать в фоне — авторитет
+  // сервер, всё что нужно — принимать снапшоты при возврате во фронт.
   document.addEventListener("visibilitychange", () => {
     if(document.hidden){
       if(rafId){ cancelAnimationFrame(rafId); rafId = 0; }
-      if(state.inGame){
+      const needsBgTick =
+        state.mode === "bot" ||
+        (state.mode === "host" && state.netMode !== "auth");
+      if(state.inGame && needsBgTick){
         // last обновится в первом же _tickCore — это нормально, просто первый
         // dt будет 0 (Clock.now() только что писали в last внутри loop).
         last = Clock.now();
@@ -2866,9 +3863,13 @@ const Game = (function(){
 
   // Debug-хук только под тестами. В продакшне p1/p2/ball инкапсулированы.
   function _debug(){
+    const nowSec = Clock.now() / 1000;
     const ws = (typeof state !== "undefined") ? state.ws : null;
     const wsState = ws ? ({0:"CONN", 1:"OPEN", 2:"CLOSING", 3:"CLOSED"})[ws.readyState] || "?" : "(none)";
-    // performance.memory — только в Chrome/Edge. Null-безопасно.
+    const gws = (typeof state !== "undefined") ? state.gameWs : null;
+    const gameWsState = gws ? ({0:"CONN", 1:"OPEN", 2:"CLOSING", 3:"CLOSED"})[gws.readyState] || "?" : "(none)";
+    // performance.memory — только в Chrome/Edge. Null-безопасно: если движок
+    // не отдаёт, ничего страшного, просто не показываем строку.
     const mem = (typeof performance !== "undefined" && performance.memory)
       ? performance.memory.usedJSHeapSize / 1048576
       : null;
@@ -2877,7 +3878,9 @@ const Game = (function(){
       p1: p1 ? { x: p1.x, y: p1.y, vx: p1.vx, vy: p1.vy, g: p1.onGround } : null,
       p2: p2 ? { x: p2.x, y: p2.y, vx: p2.vx, vy: p2.vy, g: p2.onGround } : null,
       ball: ball ? { x: ball.x, y: ball.y, vx: ball.vx, vy: ball.vy } : null,
-      score1, score2,
+      score1, score2, snapQLen: _snapCount,
+      snapAtoB: snapAValid && _snapCount > 0 ? (_snapQAt(0).recvT - snapA.recvT) : null,
+      renderDelay,
       // Perf-снимок: EWMA frame-time + p95 хвост, флаг деградации, current
       // STEP в Гц, slowFrames к lowQuality-порогу, сколько физ-шагов ушло
       // на прошлом кадре (6 = cap, post-hitch catchup). heapMB = JS-heap,
@@ -2886,11 +3889,22 @@ const Game = (function(){
       lowQuality, slowFrames, stepHz: Math.round(1 / STEP),
       stepsLastFrame: _stepsLastFrame,
       heapMB: mem,
-      wsState,
-      ballSpeed: ball ? Math.hypot(ball.vx, ball.vy) : 0
+      // Netcode-счётчики + live-поле «сколько мс назад приходил последний
+      // снапшот»: если растёт и не обнуляется — поток от хоста встал.
+      p1Drift: _lastP1Drift, bigSnaps: _bigSnapCount, extraps: _extrapCount,
+      snapTotal: _snapTotalCount,
+      timeSinceSnap: _lastSnapRecvT > 0 ? (nowSec - _lastSnapRecvT) : null,
+      wsState, gameWsState,
+      // Скорость мяча — «мяч должен двигаться, а vx/vy=0» = физика встала.
+      ballSpeed: ball ? Math.hypot(ball.vx, ball.vy) : 0,
+      // Jitter-статистика по 300 последним интер-арривалам снапшотов
+      // (host→guest). Диагноз TCP head-of-line blocking: p99 заметно выше
+      // p95 (например p95=45 мс, p99=250 мс) = редкие выпавшие сегменты
+      // держат буфер ядра на время retransmit. Null, пока сэмплов мало.
+      snapJitter: _snapDiagStats()
     };
   }
-  return { start, stop, refreshOverlay, triggerEmote,_debug };
+  return { start, stop, refreshOverlay, triggerEmote, applySnapshot, endByForfeit, _debug };
 })();
 if (typeof window !== "undefined") window.__dvDebug = () => Game._debug();
 
@@ -2933,12 +3947,22 @@ if (typeof window !== "undefined") window.__dvDebug = () => Game._debug();
     try{ d = window.__dvDebug && window.__dvDebug(); }catch(_){ d = null; }
     if(!d){ panel.textContent = "debug: game not ready"; return; }
     const fps = d.frameTimeAvg > 0 ? 1000 / d.frameTimeAvg : 0;
+    const j = d.snapJitter;
+    // «Возраст» последнего снапшота в мс — если поток встал, значение растёт
+    // без обнуления, визуальный сигнал на рост видно сразу.
+    const sinceMs = d.timeSinceSnap != null ? d.timeSinceSnap * 1000 : null;
     const lines = [
       "mode: " + (d.mode || "—") + (d.inGame ? " (in-game)" : "") + (d.matchOver ? " END" : "") + (d.lowQuality ? " LQ" : ""),
       "fps:  " + fmt(fps, 0) + "   ft avg/p95: " + fmt(d.frameTimeAvg) + "/" + (d.frameTimeP95 != null ? fmt(d.frameTimeP95) : "—") + "ms",
       "step: " + d.stepHz + "Hz   steps/f: " + d.stepsLastFrame + (d.stepsLastFrame >= 6 ? "!" : "") + "   slow: " + d.slowFrames,
       "heap: " + (d.heapMB != null ? fmt(d.heapMB, 0) + "MB" : "—") + "   score: " + d.score1 + ":" + d.score2,
-      "ws: " + d.wsState,
+      "— netcode —",
+      "ws: " + d.wsState + "   snaps: " + d.snapTotal + "   since: " + (sinceMs != null ? fmt(sinceMs, 0) + "ms" : "—"),
+      "renderDelay: " + fmt(d.renderDelay * 1000, 0) + "ms   snapQ: " + d.snapQLen + "   A→B: " + (d.snapAtoB != null ? fmt(d.snapAtoB * 1000, 0) + "ms" : "—"),
+      "drift: " + fmt(d.p1Drift, 0) + "px   hardsnap: " + d.bigSnaps + "   extrap: " + d.extraps,
+      j
+        ? "jitter p50/p95/p99: " + fmt(j.p50 * 1000, 0) + "/" + fmt(j.p95 * 1000, 0) + "/" + fmt(j.p99 * 1000, 0) + "ms (n=" + j.n + ")"
+        : "jitter: collecting…",
       "ball: " + fmt(d.ballSpeed, 0) + "px/s"
     ];
     panel.textContent = lines.join("\n");
