@@ -2347,13 +2347,14 @@ const Game = (function(){
         g.beginPath(); g.arc(size/2,size/2,size/2,0,Math.PI*2); g.clip();
         try{ g.drawImage(img, 0, 0, size, size); }catch(_){
           // CORS-провал рисования на canvas — оставляем букву-заглушку.
-          g.restore();
-          return;
         }
         g.restore();
+        // Освобождаем замыкание: иначе `img` держит g/c/size + сам себя
+        // через handler'ы, а при частой смене ботов (replay) такие
+        // orphan bitmap'ы висят в heap до major GC.
+        img.onload = img.onerror = null;
       };
-      // onerror — оставляем canvas с буквой, молча, без логов в прод.
-      img.onerror = ()=>{};
+      img.onerror = ()=>{ img.onload = img.onerror = null; };
       img.src = safeUrl;
     }
     return c;
