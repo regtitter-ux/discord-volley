@@ -670,18 +670,23 @@ const lobbyOverlay   = $("lobby-overlay");
 const lobbyCountdown = $("lobby-countdown");
 const lobbyTitle     = $("lobby-title");
 const lobbySub       = $("lobby-sub");
-// 5-секундный клиентский fallback: если за это время matched не прилетел,
-// тихо отменяем очередь и садим игрока против бота. Сервер держит собственный
-// QUEUE_TIMEOUT_MS (30с по дефолту) как safety-net — если клиент не успел
-// прислать cancel, сервер уберёт игрока из очереди сам. Коротко ждать лучше,
-// чем показывать 30с «поиск» на пустой очереди глобально распределённой игры.
-const QUEUE_COUNTDOWN_MS = 5000;
+// 5-секундный клиентский fallback: если за это время matched/matched_pending
+// не прилетел, тихо отменяем очередь и садим игрока против бота. Сервер
+// держит собственный QUEUE_TIMEOUT_MS (30с по дефолту) как safety-net.
+const QUEUE_COUNTDOWN_MS   = 5000;
+// После matched_pending pair уже сложилась — теперь ждём, пока Hathora edge
+// поднимет контейнер (cold-start до 15с). Даём 20с с запасом; если не успел,
+// всё равно откатываемся в бот. pairLocal-фолбэк на сервере при Hathora-fail
+// укладывается в тот же бюджет и успеет прислать обычный matched.
+const PREPARE_COUNTDOWN_MS = 20000;
 
 let lobbyTickTimer = 0;
 let lobbyFallbackTimer = 0;
 let lobbyCountdownStart = 0;
+let lobbyCountdownBudgetMs = QUEUE_COUNTDOWN_MS;
 function startLobbyCountdown(){
   lobbyCountdownStart = performance.now();
+  lobbyCountdownBudgetMs = QUEUE_COUNTDOWN_MS;
   updateLobbyCountdown();
   if(lobbyTickTimer) clearInterval(lobbyTickTimer);
   lobbyTickTimer = setInterval(updateLobbyCountdown, 100);
@@ -692,9 +697,23 @@ function stopLobbyCountdown(){
   if(lobbyTickTimer){ clearInterval(lobbyTickTimer); lobbyTickTimer = 0; }
   if(lobbyFallbackTimer){ clearTimeout(lobbyFallbackTimer); lobbyFallbackTimer = 0; }
 }
+// После matched_pending pair уже найден, дальше ждём Hathora cold-start.
+// Перезапускаем countdown с расширенным бюджетом (20с) и другим текстом —
+// игрок видит "готовим матч" и не думает, что система зависла. _waitingQueue
+// остаётся true, чтобы запоздавший matched был принят обычным кодом.
+function switchLobbyToPreparing(){
+  if(!state._waitingQueue) return;
+  lobbyCountdownStart = performance.now();
+  lobbyCountdownBudgetMs = PREPARE_COUNTDOWN_MS;
+  updateLobbyCountdown();
+  if(lobbyFallbackTimer) clearTimeout(lobbyFallbackTimer);
+  lobbyFallbackTimer = setTimeout(onLobbyTimeoutFallback, PREPARE_COUNTDOWN_MS);
+  lobbyTitle.textContent = I18n.t("lobby.preparing");
+  lobbySub.textContent   = I18n.t("lobby.preparing_hint");
+}
 function updateLobbyCountdown(){
   const elapsed = performance.now() - lobbyCountdownStart;
-  const left = Math.max(0, QUEUE_COUNTDOWN_MS - elapsed);
+  const left = Math.max(0, lobbyCountdownBudgetMs - elapsed);
   lobbyCountdown.textContent = String(Math.ceil(left / 1000));
 }
 
@@ -875,11 +894,25 @@ function onServerMessage(msg){
         Wallet.set(msg.coins, d);
       }
       break;
+    case "matched_pending":
+      // Pair найден, сервер уже пошёл поднимать Hathora-комнату. Гасим 5с
+      // бот-fallback, перезапускаем countdown на 20с для Hathora cold-start.
+      // _waitingQueue остаётся true — запоздавший matched попадёт в блок
+      // ниже как обычно.
+      if(state._waitingQueue) switchLobbyToPreparing();
+      break;
     case "matched":
-      // Race-guard: 5с fallback-таймер мог уже стартовать бот-матч, а matched
+      // Race-guard: fallback-таймер мог уже стартовать бот-матч, а matched
       // прилететь чуть позже (queue попал к партнёру на 4.9с и сервер не
-      // успел). Игнорируем запоздавший matched — игрок уже в бот-матче.
-      if(!state._waitingQueue) break;
+      // успел; либо Hathora cold-start проскочил 20с). Игнорируем
+      // запоздавший matched — игрок уже в бот-матче. Важно: шлём leave
+      // серверу, чтобы очистить серверный ws.roomId, иначе следующий queue
+      // будет отвергнут по `if (ws.roomId) return;` как «уже в матче».
+      if(!state._waitingQueue){
+        try { state.ws && state.ws.readyState === 1 &&
+              state.ws.send(JSON.stringify({ type: "leave" })); } catch(_){}
+        break;
+      }
       state._waitingQueue = false;
       // PvP: сервер выдал matchId + ставки трофеев. Клиент НЕ катает
       // случайки самостоятельно — используем то, что прислали, иначе

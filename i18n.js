@@ -110,10 +110,12 @@
       "game.foul":      "ФОЛ",
       "game.opponent_left": "Соперник сдался",
 
-      "lobby.searching":     "Поиск соперника…",
-      "lobby.fallback_hint": "Если никого не найдём за 5 секунд — играем с ботом.",
-      "lobby.cancel":        "Отмена",
-      "lobby.disconnected":  "Соединение разорвано",
+      "lobby.searching":      "Поиск соперника…",
+      "lobby.fallback_hint":  "Если никого не найдём за 5 секунд — играем с ботом.",
+      "lobby.preparing":      "Соперник найден, готовим матч…",
+      "lobby.preparing_hint": "Запускаем игровую комнату рядом с вами.",
+      "lobby.cancel":         "Отмена",
+      "lobby.disconnected":   "Соединение разорвано",
 
       "wallet.label":   "Монеты",
 
@@ -180,10 +182,12 @@
       "game.foul":      "FOUL",
       "game.opponent_left": "Opponent forfeited",
 
-      "lobby.searching":     "Looking for opponent…",
-      "lobby.fallback_hint": "If nobody shows up in 5 seconds — we play a bot match.",
-      "lobby.cancel":        "Cancel",
-      "lobby.disconnected":  "Disconnected",
+      "lobby.searching":      "Looking for opponent…",
+      "lobby.fallback_hint":  "If nobody shows up in 5 seconds — we play a bot match.",
+      "lobby.preparing":      "Opponent found, preparing match…",
+      "lobby.preparing_hint": "Spinning up a game room near you.",
+      "lobby.cancel":         "Cancel",
+      "lobby.disconnected":   "Disconnected",
 
       "wallet.label":   "Coins",
 

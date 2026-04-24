@@ -842,6 +842,15 @@ async function pairHathora(host, guest){
     console.warn("[ws] pairHathora: ROOM_SECRET пуст — fallback to pairLocal");
     return pairLocal(host, guest);
   }
+  // Hathora cold-start: hathoraClient.createRoom может ждать до 15 секунд,
+  // пока контейнер в нужном регионе поднимется. Клиент к этому моменту уже
+  // 5 секунд как хочет свалить в бот-матч (см. QUEUE_COUNTDOWN_MS). Шлём
+  // matched_pending моментально — клиент гасит 5с fallback и переключается
+  // на «готовим матч» с расширенным 20с таймером. Настоящий matched придёт
+  // после того, как room поднимется; если упадёт — падаем в pairLocal (ниже
+  // catch), клиент всё равно получит настоящий matched до истечения 20с.
+  try { send(host,  { type: "matched_pending" }); } catch(_){}
+  try { send(guest, { type: "matched_pending" }); } catch(_){}
   const roomId  = crypto.randomBytes(6).toString("hex");
   const matchId = "pm-" + crypto.randomBytes(8).toString("hex");
   const stakes  = rollStakes();
