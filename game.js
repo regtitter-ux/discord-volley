@@ -1142,7 +1142,12 @@ async function startMatchmaking(){
   try { ws.send(JSON.stringify({ type: "queue" })); } catch(_){}
 }
 
-$("btn-play").addEventListener("click", startMatchmaking);
+// PvP временно отключён: кнопка «Играть» сразу стартует бот-матч, лобби
+// и 5с таймер не показываются. Матчмейкинг (startMatchmaking, matched_*,
+// onPeerPayload, onPeerLeft) и серверная инфраструктура (pairHathora,
+// multi-region, shadowsim) в коде остаются — для реактивации достаточно
+// вернуть строку `startMatchmaking` в слушатель.
+$("btn-play").addEventListener("click", startBotMatch);
 
 $("btn-lobby-cancel").addEventListener("click", ()=>{
   state._waitingQueue = false;
@@ -1382,18 +1387,15 @@ function showEndOverlay(winnerSide, s1, s2, subOverride){
   overlay.classList.remove("hidden");
 }
 $("btn-replay").addEventListener("click", ()=>{
-  // Новый матч — свежий matchId + свежие ставки трофеев. Иначе сервер
-  // увидит повторный match_win по закрытому matchId и проигнорирует.
-  if(state.mode === "bot"){
-    state.session = { matchId: "b-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2,8), startedAt: Date.now(), seq: 0 };
-    state.stakes = null;
-    requestStakes(state.session.matchId);
-    Game.start();
-    return;
-  }
-  // В онлайне «повтор» = выйти из текущего матча и сразу встать в очередь.
-  quitToMenu();
-  startMatchmaking();
+  // PvP отключён — «Играть снова» всегда стартует свежий бот-матч.
+  // Ветка quitToMenu + startMatchmaking оставлена в коде ниже закомментированной
+  // как быстрый путь обратно, когда онлайн включим снова.
+  if(state.mode !== "bot") quitToMenu();
+  state.session = { matchId: "b-" + Date.now().toString(36) + "-" + Math.random().toString(36).slice(2,8), startedAt: Date.now(), seq: 0 };
+  state.stakes = null;
+  requestStakes(state.session.matchId);
+  if(state.mode !== "bot") startBotMatch();
+  else Game.start();
 });
 function quitToMenu(){
   // Если мы в онлайне — корректно уведомим сервер через {type:"leave"},
