@@ -1685,7 +1685,10 @@ const Game = (function(){
     buildBackdropSprite();
     ctx.drawImage(_backdropSprite, 0, 0, WORLD_W, WORLD_H);
     drawSparkles();
-    drawClouds();
+    // Облака — декоративный parallax. 10 штук × save/translate/rotate/
+    // drawImage/restore. rotate() отключает HW-батчинг на каждое облако,
+    // что ощутимо на iGPU. В lowQuality скипаем — поле и так читается.
+    if(!lowQuality) drawClouds();
     drawNetHalo();
 
     // Court + base line (Discord sidebar / channel list vibe)
