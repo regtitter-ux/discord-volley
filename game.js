@@ -1711,13 +1711,16 @@ const Game = (function(){
     // вместо .x/.y, чтобы между физ-тиками не было stutter.
     const a = (alpha == null) ? 1 : alpha;
     renderAlpha = a;
-    const lerp = (p, c) => p + (c - p) * a;
-    p1.renderX = lerp(p1.prevX, p1.x); p1.renderY = lerp(p1.prevY, p1.y);
-    p2.renderX = lerp(p2.prevX, p2.x); p2.renderY = lerp(p2.prevY, p2.y);
+    // Инлайн-интерполяция вместо стрелочного замыкания: раньше `const lerp`
+    // создавал 60 closure/сек в hot path, плюс 5 invocation'ов на render.
+    p1.renderX = p1.prevX + (p1.x - p1.prevX) * a;
+    p1.renderY = p1.prevY + (p1.y - p1.prevY) * a;
+    p2.renderX = p2.prevX + (p2.x - p2.prevX) * a;
+    p2.renderY = p2.prevY + (p2.y - p2.prevY) * a;
     if(ball){
-      ball.renderX = lerp(ball.prevX, ball.x);
-      ball.renderY = lerp(ball.prevY, ball.y);
-      ball.renderAngle = lerp(ball.prevAngle, ball.angle);
+      ball.renderX = ball.prevX + (ball.x - ball.prevX) * a;
+      ball.renderY = ball.prevY + (ball.y - ball.prevY) * a;
+      ball.renderAngle = ball.prevAngle + (ball.angle - ball.prevAngle) * a;
     }
     const cw = canvas.width, ch = canvas.height;
     ctx.fillStyle = "#1e1f22";
