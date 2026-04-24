@@ -476,6 +476,7 @@ const wss = new WebSocketServer({ server: httpServer, path: "/ws", perMessageDef
 const { createBroker }    = require("./broker");
 const { ShadowRegistry }  = require("./shadowsim");
 const hathoraClient       = require("./hathora-client");
+const hathoraRegions      = require("./hathora-regions");
 const { signRoomToken, verifyWebhook } = require("./room-auth");
 // DV_SHADOW_PHYSICS=1 — observer (host остаётся авторитетом).
 // DV_AUTH_PHYSICS=1   — сервер сам крутит физику для каждого матча и
@@ -505,7 +506,20 @@ if (DV_ROOMS_ROLLBACK && _DV_ROOMS_RAW === "hathora"){
 const DV_LOCAL_ROOMS = process.env.DV_LOCAL_ROOMS === "1";
 const ROOM_SECRET = process.env.ROOM_SECRET || "";
 const ROOM_TOKEN_TTL_MS = Number(process.env.ROOM_TOKEN_TTL_MS) || 60000;
-const HATHORA_REGION    = process.env.HATHORA_REGION || "Frankfurt";
+// HATHORA_FALLBACK_REGION — регион, который используется, если geo-lookup
+// не смог определить страну хотя бы одного игрока (приватный IP из Docker
+// dev-setup, geoip-lite не установлен, CDN не проставил CF-IPCountry и т.п.).
+// HATHORA_REGION оставлен для обратной совместимости с тестами и для тех,
+// кто хочет принудительно прибить один регион (= legacy-поведение до multi-
+// region рефакторинга). pair-logic см. hathora-regions.js / pickRegionForPair.
+const HATHORA_FALLBACK_REGION =
+  process.env.HATHORA_FALLBACK_REGION ||
+  process.env.HATHORA_REGION ||
+  "Frankfurt";
+// DV_HATHORA_FORCE_REGION=1 — заставляем использовать FALLBACK_REGION всегда,
+// независимо от geo. Для отладки и под инциденты, когда конкретный регион
+// Hathora лёг и надо сузить до здорового.
+const HATHORA_FORCE_REGION = process.env.DV_HATHORA_FORCE_REGION === "1";
 if (DV_ROOMS === "hathora" && !ROOM_SECRET){
   console.warn("[ws] DV_ROOMS=hathora но ROOM_SECRET пуст — pairHathora будет падать в local");
 }
@@ -705,7 +719,12 @@ setInterval(() => {
 // т.е. когда в буфер уже успели загрузиться сотни снапшотов → лишнее
 // давление на память и GC живых матчей. Теперь раз в HEARTBEAT_MS шлём
 // ping: если клиент не ответил pong'ом до следующего тика — terminate.
-const WS_HEARTBEAT_MS = Number(process.env.WS_HEARTBEAT_MS) || 20000;
+//
+// Default 5000мс (было 20000): в активном онлайн-матче соперник «замирал»
+// на 20-40с при NAT rebind/tunnel сбое, прежде чем мы его вышибали и слали
+// peer_left. 5с даёт detection ≤10с (два тика). Overhead при 10k клиентов:
+// ~20k пакетов/с × ~8 байт = 160 KB/s WS control traffic — пренебрежимо.
+const WS_HEARTBEAT_MS = Number(process.env.WS_HEARTBEAT_MS) || 5000;
 setInterval(() => {
   wss.clients.forEach(c => {
     if (c.readyState !== 1) return;
@@ -826,15 +845,32 @@ async function pairHathora(host, guest){
   const roomId  = crypto.randomBytes(6).toString("hex");
   const matchId = "pm-" + crypto.randomBytes(8).toString("hex");
   const stakes  = rollStakes();
+  // Geo-aware region selection: страны обоих пиров резолвятся в момент WS-
+  // connection (ws._country/ws._remoteIp), тут — выбор «встречного» региона.
+  // Если DV_HATHORA_FORCE_REGION=1 — принудительно берём fallback (для
+  // инцидент-режима, когда какой-то регион Hathora нестабилен).
+  let region = HATHORA_FALLBACK_REGION;
+  let geoLog = "force";
+  if (!HATHORA_FORCE_REGION){
+    // host/guest в этой функции — уже ws-объекты (см. caller в onQueue);
+    // country резолвим в wss.on("connection") и пишем на сам ws.
+    const pick = hathoraRegions.pickRegionForPair({
+      hostCountry:  host._country  || null,
+      guestCountry: guest._country || null,
+      fallback:     HATHORA_FALLBACK_REGION
+    });
+    region = pick.region;
+    geoLog = `host=${pick.hostCountry || "?"}/${pick.hostRegion || "?"} guest=${pick.guestCountry || "?"}/${pick.guestRegion || "?"} → ${region}`;
+  }
   let room;
   try {
     if (DV_LOCAL_ROOMS){
       room = await spawnLocalRoomServer({ roomId, matchId });
     } else {
-      room = await hathoraClient.createRoom({ region: HATHORA_REGION });
+      room = await hathoraClient.createRoom({ region });
     }
   } catch (e){
-    console.warn(`[ws] room-create failed (${e && e.message || e}) — fallback to pairLocal`);
+    console.warn(`[ws] room-create failed region=${region} (${e && e.message || e}) — fallback to pairLocal`);
     return pairLocal(host, guest);
   }
   await broker.setStakes(matchId, stakes, MATCH_STAKES_TTL_MS);
@@ -858,7 +894,7 @@ async function pairHathora(host, guest){
   };
   send(host,  { ...common, role: "host",  opponent: safeUser(guest.user), roomToken: hostToken });
   send(guest, { ...common, role: "guest", opponent: safeUser(host.user),  roomToken: guestToken });
-  console.log(`[ws] hathora-matched host=${host.user.id} guest=${guest.user.id} room=${roomId} match=${matchId} hathoraRoom=${room.roomId} at=${room.host}:${room.port}`);
+  console.log(`[ws] hathora-matched host=${host.user.id} guest=${guest.user.id} room=${roomId} match=${matchId} hathoraRoom=${room.roomId} at=${room.host}:${room.port} geo=${geoLog}`);
 }
 
 // Cross-instance pair: нас забрали из очереди на другом инстансе. Пришло
@@ -1005,6 +1041,12 @@ wss.on("connection", async (ws, req) => {
   // задерживать 61-байтные снапшоты до ~40 мс ради батчинга. На hot-path
   // это чистая просадка плавности. ws@8 отдаёт Node.js-сокет через _socket.
   try { ws._socket && ws._socket.setNoDelay(true); } catch {}
+  // Geo-routing для multi-region Hathora: резолвим country один раз при
+  // коннекте (lookup в geoip-lite стоит ~0.2мс + ~30МБ RSS на один процесс,
+  // не хотим делать на каждый pair). Для приватного IP/localhost country=null,
+  // pair тогда уходит в HATHORA_FALLBACK_REGION.
+  ws._remoteIp = hathoraRegions.resolveClientIp(req);
+  ws._country  = hathoraRegions.resolveCountry(req, ws._remoteIp);
   ws.user          = user;
   ws.roomId        = null;
   ws.activeMatchId = null;

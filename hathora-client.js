@@ -33,6 +33,9 @@ async function createRoom(opts){
   const apiBase = (opts && opts.apiBase) || process.env.HATHORA_API_BASE || DEFAULT_API_BASE;
   const appId   = (opts && opts.appId)   || process.env.HATHORA_APP_ID;
   const token   = (opts && opts.token)   || process.env.HATHORA_TOKEN;
+  // Регион прилетает per-call из geo-aware pairing в server.js. HATHORA_REGION
+  // остаётся как fallback для интеграционных тестов и для случаев, когда
+  // geo-lookup вернул null (приватный IP, отсутствие geoip-lite в dev-окружении).
   const region  = (opts && opts.region)  || process.env.HATHORA_REGION || "Frankfurt";
   const roomConfig = (opts && opts.roomConfig) || "";
   if (!appId) throw new Error("HATHORA_APP_ID required");

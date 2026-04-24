@@ -18,6 +18,7 @@
     "cookie-parser": "^1.4.7",
     "cookie-signature": "^1.2.1",
     "express": "^4.21.2",
+    "geoip-lite": "^1.4.10",
     "redis": "^4.7.0",
     "ws": "^8.20.0"
   },
