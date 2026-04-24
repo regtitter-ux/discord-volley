@@ -179,10 +179,9 @@ app.get("/auth/callback", async (req, res) => {
   }
 });
 
-app.get("/api/me", (req, res) => {
+app.get("/api/me", noStore, (req, res) => {
   const u = getSession(req);
   if (!u) return res.status(401).json(null);
-  res.setHeader("Cache-Control", "no-store");
   const deco = DB.getDecorations(u.id);
   res.json({
     id:          u.id,
@@ -221,8 +220,7 @@ if (NODE_ENV !== "production" && process.env.DV_DEV_LOGIN === "1"){
 
 /* ---------- Build version (cache-busting / auto-reload) ---------- */
 
-app.get("/api/version", (req, res) => {
-  res.setHeader("Cache-Control", "no-store");
+app.get("/api/version", noStore, (req, res) => {
   res.json({ build: BUILD_ID });
 });
 
@@ -362,8 +360,7 @@ function userTrophies(id){ return DB.getTrophies(id); }
 
 const LB_PAGE_SIZE = 10;
 
-app.get("/api/leaderboard", (req, res) => {
-  res.setHeader("Cache-Control", "no-store");
+app.get("/api/leaderboard", noStore, (req, res) => {
   const me = getSession(req);
   let page = parseInt(req.query.page, 10);
   if (!Number.isFinite(page) || page < 1) page = 1;
@@ -392,8 +389,7 @@ app.get("/api/leaderboard", (req, res) => {
   });
 });
 
-app.get("/api/stats", async (req, res) => {
-  res.setHeader("Cache-Control", "no-store");
+app.get("/api/stats", noStore, async (req, res) => {
   const online = broker ? await broker.getOnline() : 0;
   res.json({ online });
 });
@@ -441,6 +437,20 @@ if (DB.countDecorations() === 0){
 // Cache-buster по updated_at нужен для загруженных атласов: админ
 // перезалил файл под тем же id — браузер обязан увидеть новую версию,
 // несмотря на immutable-кэш статики.
+function decorationCommonFields(d){
+  return {
+    id:     d.id,
+    title:  d.title || "",
+    price:  d.price | 0,
+    frames: d.frames | 0,
+    fps:    d.fps | 0,
+    frameW: d.frameW | 0,
+    frameH: d.frameH | 0,
+    cols:   d.cols | 0,
+    rows:   d.rows | 0,
+  };
+}
+
 function decorationToWire(d){
   if (!d) return null;
   const isStaticAsset = typeof d.atlas === "string" && d.atlas.startsWith("/assets/");
@@ -448,18 +458,7 @@ function decorationToWire(d){
   const atlas = isStaticAsset
     ? d.atlas
     : d.atlas + (d.atlas.includes("?") ? "&" : "?") + "v=" + ver;
-  return {
-    id:     d.id,
-    title:  d.title || "",
-    price:  d.price | 0,
-    atlas,
-    frames: d.frames | 0,
-    fps:    d.fps | 0,
-    frameW: d.frameW | 0,
-    frameH: d.frameH | 0,
-    cols:   d.cols | 0,
-    rows:   d.rows | 0
-  };
+  return { ...decorationCommonFields(d), atlas };
 }
 
 function decorationCatalogList(){
@@ -479,8 +478,7 @@ function isKnownDecoration(id){
   return !!DB.getDecorationCatalogEntry(id);
 }
 
-app.get("/api/decorations", (req, res) => {
-  res.setHeader("Cache-Control", "no-store");
+app.get("/api/decorations", noStore, (req, res) => {
   const u = getSession(req);
   if (!u) return res.status(401).json({ error: "unauthorized" });
   const s = DB.getDecorations(u.id);
@@ -496,8 +494,7 @@ app.get("/api/decorations", (req, res) => {
 // Атомарный UPDATE в БД гарантирует, что даже при параллельных запросах
 // монеты снимутся ровно один раз; повторный POST с тем же id вернёт
 // already_owned (changes = 0 при instr-матче).
-app.post("/api/decorations/buy", (req, res) => {
-  res.setHeader("Cache-Control", "no-store");
+app.post("/api/decorations/buy", noStore, (req, res) => {
   const u = getSession(req);
   if (!u) return res.status(401).json({ error: "unauthorized" });
   const id = String(req.query.id || "");
@@ -532,14 +529,20 @@ const ADMIN_IDS = (function(){
 })();
 function isAdmin(u){ return !!(u && ADMIN_IDS.has(String(u.id))); }
 
+function noStore(_req, res, next){ res.setHeader("Cache-Control", "no-store"); next(); }
+
+function requireAdmin(req, res, next){
+  const me = getSession(req);
+  if (!isAdmin(me)) return res.status(403).json({ error: "forbidden" });
+  req._admin = me;
+  next();
+}
+
 // Поиск пользователя по произвольному хендлу: сперва пробуем как точный ID
 // (у Discord это числовой snowflake, у dev-login — любой TEXT), потом
 // fallback — username / global_name без учёта регистра. Возвращаем только
 // id — больше серверу ничего не нужно для addCoins.
-app.get("/api/admin/lookup", (req, res) => {
-  res.setHeader("Cache-Control", "no-store");
-  const me = getSession(req);
-  if (!isAdmin(me)) return res.status(403).json({ error: "forbidden" });
+app.get("/api/admin/lookup", noStore, requireAdmin, (req, res) => {
   const q = String(req.query.q || "").trim();
   if (!q) return res.status(400).json({ error: "empty_query" });
   const byId = DB.db.prepare("SELECT id, global_name, username, coins FROM users WHERE id = ?").get(q);
@@ -553,10 +556,8 @@ app.get("/api/admin/lookup", (req, res) => {
 // Изменение баланса: delta — signed integer. Серверная правка идёт через
 // DB.addCoins (MAX(0,...) не уходит в минус), так что «−5000» у юзера с
 // балансом 100 обнулит его, а не улетит в отрицательное.
-app.post("/api/admin/coins", (req, res) => {
-  res.setHeader("Cache-Control", "no-store");
-  const me = getSession(req);
-  if (!isAdmin(me)) return res.status(403).json({ error: "forbidden" });
+app.post("/api/admin/coins", noStore, requireAdmin, (req, res) => {
+  const me = req._admin;
   const id = String(req.query.id || "").trim();
   const delta = parseInt(req.query.delta, 10);
   if (!id) return res.status(400).json({ error: "empty_id" });
@@ -650,26 +651,15 @@ function atlasPathUnder(id, ext){
 function adminDecoToWire(d){
   if (!d) return null;
   return {
-    id:        d.id,
-    title:     d.title || "",
-    price:     d.price | 0,
+    ...decorationCommonFields(d),
     atlas:     d.atlas,
-    frames:    d.frames | 0,
-    fps:       d.fps | 0,
-    frameW:    d.frameW | 0,
-    frameH:    d.frameH | 0,
-    cols:      d.cols | 0,
-    rows:      d.rows | 0,
     sortOrder: d.sortOrder | 0,
     updatedAt: Number(d.updatedAt) || 0,
     builtin:   typeof d.atlas === "string" && d.atlas.startsWith("/assets/")
   };
 }
 
-app.get("/api/admin/decorations", (req, res) => {
-  res.setHeader("Cache-Control", "no-store");
-  const me = getSession(req);
-  if (!isAdmin(me)) return res.status(403).json({ error: "forbidden" });
+app.get("/api/admin/decorations", noStore, requireAdmin, (req, res) => {
   res.json({ catalog: DB.listDecorationCatalog().map(adminDecoToWire) });
 });
 
@@ -686,10 +676,8 @@ app.use("/cdn/decorations", express.static(DECORATIONS_DIR, {
   }
 }));
 
-app.post("/api/admin/decorations", async (req, res) => {
-  res.setHeader("Cache-Control", "no-store");
-  const me = getSession(req);
-  if (!isAdmin(me)) return res.status(403).json({ error: "forbidden" });
+app.post("/api/admin/decorations", noStore, requireAdmin, async (req, res) => {
+  const me = req._admin;
   const ct = String(req.headers["content-type"] || "").toLowerCase();
   if (!ct.startsWith("multipart/form-data")){
     return res.status(415).json({ error: "multipart_required" });
@@ -786,10 +774,8 @@ app.post("/api/admin/decorations", async (req, res) => {
   res.json({ ok: true, decoration: adminDecoToWire(entry) });
 });
 
-app.delete("/api/admin/decorations/:id", (req, res) => {
-  res.setHeader("Cache-Control", "no-store");
-  const me = getSession(req);
-  if (!isAdmin(me)) return res.status(403).json({ error: "forbidden" });
+app.delete("/api/admin/decorations/:id", noStore, requireAdmin, (req, res) => {
+  const me = req._admin;
   const id = sanitizeDecoId(req.params.id);
   if (!id) return res.status(400).json({ error: "bad_id" });
   const existed = DB.deleteDecoration(id);
@@ -809,8 +795,7 @@ app.delete("/api/admin/decorations/:id", (req, res) => {
   res.json({ ok: true, id });
 });
 
-app.post("/api/decorations/select", (req, res) => {
-  res.setHeader("Cache-Control", "no-store");
+app.post("/api/decorations/select", noStore, (req, res) => {
   const u = getSession(req);
   if (!u) return res.status(401).json({ error: "unauthorized" });
   const raw = req.query.id;
@@ -1578,24 +1563,6 @@ wss.on("connection", async (ws, req) => {
         const ctx = (msg.context && typeof msg.context === "object") ? msg.context : null;
         const res = awardCoins(ws.user, kind, mid, ctx);
         if (res) send(ws, { type: "wallet", coins: res.coins, delta: res.delta, kind });
-        break;
-      }
-      case "relay": {
-        // Горячий путь — 30 Гц на матч, при 10k матчей это ~600k msg/s
-        // через всех пиров. Минимизируем работу: один JSON.stringify
-        // итогового пакета, отсечка по длине уже сериализованной строки
-        // (4KB). В local-режиме publishRoom синхронно фанаутит фрейм всем
-        // членам комнаты на этом инстансе; в Redis — PUBLISH на per-room
-        // канале, fire-and-forget (снапшот идемпотентный, следующий
-        // долетит через 33 мс). Свой senderId broker использует, чтобы
-        // не доставлять эхо обратно отправителю.
-        if (!ws.roomId) break;
-        const payload = msg.payload;
-        if (!payload) break;
-        let out;
-        try { out = JSON.stringify({ type: "peer", payload }); } catch { break; }
-        if (out.length >= 4096) break;
-        broker.publishRoom(ws.roomId, ws.wsId, out);
         break;
       }
     }
