@@ -1,6 +1,11 @@
 /* Volleyball Online — lightweight vanilla canvas game.
-   No frameworks, no build. Fixed-timestep physics @ 120Hz, rendered via rAF. */
-(function(){
+   No frameworks, no build. Fixed-timestep physics @ 120Hz, rendered via rAF.
+
+   Не оборачиваем в IIFE: decorations-ui.js / admin.js подгружаются
+   отдельными <script>-тегами и обращаются к state / Wallet / Auth / I18n /
+   closeUserPopup / screens / fmtI18n / refreshLocalizedDynamicUI напрямую
+   через shared script scope. IIFE изолировала бы эти имена и сломала
+   ссылки из соседних скриптов. */
 "use strict";
 
 /* ---------------- DOM ---------------- */
@@ -2825,6 +2830,4 @@ boot();
   // На выходе в меню overlay скрывается / screen-game прячется — пробуем.
   document.addEventListener("click",   maybeReload, true);
   document.addEventListener("keydown", maybeReload, true);
-})();
-
 })();
