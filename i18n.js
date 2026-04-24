@@ -138,7 +138,7 @@
       "deco.selected":   "Selected",
       "deco.owned":      "Owned",
       "deco.insufficient":"Not enough coins",
-      "menu.heading":   "Online Volleyball",
+      "menu.heading":   "Volleyball Online",
       "menu.hint":      "Use arrows / WAD to move and jump. Don't let the ball touch the ground on your side.",
       "menu.points":    "Points to win",
       "menu.play":      "PLAY",
