@@ -1319,10 +1319,28 @@ const Game = (function(){
     const server = servingSide === 1 ? p1 : p2;
     const serverX = (server && typeof server.x === "number") ? server.x : null;
     const core = DVPhysics.serveBall(servingSide, serverX, WORLD_W, NET_X);
-    ball = Object.assign(core, {
-      prevX: core.x,  prevY: core.y,  prevAngle: 0,
-      renderX: core.x, renderY: core.y, renderAngle: 0
-    });
+    // Первая подача создаёт ball со всеми render-полями. Последующие
+    // мутируют in-place — убирает Object.assign-аллокацию на каждом голе.
+    // DVPhysics.serveBall всё равно возвращает свежий литерал (он shared
+    // с shadowsim на сервере, trivially переиспользовать нельзя), но мы
+    // хотя бы не плодим второй объект-обёртку на клиенте.
+    if(!ball){
+      ball = {
+        x: core.x, y: core.y,
+        vx: core.vx, vy: core.vy,
+        r: core.r, angle: core.angle,
+        touches: { left: 0, right: 0 },
+        prevX: core.x,  prevY: core.y,  prevAngle: 0,
+        renderX: core.x, renderY: core.y, renderAngle: 0
+      };
+    } else {
+      ball.x = core.x; ball.y = core.y;
+      ball.vx = core.vx; ball.vy = core.vy;
+      ball.r = core.r; ball.angle = core.angle;
+      ball.touches.left = 0; ball.touches.right = 0;
+      ball.prevX = core.x;  ball.prevY = core.y;  ball.prevAngle = 0;
+      ball.renderX = core.x; ball.renderY = core.y; ball.renderAngle = 0;
+    }
     trailHead = 0; trailCount = 0;
     hitFlash = 0;
     squash.ball = 0;
