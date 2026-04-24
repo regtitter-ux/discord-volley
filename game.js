@@ -2669,6 +2669,13 @@ const Game = (function(){
       _bgWorker.onmessage = () => {
         if(!_bgActive) return;
         if(!state.inGame) return;
+        // Race-guard: при visibilitychange → visible мы успеваем запустить
+        // rAF-loop ДО того, как worker получит postMessage(0) и остановит
+        // свой setInterval. В окне между этими событиями tick от worker'а
+        // и rAF могли сработать в одном кадре — получался double step()
+        // + double render. Проверкой rafId гарантируем: если rAF активен,
+        // worker молчит.
+        if(rafId) return;
         _tickCore();
       };
     }catch(_){ _bgWorker = null; }
