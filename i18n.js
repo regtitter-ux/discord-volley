@@ -93,14 +93,6 @@
       "trophies.label": "Кубки",
       "game.stakes":    "Ставка: +{win} / −{loss}",
 
-      "lobby.searching":     "Поиск соперника…",
-      "lobby.fallback_hint": "Если никого не найдём за 30 секунд — начнём матч с ботом.",
-      "lobby.cancel":        "Отмена",
-      "lobby.matched":       "Соперник найден",
-      "lobby.connecting":    "Подключение…",
-      "lobby.bot_fallback":  "Нет соперников онлайн — играете с ботом",
-      "lobby.disconnected":  "Соперник отключился",
-
       "hud.online":     "ОНЛАЙН",
       "hud.bot":        "БОТ",
 
@@ -165,14 +157,6 @@
 
       "trophies.label": "Trophies",
       "game.stakes":    "Stakes: +{win} / −{loss}",
-
-      "lobby.searching":     "Searching for opponent…",
-      "lobby.fallback_hint": "If nobody joins in 30 seconds, we'll start a match against a bot.",
-      "lobby.cancel":        "Cancel",
-      "lobby.matched":       "Opponent found",
-      "lobby.connecting":    "Connecting…",
-      "lobby.bot_fallback":  "No opponents online — playing against a bot",
-      "lobby.disconnected":  "Opponent disconnected",
 
       "hud.online":     "ONLINE",
       "hud.bot":        "BOT",
