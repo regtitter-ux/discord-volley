@@ -1864,10 +1864,19 @@ const Game = (function(){
   }
 
   function drawTrail(){
-    // Fade from oldest to newest; only while ball is moving fast enough.
+    // Fade from oldest to newest; плавно гаснет по скорости, чтобы хвост не
+    // обрубался одним кадром, когда мяч замедляется и точки схлопываются
+    // обратно в тело мяча.
     const speed2 = ball.vx*ball.vx + ball.vy*ball.vy;
-    if(speed2 < 260*260) return;
+    const SPEED_HIDE = 180;
+    const SPEED_FULL = 340;
+    if(speed2 < SPEED_HIDE*SPEED_HIDE) return;
     if(trailCount < 3) return;
+    const speed = Math.sqrt(speed2);
+    // smoothstep для мягкого выхода (без линейного излома у краёв окна).
+    let u = (speed - SPEED_HIDE) / (SPEED_FULL - SPEED_HIDE);
+    if(u > 1) u = 1; else if(u < 0) u = 0;
+    const speedFade = u*u*(3 - 2*u);
     // Ring buffer: trailHead — новейший, шаги назад = (head - i + TRAIL_LEN)%TRAIL_LEN.
     // Тело мяча — lerp(trail[1], trail[0]). Каждая точка смещается на alpha:
     // effective[i] = lerp(trail[i+1], trail[i]).
@@ -1882,8 +1891,8 @@ const Game = (function(){
       const x = trailX[oIdx] + (trailX[cIdx] - trailX[oIdx]) * a;
       const y = trailY[oIdx] + (trailY[cIdx] - trailY[oIdx]) * a;
       const t = i * inv;
-      const r = ball.r * (1 - t*0.6);
-      ctx.globalAlpha = (1 - t) * 0.35;
+      const r = ball.r * (1 - t*0.6) * (0.85 + 0.15*speedFade);
+      ctx.globalAlpha = (1 - t) * 0.35 * speedFade;
       ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill();
     }
     ctx.globalAlpha = 1;
