@@ -39,6 +39,20 @@
   const NET_X    = WORLD_W * 0.5;
   const GROUND_Y = WORLD_H - 30;
 
+  // Pre-allocated event objects: эти функции вызываются 120–1000+ раз/сек
+  // на hot path (step() × sub-steps × 2 игрока). Свежий литерал на каждый
+  // возврат давал ~1000 alloc/сек чистой physics-пыли → Scavenge-GC каждые
+  // 1–3 сек → видимый хитч на слабом ПК. Переиспользуем module-level
+  // объекты: caller читает результат сразу, в одном V8-потоке конфликтов нет.
+  // Одно и то же поле заполняем на каждом вызове — поля стабильны (V8 hidden
+  // class), аллокаций ноль.
+  const _EV_INTEGRATE = { landed: false, impactVy: 0 };
+  const _EV_GROUND    = { hit: false, impactSpeed: 0 };
+  const _EV_NET       = { hit: false, hitPower: 0 };
+  const _EV_PLAYER    = { hit: false, isSpike: false, fxX: 0, fxY: 0 };
+  const _EV_INPUT     = { jumped: false };
+  const _EV_HUMAN     = { jumpBufferT: 0, jumped: false };
+
   // Pure-кинематика игрока: гравитация, интегрирование позиции, зажимы по
   // X, посадка на землю. Мутирует p.{x,y,vy,onGround}. Возвращает событие
   // посадки с импактной vy — клиент лепит на него squash-анимацию и
@@ -57,9 +71,13 @@
       p.y = groundY - p.r;
       p.vy = 0;
       p.onGround = true;
-      return { landed: wasInAir, impactVy };
+      _EV_INTEGRATE.landed = wasInAir;
+      _EV_INTEGRATE.impactVy = impactVy;
+      return _EV_INTEGRATE;
     }
-    return { landed: false, impactVy: 0 };
+    _EV_INTEGRATE.landed = false;
+    _EV_INTEGRATE.impactVy = 0;
+    return _EV_INTEGRATE;
   }
 
   // Pure-отскок мяча от боковых стен. Нет event'а — стена молчит, sfx
@@ -77,9 +95,13 @@
       ball.y  = groundY - ball.r;
       ball.vy = -impactSpeed * E_GROUND;
       ball.vx *= 0.96;
-      return { hit: true, impactSpeed };
+      _EV_GROUND.hit = true;
+      _EV_GROUND.impactSpeed = impactSpeed;
+      return _EV_GROUND;
     }
-    return { hit: false, impactSpeed: 0 };
+    _EV_GROUND.hit = false;
+    _EV_GROUND.impactSpeed = 0;
+    return _EV_GROUND;
   }
 
   // Pure-столкновение мяча с сеткой (AABB + radius). Мутирует ball на
@@ -93,7 +115,11 @@
     const cy = Math.max(top,  Math.min(ball.y, bot));
     let nx = ball.x - cx, ny = ball.y - cy;
     const d2 = nx*nx + ny*ny;
-    if(d2 >= ball.r*ball.r) return { hit: false, hitPower: 0 };
+    if(d2 >= ball.r*ball.r){
+      _EV_NET.hit = false;
+      _EV_NET.hitPower = 0;
+      return _EV_NET;
+    }
     let d = Math.sqrt(d2);
     if(d < 0.0001){
       // Ball center inside net AABB — pick shortest escape axis.
@@ -116,9 +142,13 @@
       const hitPower = -vn;
       ball.vx -= (1+E_NET) * vn * nx;
       ball.vy -= (1+E_NET) * vn * ny;
-      return { hit: true, hitPower };
+      _EV_NET.hit = true;
+      _EV_NET.hitPower = hitPower;
+      return _EV_NET;
     }
-    return { hit: false, hitPower: 0 };
+    _EV_NET.hit = false;
+    _EV_NET.hitPower = 0;
+    return _EV_NET;
   }
 
   // Pure-столкновение мяча с игроком: classic slime-volleyball bounce
@@ -135,7 +165,13 @@
     let ny = ball.y - p.y;
     const rr = p.r + ball.r;
     const d2 = nx*nx + ny*ny;
-    if(d2 >= rr*rr) return { hit: false, isSpike: false, fxX: 0, fxY: 0 };
+    if(d2 >= rr*rr){
+      _EV_PLAYER.hit = false;
+      _EV_PLAYER.isSpike = false;
+      _EV_PLAYER.fxX = 0;
+      _EV_PLAYER.fxY = 0;
+      return _EV_PLAYER;
+    }
     const d = Math.sqrt(d2);
     if(d < 0.0001){
       // Degenerate: ball embedded at player center. Eject straight up.
@@ -185,7 +221,11 @@
     const isSpike = !p.onGround && ny < -0.3 && ball.vy > 200;
     const fxX = p.x + nx * (p.r + ball.r*0.3);
     const fxY = p.y + ny * (p.r + ball.r*0.3);
-    return { hit: true, isSpike, fxX, fxY };
+    _EV_PLAYER.hit = true;
+    _EV_PLAYER.isSpike = isSpike;
+    _EV_PLAYER.fxX = fxX;
+    _EV_PLAYER.fxY = fxY;
+    return _EV_PLAYER;
   }
 
   // Pure-вход для бота/удалённого peer'а: детерминированный ax из (left,right)
@@ -200,9 +240,11 @@
     if(jump && p.onGround){
       p.vy = -JUMP;
       p.onGround = false;
-      return { jumped: true };
+      _EV_INPUT.jumped = true;
+      return _EV_INPUT;
     }
-    return { jumped: false };
+    _EV_INPUT.jumped = false;
+    return _EV_INPUT;
   }
 
   // Human-control с coyote + jump-buffer: нажатие за JUMP_BUFFER до посадки
@@ -230,9 +272,13 @@
       p.onGround = false;
       jumpBufferT = 0;
       p.coyoteT  = 0;
-      return { jumpBufferT, jumped: true };
+      _EV_HUMAN.jumpBufferT = 0;
+      _EV_HUMAN.jumped = true;
+      return _EV_HUMAN;
     }
-    return { jumpBufferT, jumped: false };
+    _EV_HUMAN.jumpBufferT = jumpBufferT;
+    _EV_HUMAN.jumped = false;
+    return _EV_HUMAN;
   }
 
   // Pure-кинематика подачи: мяч падает прямо над подающим (sx), зажатый в

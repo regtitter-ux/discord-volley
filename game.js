@@ -1503,7 +1503,11 @@ const Game = (function(){
     // под-шаги такого размера, чтобы за один под-шаг мяч смещался не более
     // чем на половину своего радиуса — коллизии проверяются на каждом.
     const travel = Math.sqrt(ball.vx*ball.vx + ball.vy*ball.vy) * dt;
-    const maxPerSub = ball.r * 0.5;
+    // 0.75 вместо 0.5: на пике скорости (MAX_BSPD=1300) travel ≈ 10.8 px при
+    // STEP=1/120 → раньше было 2 sub-шага, теперь 1 (12.75 > 10.8). Tunneling
+    // риск нулевой — 12.75 < ball.r=17, мяч не проскочит сетку/игрока.
+    // При STEP_LO=1/60 (lowQuality) travel ≈ 21.7 → 2 sub-шага вместо 3.
+    const maxPerSub = ball.r * 0.75;
     const subs = Math.max(1, Math.ceil(travel / maxPerSub));
     const subDt = dt / subs;
     for(let s = 0; s < subs; s++){
@@ -2486,12 +2490,24 @@ const Game = (function(){
       const hardFreeze = isTouch ? 200 : 150;
       const hitch      = isTouch ? 100 : 60;
       const avgSlow    = isTouch ? 33  : 22;
+      // Порог 15 (было 40): при 25 FPS (40мс/кадр) старое окно ≈1.6 с
+      // лагающего gameplay ДО деградации — достаточно, чтобы spiral of death
+      // успел раскрутиться (STEP=1/120 копит acc, step() жирнеет, GC хуже).
+      // 15 кадров ≈ 0.4 с — реагируем до лавины. Hitch-boost увеличен
+      // симметрично: 3 хитча должны мгновенно переключать качество.
+      const SLOW_LIMIT = 15;
+      // Ранний детект слабого ПК: к 15-му кадру у нас уже есть осмысленный
+      // EWMA. Если он сразу выше порога, не ждём 15 медленных подряд —
+      // переключаемся сходу. Это ловит низкий baseline (Intel HD, старый
+      // ноут), а не разовые хитчи при старте.
+      const earlyProbeReady = _frameTimeCount === 15 && frameTimeAvg > avgSlow;
       if(!lowQuality){
         if(ft > hardFreeze){ lowQuality = true; }
-        else if(ft > hitch){ slowFrames += 20; if(slowFrames > 40) lowQuality = true; }
+        else if(earlyProbeReady){ lowQuality = true; }
+        else if(ft > hitch){ slowFrames += 8; if(slowFrames > SLOW_LIMIT) lowQuality = true; }
         else if(frameTimeAvg > avgSlow){
           slowFrames++;
-          if(slowFrames > 40) lowQuality = true;
+          if(slowFrames > SLOW_LIMIT) lowQuality = true;
         } else {
           slowFrames = Math.max(0, slowFrames - 1);
         }
