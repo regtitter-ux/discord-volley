@@ -2330,10 +2330,15 @@ const Game = (function(){
     const feetY = py + r;
     const air = Math.min(1, Math.max(0, (GROUND_Y - feetY) / 200));
     const sh  = 1 - air*0.5;
-    ctx.fillStyle = "rgba(0,0,0," + (0.32 - air*0.18) + ")";
+    // fillStyle+globalAlpha вместо "rgba(...," + a + ")" — убирает
+    // 2 string-аллокации/кадр в hot path (2 игрока × 60 FPS = 120/сек
+    // уникальных строк в GC). Тот же трюк уже в drawTrail.
+    ctx.fillStyle = "#000000";
+    ctx.globalAlpha = 0.32 - air*0.18;
     ctx.beginPath();
     ctx.ellipse(px, GROUND_Y - 1, r*0.95*sh, 6*sh, 0, 0, Math.PI*2);
     ctx.fill();
+    ctx.globalAlpha = 1;
 
     // Landing squash: scale around feet so the head compresses toward the ground.
     const st = (p.side === 1 ? squash.p1 : squash.p2);
