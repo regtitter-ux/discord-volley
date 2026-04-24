@@ -1968,6 +1968,13 @@ const Game = (function(){
     ctx.fillRect(left - 2, top + 2, NET_W + 4, 2);
   }
 
+  // Буферы для батчинга trail по alpha-бакету. До TRAIL_LEN точек, ≤8
+  // итераций в drawTrail. Держим в замыкании, без аллокаций на вызов.
+  const _TRAIL_BUCKETS = 4;
+  const _trailX = new Float32Array(TRAIL_LEN);
+  const _trailYb = new Float32Array(TRAIL_LEN);
+  const _trailR = new Float32Array(TRAIL_LEN);
+  const _trailB = new Int8Array(TRAIL_LEN);
   function drawTrail(){
     // Fade from oldest to newest; плавно гаснет по скорости, чтобы хвост не
     // обрубался одним кадром, когда мяч замедляется и точки схлопываются
@@ -1987,18 +1994,39 @@ const Game = (function(){
     // effective[i] = lerp(trail[i+1], trail[i]).
     const a = renderAlpha;
     const inv = 1 / TRAIL_LEN;
-    // fillStyle + globalAlpha вместо "rgba(...," + a + ")" на каждой точке:
-    // снимает 8 string-аллокаций/кадр (~480/сек) из GC hot-path.
-    ctx.fillStyle = "#ffffff";
-    for(let i = 1; i < trailCount - 1; i++){
+    // Проход 1: вычисляем x/y/r/bucket для всех точек.
+    const n = trailCount - 2;
+    for(let i = 1; i <= n; i++){
+      const idx = i - 1;
       const cIdx = (trailHead - i + TRAIL_LEN) % TRAIL_LEN;
       const oIdx = (trailHead - (i+1) + TRAIL_LEN) % TRAIL_LEN;
-      const x = trailX[oIdx] + (trailX[cIdx] - trailX[oIdx]) * a;
-      const y = trailY[oIdx] + (trailY[cIdx] - trailY[oIdx]) * a;
+      _trailX[idx]  = trailX[oIdx] + (trailX[cIdx] - trailX[oIdx]) * a;
+      _trailYb[idx] = trailY[oIdx] + (trailY[cIdx] - trailY[oIdx]) * a;
       const t = i * inv;
-      const r = ball.r * (1 - t*0.6) * (0.85 + 0.15*speedFade);
-      ctx.globalAlpha = (1 - t) * 0.35 * speedFade;
-      ctx.beginPath(); ctx.arc(x, y, r, 0, Math.PI*2); ctx.fill();
+      _trailR[idx] = ball.r * (1 - t*0.6) * (0.85 + 0.15*speedFade);
+      const al = (1 - t) * 0.35 * speedFade;
+      let bi = (al * _TRAIL_BUCKETS / 0.35)|0;
+      if(bi < 0) bi = 0; else if(bi >= _TRAIL_BUCKETS) bi = _TRAIL_BUCKETS - 1;
+      _trailB[idx] = bi;
+    }
+    // Проход 2: один beginPath+N*arc+fill на каждый bucket. Было до 8
+    // отдельных fill() вызовов (GPU state-flush на каждом); стало ≤4.
+    ctx.fillStyle = "#ffffff";
+    for(let b = 0; b < _TRAIL_BUCKETS; b++){
+      let started = false;
+      for(let i = 0; i < n; i++){
+        if(_trailB[i] !== b) continue;
+        if(!started){
+          // Средняя альфа бакета: (b+0.5) / _TRAIL_BUCKETS × 0.35_max.
+          ctx.globalAlpha = ((b + 0.5) / _TRAIL_BUCKETS) * 0.35;
+          ctx.beginPath();
+          started = true;
+        }
+        const r = _trailR[i];
+        ctx.moveTo(_trailX[i] + r, _trailYb[i]);
+        ctx.arc(_trailX[i], _trailYb[i], r, 0, Math.PI*2);
+      }
+      if(started) ctx.fill();
     }
     ctx.globalAlpha = 1;
   }
