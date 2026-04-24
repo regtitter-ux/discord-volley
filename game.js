@@ -1850,19 +1850,27 @@ const Game = (function(){
   }
 
   // Каждое облако — набор статичных векторных фигур. Один раз рендерим
-  // в офскрин-спрайт, дальше просто blit через drawImage (+ translate/rotate),
-  // чтобы освободить 2D-контекст от десятков path-команд за кадр.
+  // в офскрин-спрайт. Tilt у каждого облака ФИКСИРОВАН (buildClouds выставляет
+  // и не меняет), поэтому запекаем rotation прямо в спрайт — drawClouds
+  // рисует голым drawImage без save/rotate/restore. На iGPU каждый ctx.rotate()
+  // ломает GPU-батчинг drawImage, 10 облаков × rotate = 10 batch flush за кадр.
   function buildCloudSprite(c){
     const s = c.size;
-    const side = Math.ceil(s * 2.4);
-    const off = document.createElement("canvas");
-    off.width = side;
-    off.height = side;
+    // Запас под поворот: после rotate диагональ ≈ side*√2. Tilt ≤ ±0.18 рад
+    // → √2 с запасом, bounds гарантировано вмещаются.
+    const side = Math.ceil(s * 2.4 * 1.45);
+    const off = _makeOffscreen(side, side);
     const octx = off.getContext("2d");
     const cx = side / 2, cy = side / 2;
-    if(c.kind === "logo")      drawCloudLogo(octx, cx, cy, s, c.color);
-    else if(c.kind === "icon") drawCloudIcon(octx, cx, cy, s, c.color, c.mark);
-    else                       drawCloudBubble(octx, cx, cy, s, c.color);
+    // Bake rotation: translate→rotate→draw→restore, причём рисуем от (0,0)
+    // а не от центра, потому что drawCloud* функции уже принимают центр.
+    octx.save();
+    octx.translate(cx, cy);
+    octx.rotate(c.tilt);
+    if(c.kind === "logo")      drawCloudLogo(octx, 0, 0, s, c.color);
+    else if(c.kind === "icon") drawCloudIcon(octx, 0, 0, s, c.color, c.mark);
+    else                       drawCloudBubble(octx, 0, 0, s, c.color);
+    octx.restore();
     c._sprite = off;
     c._spriteHalf = side / 2;
   }
@@ -1923,15 +1931,14 @@ const Game = (function(){
   }
   function drawClouds(){
     if(!clouds) return;
+    // Rotation запечена в спрайт (см. buildCloudSprite) — рисуем плоским
+    // drawImage без save/rotate/restore. GPU-батчинг drawImage сохраняется,
+    // что снимает 10 batch-flush'ей на кадр на iGPU.
     for(const c of clouds){
       if(!c._sprite) buildCloudSprite(c);
       const x = ((c.x + matchTime * c.speed) % (WORLD_W + 160)) - 80;
-      ctx.save();
       ctx.globalAlpha = c.alpha;
-      ctx.translate(x, c.y);
-      ctx.rotate(c.tilt);
-      ctx.drawImage(c._sprite, -c._spriteHalf, -c._spriteHalf);
-      ctx.restore();
+      ctx.drawImage(c._sprite, x - c._spriteHalf, c.y - c._spriteHalf);
     }
     ctx.globalAlpha = 1;
   }
