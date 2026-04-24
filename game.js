@@ -1884,12 +1884,17 @@ const Game = (function(){
     ctx.fillStyle = netPostsGrad();
     ctx.fillRect(left, top + 4, NET_W, NET_H - 4);
 
-    // Mesh texture — grid lines inside the post area
+    // Mesh texture — grid lines inside the post area. Один beginPath +
+    // всё moveTo/lineTo + один stroke(): 14 линий раньше давали 14 раздельных
+    // path-flush'ей на GPU за кадр.
     ctx.strokeStyle = "rgba(255,255,255,0.55)";
     ctx.lineWidth = 1;
+    ctx.beginPath();
     for(let y = top + 10; y < GROUND_Y - 2; y += 10){
-      ctx.beginPath(); ctx.moveTo(left + 1, y); ctx.lineTo(left + NET_W - 1, y); ctx.stroke();
+      ctx.moveTo(left + 1, y);
+      ctx.lineTo(left + NET_W - 1, y);
     }
+    ctx.stroke();
 
     // Top band — Blurple cap
     ctx.fillStyle = "#5865f2";
