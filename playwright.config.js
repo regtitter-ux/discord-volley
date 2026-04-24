@@ -31,7 +31,7 @@ module.exports = defineConfig({
     { name: "mobile-chrome",  use: { ...devices["Pixel 7"] } }
   ],
   webServer: {
-    command: `node --experimental-sqlite server.js`,
+    command: `node --experimental-sqlite src/server/server.js`,
     url: BASE,
     reuseExistingServer: !process.env.CI,
     timeout: 30_000,

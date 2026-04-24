@@ -15,9 +15,12 @@ COPY package.json package-lock.json* ./
 RUN npm ci --omit=dev --no-audit --no-fund \
     && npm cache clean --force
 
-# Только код, нужный room-server'у. Клиент (game.js, index.html, assets/)
-# в образ room-runtime не тащим — он не обслуживает HTTP-статик, только WS.
-COPY room-server.js room-auth.js shadowsim.js physics.js codec.js ./
+# Только код, нужный room-server'у: src/room (room-server, room-auth, shadowsim)
+# и src/shared (physics, codec). Клиентский UI и server.js в образ не тащим —
+# room-runtime не обслуживает HTTP-статик, только WS на одну комнату.
+# Никаких ручных копий .deploy/hathora/ — Dockerfile берёт из source-of-truth.
+COPY src/shared ./src/shared
+COPY src/room   ./src/room
 
 ENV NODE_ENV=production
 # Hathora проксирует наружу порт, заявленный в hathora.toml/dashboard.
@@ -27,5 +30,5 @@ EXPOSE 8080
 
 # ROOM_SECRET и ROOM_RAILWAY_URL — через env на Hathora dashboard. matchId
 # проверяется по подписанному room-token'у клиента, отдельный --match-id
-# не нужен (см. room-server.js verifyRoomToken).
-CMD ["node", "room-server.js", "--port", "8080"]
+# не нужен (см. src/room/room-server.js verifyRoomToken).
+CMD ["node", "src/room/room-server.js", "--port", "8080"]

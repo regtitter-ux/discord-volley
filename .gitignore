@@ -13,4 +13,8 @@ data-test/
 playwright-report/
 test-results/
 .claude/settings.local.json
+.claude/worktrees/
+.claude/scheduled_tasks.lock
 .tmp_deco/
+.deploy/
+.collaborator

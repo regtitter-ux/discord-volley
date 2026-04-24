@@ -17,4 +17,4 @@ EXPOSE 8080
 # --experimental-sqlite: node:sqlite на Node 22 требует флаг (в 24 он уже
 # стабилен, флаг остаётся совместимо-проходным). Перенесёт весь лидерборд
 # и кошельки с data/leaderboard.json на data/volley.sqlite при первом старте.
-CMD ["node", "--experimental-sqlite", "server.js"]
+CMD ["node", "--experimental-sqlite", "src/server/server.js"]
