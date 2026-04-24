@@ -2222,17 +2222,30 @@ const Game = (function(){
   // render рисует готовый кадр одним drawImage без аргументов-кропа, что на
   // слабых GPU дешевле, чем сэмплить из большой текстуры с sx/sy/sw/sh каждый
   // кадр на каждого игрока.
+  // LRU-кеп: ключ включает `?v=<updatedAt>`, поэтому при обновлении атласа
+  // админом старая запись становится недоступной навсегда, но раньше висела
+  // в Map + до 60 offscreen canvas. Игрок одновременно видит максимум 2-4
+  // разных украшения (своё + оппонента + history), держим 6 — с запасом.
+  const DECO_ATLAS_CACHE_MAX = 6;
   const decoAtlasCache = new Map();
   function getDecoAtlas(url){
     if(!url) return null;
     let entry = decoAtlasCache.get(url);
-    if(!entry){
-      const img = new Image();
-      img.decoding = "async";
-      entry = { img, frames: null };
-      img.src = url;
+    if(entry){
+      // Touch: переносим в конец Map — в Map.keys() порядок вставки.
+      decoAtlasCache.delete(url);
       decoAtlasCache.set(url, entry);
+      return entry;
     }
+    if(decoAtlasCache.size >= DECO_ATLAS_CACHE_MAX){
+      const oldestKey = decoAtlasCache.keys().next().value;
+      decoAtlasCache.delete(oldestKey);
+    }
+    const img = new Image();
+    img.decoding = "async";
+    entry = { img, frames: null };
+    img.src = url;
+    decoAtlasCache.set(url, entry);
     return entry;
   }
   function getDecoFrameCanvas(entry, cols, rows, frames, idx){
