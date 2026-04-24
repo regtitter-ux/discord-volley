@@ -1047,6 +1047,11 @@ const Game = (function(){
   // спайки до невидимости, хвост распределения точнее показывает stutter.
   const FT_WINDOW = 120;
   const _frameTimeBuf = new Float32Array(FT_WINDOW);
+  // Отдельный буфер для sort — держим на уровне замыкания, не аллоцируем
+  // новый TypedArray на каждый вызов. При открытом debug-overlay _debug()
+  // крутится каждые 300 мс, и раньше каждый вызов порождал ArrayBuffer,
+  // засоряющий heap ровно тогда, когда пользователь диагностирует фризы.
+  const _frameTimeSort = new Float32Array(FT_WINDOW);
   let _frameTimeHead = 0;
   let _frameTimeCount = 0;
   function _frameTimePush(ft){
@@ -1056,10 +1061,12 @@ const Game = (function(){
   }
   function _frameTimeP95(){
     if(_frameTimeCount < 8) return null;
-    const arr = new Float32Array(_frameTimeCount);
-    for(let i = 0; i < _frameTimeCount; i++) arr[i] = _frameTimeBuf[i];
-    Array.prototype.sort.call(arr, (a,b) => a - b);
-    return arr[Math.min(_frameTimeCount - 1, Math.floor(_frameTimeCount * 0.95))];
+    for(let i = 0; i < _frameTimeCount; i++) _frameTimeSort[i] = _frameTimeBuf[i];
+    // Float32Array.prototype.sort — in-place, числовой сорт по дефолту,
+    // без compare-функции и без аллокаций.
+    const view = _frameTimeSort.subarray(0, _frameTimeCount);
+    view.sort();
+    return view[Math.min(_frameTimeCount - 1, Math.floor(_frameTimeCount * 0.95))];
   }
   let hitFlash = 0;
   let jumpBufferT = 0;
