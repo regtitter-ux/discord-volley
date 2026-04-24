@@ -287,6 +287,10 @@
   // подающего нет (matchOver/initial spawn), тогда используем четверть поля.
   // worldW/netX — размеры приходят от caller'а (это world config, не физика).
   // Возвращает core-поля ball'а; prev/render-поля клиент добавляет сам.
+  // NB: свежий литерал намеренно — shadowsim.js делает `sim.ball = serveBall(...)`
+  // и ожидает независимый объект на каждый сим. Переиспользуемый singleton
+  // здесь поломал бы мультиигровой сервер (все sim'ы разделяли бы один ball).
+  // Частота вызова — 1 раз за очко, GC-давление пренебрежимо.
   function serveBall(servingSide, serverX, worldW, netX){
     const minX = (servingSide === 1) ? BALL_R          : netX + NET_W/2 + BALL_R;
     const maxX = (servingSide === 1) ? netX - NET_W/2 - BALL_R : worldW - BALL_R;

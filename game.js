@@ -181,17 +181,27 @@ const Wallet = (function(){
     balance = n;
     for(const fn of listeners) { try { fn(delta, balance); } catch(_){} }
   }
+  // Pre-allocated payload: award() вызывается из collideBallPlayer (rally.hit
+  // каждый удар мяча) — на длинном ралли это до 5-10/сек. Свежий литерал +
+  // nested context-object + String(kind) давали пучок транзиентов на GC.
+  // Один модульный payload + context безопасны: стэйт синхронный, сервер
+  // получает snapshot по JSON.stringify — наши последующие мутации payload
+  // к нему не относятся.
+  const _awardPayload = { type: "award", kind: "", matchId: null, context: undefined };
+  const _awardContext = { combo: 0 };
   function award(kind, amountOrCombo){
     // Клиентское значение amount игнорируется сервером; для rally.combo мы
     // всё же прокидываем combo в context, чтобы сервер знал размер серии.
     if(!state.ws || state.ws.readyState !== 1) return false;
-    const payload = {
-      type: "award",
-      kind: String(kind || ""),
-      matchId: (state.session && state.session.matchId) || null
-    };
-    if(kind === "rally.combo") payload.context = { combo: amountOrCombo | 0 };
-    try { state.ws.send(JSON.stringify(payload)); } catch(_){}
+    _awardPayload.kind = kind || "";
+    _awardPayload.matchId = (state.session && state.session.matchId) || null;
+    if(kind === "rally.combo"){
+      _awardContext.combo = amountOrCombo | 0;
+      _awardPayload.context = _awardContext;
+    } else {
+      _awardPayload.context = undefined;
+    }
+    try { state.ws.send(JSON.stringify(_awardPayload)); } catch(_){}
     return true;
   }
   return {
@@ -234,6 +244,24 @@ function renderWallet(){
 }
 // Коалесцируем +N: при частых начислениях (каждое касание мяча) копим сумму и
 // анимируем один раз после дебаунс-окна, иначе reflow+рестарт анимации на каждый +1.
+// Анимации крутим через Web Animations API вместо `void offsetWidth` — старый
+// трюк форсировал синхронный reflow во время матча (триггерился по WS-пушу
+// `wallet` каждые 160 мс в активном раллие), что воровало 2-10 мс кадрового
+// бюджета на слабом ПК. Keyframes вынесены в модульные константы — zero alloc
+// на каждый вызов (до правки плюс каждый раз создавался массив + 3 объекта).
+const _WALLET_BUMP_KF = [
+  { transform: "scale(1)",    color: "var(--text)" },
+  { transform: "scale(1.35)", color: "#ffd34a", offset: 0.35 },
+  { transform: "scale(1)",    color: "var(--text)" }
+];
+const _WALLET_BUMP_OPT = { duration: 450, easing: "ease" };
+const _WALLET_DELTA_KF = [
+  { opacity: 0, transform: "translate(-50%,0) scale(.7)" },
+  { opacity: 1, transform: "translate(-50%,-8px) scale(1.05)", offset: 0.15 },
+  { opacity: 1, transform: "translate(-50%,-22px) scale(1)",   offset: 0.70 },
+  { opacity: 0, transform: "translate(-50%,-34px) scale(.9)" }
+];
+const _WALLET_DELTA_OPT = { duration: 950, easing: "ease", fill: "forwards" };
 let pendingDelta = 0;
 let pendingTimer = 0;
 function flushWalletDelta(){
@@ -243,12 +271,18 @@ function flushWalletDelta(){
   if(amount <= 0) return;
   for(const e of walletEls){
     if(!e.value || !e.delta) continue;
-    e.value.classList.remove("bump");
-    e.delta.classList.remove("show");
-    void e.delta.offsetWidth;
     e.delta.textContent = "+" + amount;
-    e.value.classList.add("bump");
-    e.delta.classList.add("show");
+    if(typeof e.value.animate === "function"){
+      e.value.animate(_WALLET_BUMP_KF,  _WALLET_BUMP_OPT);
+      e.delta.animate(_WALLET_DELTA_KF, _WALLET_DELTA_OPT);
+    } else {
+      // Фолбэк для старых браузеров: прежний reflow-трюк.
+      e.value.classList.remove("bump");
+      e.delta.classList.remove("show");
+      void e.delta.offsetWidth;
+      e.value.classList.add("bump");
+      e.delta.classList.add("show");
+    }
   }
 }
 function flashWalletDelta(amount){
@@ -269,13 +303,18 @@ function renderTrophies(){
 }
 function flashTrophyDelta(amount){
   if(!trophyValueEl || !trophyDeltaEl || !amount) return;
-  trophyValueEl.classList.remove("bump");
-  trophyDeltaEl.classList.remove("show");
-  void trophyDeltaEl.offsetWidth;
   trophyDeltaEl.textContent = (amount > 0 ? "+" : "") + amount;
   trophyDeltaEl.style.color = amount < 0 ? "#f87171" : "";
-  trophyValueEl.classList.add("bump");
-  trophyDeltaEl.classList.add("show");
+  if(typeof trophyValueEl.animate === "function"){
+    trophyValueEl.animate(_WALLET_BUMP_KF,  _WALLET_BUMP_OPT);
+    trophyDeltaEl.animate(_WALLET_DELTA_KF, _WALLET_DELTA_OPT);
+  } else {
+    trophyValueEl.classList.remove("bump");
+    trophyDeltaEl.classList.remove("show");
+    void trophyDeltaEl.offsetWidth;
+    trophyValueEl.classList.add("bump");
+    trophyDeltaEl.classList.add("show");
+  }
 }
 renderTrophies();
 Trophies.onChange((delta)=>{
@@ -1367,9 +1406,10 @@ const Game = (function(){
     const core = DVPhysics.serveBall(servingSide, serverX, WORLD_W, NET_X);
     // Первая подача создаёт ball со всеми render-полями. Последующие
     // мутируют in-place — убирает Object.assign-аллокацию на каждом голе.
-    // DVPhysics.serveBall всё равно возвращает свежий литерал (он shared
-    // с shadowsim на сервере, trivially переиспользовать нельзя), но мы
-    // хотя бы не плодим второй объект-обёртку на клиенте.
+    // DVPhysics.serveBall всё равно возвращает свежий литерал (shadowsim на
+    // сервере делает `sim.ball = serveBall(...)` и требует независимый
+    // объект на каждый сим), но мы хотя бы не плодим второй объект-обёртку
+    // на клиенте.
     if(!ball){
       ball = {
         x: core.x, y: core.y,
@@ -1663,10 +1703,15 @@ const Game = (function(){
   // Human-control: coyote/jump-buffer в DVPhysics, jumpBufferT храним
   // локально (state caller'а). На Этапе 2 сервер будет держать свой
   // jumpBufferT per-peer и гонять тот же код.
+  // Reused input object — applyHumanInput вызывается 120 раз/сек, свежий
+  // литерал на каждый тик давал ~36 тыс. short-lived объектов за 5 мин →
+  // Scavenge GC каждые 0.5-1с. Переиспользуем один объект, поля стабильны.
+  const _humanInput = { left: false, right: false, jumpHeld: false };
   function applyHumanInput(p, dt){
-    const ev = DVPhysics.applyHumanInput(p, dt,
-      { left: keys.left, right: keys.right, jumpHeld: keys.jump },
-      jumpBufferT);
+    _humanInput.left     = keys.left;
+    _humanInput.right    = keys.right;
+    _humanInput.jumpHeld = keys.jump;
+    const ev = DVPhysics.applyHumanInput(p, dt, _humanInput, jumpBufferT);
     jumpBufferT = ev.jumpBufferT;
     if(ev.jumped) sfx.jump();
   }
@@ -2444,10 +2489,13 @@ const Game = (function(){
     ctx.translate(px, py + r * (1 - syAxis));
     ctx.scale(sxAxis, syAxis);
 
-    ctx.save();
-    ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI*2); ctx.clip();
+    // Аватар уже запечён круглым в getAvatarCanvas: при наличии картинки —
+    // через clip внутри offscreen'а; при fallback-букве — просто arc+fill
+    // на прозрачном квадрате (углы transparent). Поэтому clip на main-ctx
+    // избыточен: Canvas2D ctx.clip() форсирует path tessellation на CPU/
+    // iGPU (один из самых дорогих 2D-ops), и снимать его — значит убрать
+    // 2 clip'а за кадр (p1+p2).
     ctx.drawImage(av, -r, -r, size, size);
-    ctx.restore();
 
     ctx.beginPath(); ctx.arc(0, 0, r, 0, Math.PI*2);
     ctx.strokeStyle = "#ffffff"; ctx.lineWidth = 4; ctx.stroke();
@@ -2649,19 +2697,28 @@ const Game = (function(){
     }
     if(profile){
       const t2 = performance.now();
-      // Ring-buffer, а не unbounded .push(): при `__dvProfile=true` старый
-      // код рос линейно (3 массива × 60 записей/сек ≈ 11 тыс/мин), без
-      // инвалидации в resetMatch — классический heap-leak. Кеп 600 ≈ 10 с
-      // истории, достаточно для репрезентативной выборки.
+      // Настоящий ring-buffer с head-index'ом. В предыдущей версии `push+shift`
+      // назывался ring-buffer, но Array.shift() — O(n): копирует 600 элементов
+      // на каждый кадр × 3 массива = ~108k element copies/сек под profile.
+      // Это активно ухудшало измерения ровно в тот момент, когда юзер пытается
+      // диагностировать фризы (Heisenbug). Прямое индексирование = O(1),
+      // форма `prof.step`/etc сохранена — тесты по-прежнему делают slice(-N)
+      // для репрезентативной выборки (порядок для p95/max не важен).
       const PROF_CAP = 600;
       let prof = window.__dvProf;
-      if(!prof) prof = window.__dvProf = { step: [], render: [], steps: [] };
-      if(prof.step.length >= PROF_CAP) prof.step.shift();
-      if(prof.render.length >= PROF_CAP) prof.render.shift();
-      if(prof.steps.length >= PROF_CAP) prof.steps.shift();
-      prof.step.push(t1 - t0);
-      prof.render.push(t2 - t1);
-      prof.steps.push(steps);
+      if(!prof){
+        prof = window.__dvProf = {
+          step:   new Array(PROF_CAP).fill(0),
+          render: new Array(PROF_CAP).fill(0),
+          steps:  new Array(PROF_CAP).fill(0),
+          _head:  0
+        };
+      }
+      const h = prof._head;
+      prof.step[h]   = t1 - t0;
+      prof.render[h] = t2 - t1;
+      prof.steps[h]  = steps;
+      prof._head = (h + 1) % PROF_CAP;
     }
     // Адаптивное качество: считаем EWMA времени кадра. Порог 22 мс ≈ 45 FPS
     // — ниже этого на десктопе включаем lowQuality и скидываем тяжёлые
