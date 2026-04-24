@@ -48,13 +48,29 @@ const Clock = {
 const DecoAnim = (function(){
   const layers = new Set();
   let running = false;
+  // Пауза на время активного canvas-матча: rAF-тикер DecoAnim крутится
+  // параллельно с Game.loop и на каждый кадр дёргает dataset + пишет в
+  // style.backgroundPosition для всех attached элементов (DOM-write +
+  // partial style recalc). Во время матча анимация украшений в HUD-аватарах
+  // визуально теряется на фоне canvas, и выгоднее приглушить второй rAF.
+  let paused = false;
   function attach(el){
     if(!el) return;
     layers.add(el);
-    if(!running){ running = true; requestAnimationFrame(tick); }
+    if(!running && !paused){ running = true; requestAnimationFrame(tick); }
   }
   function detach(el){ layers.delete(el); }
+  function pause(){
+    paused = true;
+    // running сам сбросится в tick() — не форсим, чтобы не терять кадр.
+  }
+  function resume(){
+    if(!paused) return;
+    paused = false;
+    if(!running && layers.size > 0){ running = true; requestAnimationFrame(tick); }
+  }
   function tick(){
+    if(paused){ running = false; return; }
     if(layers.size === 0){ running = false; return; }
     const t = performance.now();
     for(const el of layers){
@@ -77,7 +93,7 @@ const DecoAnim = (function(){
     }
     requestAnimationFrame(tick);
   }
-  return { attach, detach };
+  return { attach, detach, pause, resume };
 })();
 window.DecoAnim = DecoAnim;
 
@@ -1408,6 +1424,10 @@ const Game = (function(){
     last = Clock.now();
     acc = 0;
     cancelAnimationFrame(rafId);
+    // Приглушаем параллельный rAF-тикер DecoAnim на время матча: анимация
+    // украшений в HUD-аватарах не читается на фоне canvas-геймплея, а
+    // лишний rAF-callback + DOM-write каждый кадр бьёт по слабым ПК.
+    if(typeof DecoAnim !== "undefined" && DecoAnim.pause) DecoAnim.pause();
     // Render a frame immediately so the scene isn't black before first rAF tick
     render();
     rafId = requestAnimationFrame(loop);
@@ -1422,6 +1442,7 @@ const Game = (function(){
     rafId = 0;
     _setBgTick(false);
     overlay.classList.add("hidden");
+    if(typeof DecoAnim !== "undefined" && DecoAnim.resume) DecoAnim.resume();
   }
 
   function endMatch(winnerSide){
