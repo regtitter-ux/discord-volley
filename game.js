@@ -2548,10 +2548,19 @@ const Game = (function(){
     }
     if(profile){
       const t2 = performance.now();
-      if(!window.__dvProf) window.__dvProf = { step: [], render: [], steps: [] };
-      window.__dvProf.step.push(t1 - t0);
-      window.__dvProf.render.push(t2 - t1);
-      window.__dvProf.steps.push(steps);
+      // Ring-buffer, а не unbounded .push(): при `__dvProfile=true` старый
+      // код рос линейно (3 массива × 60 записей/сек ≈ 11 тыс/мин), без
+      // инвалидации в resetMatch — классический heap-leak. Кеп 600 ≈ 10 с
+      // истории, достаточно для репрезентативной выборки.
+      const PROF_CAP = 600;
+      let prof = window.__dvProf;
+      if(!prof) prof = window.__dvProf = { step: [], render: [], steps: [] };
+      if(prof.step.length >= PROF_CAP) prof.step.shift();
+      if(prof.render.length >= PROF_CAP) prof.render.shift();
+      if(prof.steps.length >= PROF_CAP) prof.steps.shift();
+      prof.step.push(t1 - t0);
+      prof.render.push(t2 - t1);
+      prof.steps.push(steps);
     }
     // Адаптивное качество: считаем EWMA времени кадра. Порог 22 мс ≈ 45 FPS
     // — ниже этого на десктопе включаем lowQuality и скидываем тяжёлые
