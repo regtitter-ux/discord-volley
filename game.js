@@ -1212,9 +1212,26 @@ const Game = (function(){
       elA.textContent = String(score1);
       elB.textContent = String(score2);
       const pulseEl = localSide === 1 ? elA : elB;
-      pulseEl.classList.remove("pulse");
-      void pulseEl.offsetWidth; // reflow to restart animation
-      pulseEl.classList.add("pulse");
+      // Web Animations API вместо class-toggle + `void offsetWidth` для
+      // рестарта: старый приём форсировал синхронный reflow в критическом
+      // игровом событии (очко = 1-2 раза за rally), что на слабом ПК
+      // воровало 1-3 мс кадрового бюджета. el.animate() возвращает свежую
+      // Animation каждый вызов, без reflow и без class-гонок.
+      if(typeof pulseEl.animate === "function"){
+        pulseEl.animate(
+          [
+            { transform: "scale(1)",    color: "var(--text, #fff)" },
+            { transform: "scale(1.55)", color: "#ffd34a", offset: 0.35 },
+            { transform: "scale(1)",    color: "var(--text, #fff)" }
+          ],
+          { duration: 450, easing: "ease" }
+        );
+      } else {
+        // Фолбэк для старых браузеров: прежний reflow-трюк.
+        pulseEl.classList.remove("pulse");
+        void pulseEl.offsetWidth;
+        pulseEl.classList.add("pulse");
+      }
       spawnParticles(
         ball.x, GROUND_Y - 2, 22,
         localSide === 1 ? "rgba(35,165,90,1)" : "rgba(242,63,66,1)", 260
