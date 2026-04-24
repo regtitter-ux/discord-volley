@@ -247,116 +247,20 @@ const DB = openDb(DATA_DIR);
 
 function ensureUser(user){ return DB.ensureUser(user); }
 
-/* ---------- Match stakes (trophies) ----------
-   На старте матча сервер катает две случайные величины:
-     win  ∈ [20..35] — сколько +трофеев получит победитель
-     loss ∈ [25..40] — сколько −трофеев потеряет проигравший (клампим в 0).
-   Ставки хранятся по matchId, и match_win / match_loss смотрят именно
-   туда — клиент не может подменить размер награды. Каждый исход на матч
-   принимается один раз: повторный match_win с того же matchId → no-op.
-   Через 15 минут запись стирается (GC на случай, если клиент не закрыл
-   матч и не перезапросил). */
-const TROPHY_WIN_MIN  = 20, TROPHY_WIN_MAX  = 35;
-const TROPHY_LOSS_MIN = 25, TROPHY_LOSS_MAX = 40;
-const MATCH_STAKES_TTL_MS = 15 * 60 * 1000;
-
-function randInt(min, max){ return min + Math.floor(Math.random() * (max - min + 1)); }
-
-function rollStakes(){
-  return {
-    win:  randInt(TROPHY_WIN_MIN,  TROPHY_WIN_MAX),
-    loss: randInt(TROPHY_LOSS_MIN, TROPHY_LOSS_MAX),
-    winnerReportedBy: null,
-    loserReportedBy:  null
-  };
-}
-
-// userRates растёт линейно по числу уникальных юзеров за время аптайма и
-// никогда не освобождается. Раз в 5 минут выкидываем записи, где последняя
-// активность старше часа — кулдауны за это время всё равно истекли.
-// В multi-instance режиме userRates per-instance: это ок, т.к. ws-сессия
-// клиента держится одним инстансом, и все award'ы одного матча приходят
-// туда же. Суммарный кап по match.win защищён global-cooldown'ом 30с
-// (приближение, а не строгая гарантия через Redis — сознательный trade-off).
-const USER_RATES_TTL_MS = 60 * 60 * 1000;
-setInterval(() => {
-  const cutoff = Date.now() - USER_RATES_TTL_MS;
-  for (const [id, rec] of userRates){
-    let latest = rec._lastMatchWinAt || 0;
-    for (const k of Object.keys(rec)){
-      if (k.startsWith("_")) continue;
-      const st = rec[k];
-      if (st && st.lastAt > latest) latest = st.lastAt;
-    }
-    if (latest < cutoff) userRates.delete(id);
-  }
-}, 5 * 60 * 1000).unref();
-
-// Атомарный claim через broker: под Redis это Lua-скрипт, гарантирующий,
-// что даже два инстанса не смогут выплатить win/loss дважды. Под LocalBroker
-// — обычная проверка поля на in-memory записи.
-async function applyMatchOutcome(userObj, matchId, outcome){
-  const r = await broker.claimOutcome(matchId, userObj.id, outcome);
-  if (!r) return null;
-  const total = DB.addTrophies(userObj, r.delta);
-  console.log(`[lb] ${outcome} ${userObj.id} Δ${r.delta} → ${total}`);
-  return { total, delta: r.delta };
-}
-
-/* ---------- Server-authoritative wallet ----------
-   Клиент шлёт {type:"award", kind, matchId, context}. Сервер — единственный
-   источник истины по балансу. Рейт-лимиты и размеры наград настроены тут,
-   а не на клиенте: правка клиентского кода ни на что не влияет.
-   Допустимые kind:
-     rally.hit   — касание мяча; +1, до 200 за матч, не чаще 1 раз в 250 мс.
-     rally.combo — серия касаний; +context.combo (клампим 1..200), до 40 за матч.
-     round.win   — выигран раунд; +5, до 100 за матч.
-     match.win   — выигран матч; +50, 1 раз за матч + 30 с кулдаун между
-                   любыми match.win одного юзера (против фермы ботов).
-   Лимиты «за матч» — по matchId (клиент генерит при старте). Новые matchId
-   ресетят счётчик kind, поэтому общая кросс-матч защита — global cooldown на
-   match.win и умеренные per-match лимиты для остальных событий. */
-// Env-оверрайды оставлены для интеграционных тестов: поднимать per-match cap
-// или 30с global cooldown на живом сервере на время теста дешевле и честнее,
-// чем мокать awardCoins. В проде env не задан — работают дефолты.
-const AWARDS = {
-  "rally.hit":   { amount: 1,  minGapMs: 250,  maxPerMatch: Number(process.env.WALLET_RALLY_MAX) || 200 },
-  "rally.combo": { amount: 0,  minGapMs: 400,  maxPerMatch: 40, fromContext: true },
-  "round.win":   { amount: 5,  minGapMs: 500,  maxPerMatch: 100 },
-  "match.win":   { amount: 50, minGapMs: 1000, maxPerMatch: 1,  globalGapMs: Number(process.env.WALLET_MATCHWIN_GLOBAL_MS) || 30000 }
-};
-// userId → { kind → { lastAt, count, matchId } } + _lastMatchWinAt
-const userRates = new Map();
-
-function awardCoins(user, kind, matchId, context){
-  const cfg = AWARDS[kind];
-  if (!cfg) return null;
-  if (!matchId || typeof matchId !== "string" || matchId.length > 64) return null;
-  if (!user || !user.id) return null;
-  const now = Date.now();
-  let rec = userRates.get(user.id);
-  if (!rec){ rec = { _lastMatchWinAt: 0 }; userRates.set(user.id, rec); }
-  // Global cooldown — защита от фарма ботом на коротких быстрых матчах.
-  if (cfg.globalGapMs && kind === "match.win"){
-    if (now - (rec._lastMatchWinAt || 0) < cfg.globalGapMs) return null;
-  }
-  let st = rec[kind];
-  if (!st || st.matchId !== matchId) st = rec[kind] = { lastAt: -Infinity, count: 0, matchId };
-  if (now - st.lastAt < cfg.minGapMs) return null;
-  if (st.count >= cfg.maxPerMatch)    return null;
-  let amount = cfg.amount;
-  if (cfg.fromContext && context && typeof context.combo === "number"){
-    amount = Math.max(1, Math.min(200, context.combo | 0));
-  }
-  st.lastAt = now;
-  st.count++;
-  if (kind === "match.win") rec._lastMatchWinAt = now;
-  const coins = DB.addCoins(user, amount);
-  return { coins, delta: amount };
-}
-
-function userCoins(id){    return DB.getCoins(id); }
-function userTrophies(id){ return DB.getTrophies(id); }
+/* ---------- Wallet (монеты) + Trophies/stakes ----------
+   Server-authoritative. Рейт-лимиты, размеры наград, match stakes TTL,
+   global cooldowns — всё живёт в ./wallet.js. Тут только импорт и
+   ленивая ссылка на broker (он создаётся ниже). */
+const Wallet = require("./wallet")({ DB, getBroker: () => broker });
+const {
+  AWARDS,
+  MATCH_STAKES_TTL_MS,
+  rollStakes,
+  applyMatchOutcome,
+  awardCoins,
+  userCoins,
+  userTrophies,
+} = Wallet;
 
 const LB_PAGE_SIZE = 10;
 
