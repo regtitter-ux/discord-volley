@@ -1604,7 +1604,14 @@ const Game = (function(){
   //   нормального потока prediction уезжала за 100+ px → hard-snap (визуально
   //   «фриз-рывок»). Подняв max до 260 мс, мы переживаем такие спайки внутри
   //   interpolation'а и даём плавную лерп-кривую между A→B.
-  const RENDER_DELAY_MIN = 0.05;
+  // Block F (Apr 2026): MIN поднят 50→100мс по результатам прод-overlay.
+  // На чистой сети без RTT-spike алгоритм адаптации опускал renderDelay в
+  // пол (50мс), буфер сжимался до 1 снапа. Когда RTT периодически прыгал
+  // 200→600мс (DE↔DE Frankfurt edge), буфер опустошался → 149 extrap-
+  // событий за матч → визуальные «фризы». 100мс floor = 6 снапов запаса
+  // при 60Гц, переживает RTT-спайки до ~600мс без underflow. Стоимость —
+  // +50мс input lag для p2/мяча (свой p1 client-side predicted, не теряет).
+  const RENDER_DELAY_MIN = 0.10;
   const RENDER_DELAY_MAX = 0.26;
   const SNAP_GAP_WINDOW = 24;                     // ~0.8 с истории при 30 Гц
   // Ring buffer вместо push/shift массива: push/shift на hot-path 60 Гц
@@ -2407,7 +2414,16 @@ const Game = (function(){
           // снапа по его авторитетной скорости.
           const MAX_EXTRAPOLATE = 0.3;
           const dtA = Math.min(MAX_EXTRAPOLATE, Math.max(0, targetT - snapA.recvT));
-          if(dtA > 0) _extrapCount++;
+          if(dtA > 0){
+            _extrapCount++;
+            // Block F: feedback loop. Underflow = «буфер был слишком мал на
+            // момент `targetT - snapA.recvT`». Поднимаем renderDelay так,
+            // чтобы при том же gap'е следующий тик не ушёл в extrap. +40мс
+            // safety margin (≈2 снапа). Cap MAX. Это компенсирует случаи,
+            // когда p99-адаптация ещё не почуяла спайк (window=24, 0.4с).
+            const want = Math.min(RENDER_DELAY_MAX, dtA + 0.040);
+            if(want > renderDelay) renderDelay = want;
+          }
           _ballHiddenTeleport = false;
           const vx2 = flip ? -aOpp.vx : aOpp.vx;
           const vy2 = aOpp.vy;
@@ -2655,10 +2671,16 @@ const Game = (function(){
         }
         const p99 = _snapGapScratch[Math.min(n - 1, Math.floor(n * 0.99))];
         const target = Math.max(RENDER_DELAY_MIN, Math.min(RENDER_DELAY_MAX, p99 * 1.10));
-        // Быстро поднимаемся (чтобы не ловить rubber-band), медленно опускаемся.
+        // Block F (Apr 2026): спуск замедлен 0.94/0.06 → 0.985/0.015. Старый
+        // half-life ≈ 11 sample × 16мс = 180мс — между периодическими RTT-
+        // спайками (~1 раз в 1-2с) buffer успевал схлопнуться обратно до
+        // floor, и следующий спайк опять давал underflow. Новый half-life
+        // ≈ 46 sample × 16мс = 740мс — buffer держится "поднятым" дольше.
+        // Поднимаемся мгновенно (target > renderDelay → немедленный прыжок),
+        // спуск через EMA. Этого достаточно при стабильном MIN floor.
         renderDelay = target > renderDelay
           ? target
-          : renderDelay * 0.94 + target * 0.06;
+          : renderDelay * 0.985 + target * 0.015;
       }
     }
     _lastSnapRecvT = now;
@@ -4133,7 +4155,7 @@ if (typeof window !== "undefined") window.__dvDebug = () => Game._debug();
       "heap: " + (d.heapMB != null ? fmt(d.heapMB, 0) + "MB" : "—") + "   score: " + d.score1 + ":" + d.score2,
       "— netcode —",
       "ws: " + d.wsState + "   snaps: " + d.snapTotal + "   since: " + (sinceMs != null ? fmt(sinceMs, 0) + "ms" : "—"),
-      "rtt: " + (d.rttEmaMs ? fmt(d.rttEmaMs, 0) + "ms" : "—") + " (max " + (d.maxRttMs ? fmt(d.maxRttMs, 0) + "ms" : "—") + ")   offset: " + fmt(d.clockOffsetMs, 0) + "ms",
+      "rtt: " + (d.rttEmaMs ? fmt(d.rttEmaMs, 0) + "ms" : "—") + " (max " + (d.maxRttMs ? fmt(d.maxRttMs, 0) + "ms" : "—") + ")",
       "renderDelay: " + fmt(d.renderDelay * 1000, 0) + "ms   snapQ: " + d.snapQLen + "   A→B: " + (d.snapAtoB != null ? fmt(d.snapAtoB * 1000, 0) + "ms" : "—"),
       "drift: " + fmt(d.p1Drift, 0) + "px   hardsnap: " + d.bigSnaps + "   extrap: " + d.extraps + "   lost: " + d.lostSnaps + " (" + (d.lostPctX100 / 100).toFixed(2) + "%)",
       j
