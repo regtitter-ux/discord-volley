@@ -135,9 +135,16 @@ function main(){
     ws._userId = null;
     touchActivity();
 
+    // Возвращает bufferedAmount после отправки (для shadow-side backpressure
+     // мониторинга). -1 = skip из-за переполненного TCP-буфера: следующая
+    // партия снапшотов всё равно догонит. null = сокет не готов.
     const sendRaw = (frame) => {
-      if (ws.readyState !== 1) return;
-      try { ws.send(frame); } catch {}
+      if (ws.readyState !== 1) return null;
+      // 32 KB ≈ 460 снапшотов по 69 Б — порядок «секунда лагает». Дальнейшие
+      // снапы всё равно нерелевантны клиенту (он играет past-time через
+      // renderDelay), копить их в socket-queue вреднее, чем пропустить.
+      if (ws.bufferedAmount > 32768) return -1;
+      try { ws.send(frame); return ws.bufferedAmount; } catch { return null; }
     };
 
     const closeWith = (code, reason) => {

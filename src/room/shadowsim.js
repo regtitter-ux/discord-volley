@@ -112,6 +112,15 @@ function makeSim(){
     driftSamples:  0,
     scoreMismatches: 0,  // сколько раз state-фрейм принёс s1/s2, не совпавший с нашим
     warnedOnce:    false,
+    // Backpressure-метрики per-пир. bp*Drops растёт когда sendRaw вернул -1
+    // (skip из-за переполненного TCP-буфера 32 КБ). bp*Max — наблюдаемый
+    // максимум bufferedAmount после send'а в окне между _flushStats. Если
+    // bp*Drops > 0 регулярно — клиент не успевает читать, а у нас snapshot-
+    // bombarding TCP, что усиливает HoL-блокировку при первом spike'е.
+    bpHostDrops:   0,
+    bpHostMax:     0,
+    bpGuestDrops:  0,
+    bpGuestMax:    0,
     openedAt:      Date.now(),
     lastStatsAt:   Date.now()
   };
@@ -169,6 +178,11 @@ function _restartRound(sim){
 }
 // Бинарный снапшот для обоих пиров. Клиент отправителя (host/guest)
 // примет его через тот же Codec.decode-путь в onmessage(binary).
+//
+// sendRaw-контракт (room-server.js): возвращает bufferedAmount после send'а,
+// либо -1 если skip из-за переполненного TCP-буфера, либо null если ws
+// не готов. Накапливаем по-пировые drops/maxBuffered в sim для логгирования
+// в _flushStats — backpressure-метрика на проде.
 function _emitSnapshot(sim){
   const hostSink  = sim.peerSinks.host;
   const guestSink = sim.peerSinks.guest;
@@ -188,8 +202,20 @@ function _emitSnapshot(sim){
   // sendRaw на WS принимает Buffer/Uint8Array/ArrayBuffer. ws@8 съедает
   // Uint8Array без копирования, но если в пути есть Buffer.from — не
   // принципиально, всё это одна и та же память.
-  if (hostSink)  try { hostSink(frame);  } catch {}
-  if (guestSink) try { guestSink(frame); } catch {}
+  if (hostSink){
+    try {
+      const r = hostSink(frame);
+      if (r === -1) sim.bpHostDrops++;
+      else if (typeof r === "number" && r > sim.bpHostMax) sim.bpHostMax = r;
+    } catch {}
+  }
+  if (guestSink){
+    try {
+      const r = guestSink(frame);
+      if (r === -1) sim.bpGuestDrops++;
+      else if (typeof r === "number" && r > sim.bpGuestMax) sim.bpGuestMax = r;
+    } catch {}
+  }
 }
 
 class ShadowRegistry {
@@ -483,13 +509,20 @@ class ShadowRegistry {
       const stateHz = (sim.frames.stateFromHost / dt).toFixed(1);
       const inpHz   = (sim.frames.inputFromGuest / dt).toFixed(1);
       const avg     = sim.driftSamples ? (sim.driftSumPx / sim.driftSamples).toFixed(1) : "0.0";
-      console.log(`[shadow] ${roomId} state=${stateHz}Hz input=${inpHz}Hz drift avg=${avg}px max=${sim.driftMaxPx.toFixed(1)}px scoreMismatch=${sim.scoreMismatches} score=${sim.score1}:${sim.score2}`);
+      const bpTag = (sim.bpHostDrops || sim.bpGuestDrops || sim.bpHostMax > 4096 || sim.bpGuestMax > 4096)
+        ? ` backpressure[host]=drops=${sim.bpHostDrops} max=${sim.bpHostMax}B [guest]=drops=${sim.bpGuestDrops} max=${sim.bpGuestMax}B`
+        : "";
+      console.log(`[shadow] ${roomId} state=${stateHz}Hz input=${inpHz}Hz drift avg=${avg}px max=${sim.driftMaxPx.toFixed(1)}px scoreMismatch=${sim.scoreMismatches} score=${sim.score1}:${sim.score2}${bpTag}`);
       sim.frames.stateFromHost = 0;
       sim.frames.inputFromGuest = 0;
       sim.driftSumPx = 0;
       sim.driftMaxPx = 0;
       sim.driftSamples = 0;
       sim.scoreMismatches = 0;
+      sim.bpHostDrops = 0;
+      sim.bpHostMax = 0;
+      sim.bpGuestDrops = 0;
+      sim.bpGuestMax = 0;
       sim.lastStatsAt = now;
     }
   }

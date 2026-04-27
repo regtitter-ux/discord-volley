@@ -1579,8 +1579,12 @@ const Game = (function(){
   // Держим пул wrapper'ов { recvT, s } фиксированного размера, а snapA/snapB
   // отдаём как прямые индексы в пул.
   const SNAP_Q_MAX = 16;
+  // srvT — серверная отметка времени снапа (s.srvTickMs/1000), используется
+  // для адаптации буфера и определения «server-side gap» между снапами без
+  // примеси клиентского GC/rAF jitter (Critic C3, Apr 2026). recvT остаётся
+  // как локальный wall-clock приёма для targetT-сравнения в step()-loop'е.
   const _snapSlots = new Array(SNAP_Q_MAX);
-  for(let i = 0; i < SNAP_Q_MAX; i++) _snapSlots[i] = { recvT: 0, s: null };
+  for(let i = 0; i < SNAP_Q_MAX; i++) _snapSlots[i] = { recvT: 0, srvT: 0, s: null };
   let _snapHead = 0;   // индекс самого старого wrapper'а в кольце
   let _snapCount = 0;  // сколько живых элементов в очереди
   function _snapQAt(i){
@@ -1589,7 +1593,7 @@ const Game = (function(){
   }
   // snapA — «левая» точка интерполяции. Храним в отдельной ячейке (не внутри
   // кольца), иначе push поверх её слота затёр бы payload.
-  const snapA = { recvT: 0, s: null };
+  const snapA = { recvT: 0, srvT: 0, s: null };
   let snapAValid = false;
   // Stage 8: старт 120 мс, покрывает Hathora edge jitter (TLS + Frankfurt hop),
   // потом p99-адаптация подтянет точно. При низком jitter MIN=50 мс быстро
@@ -1613,7 +1617,11 @@ const Game = (function(){
   // +50мс input lag для p2/мяча (свой p1 client-side predicted, не теряет).
   const RENDER_DELAY_MIN = 0.10;
   const RENDER_DELAY_MAX = 0.26;
-  const SNAP_GAP_WINDOW = 24;                     // ~0.8 с истории при 30 Гц
+  // Apr 2026: 24 → 60. На server-clock метрике (без client-GC шума) p99-окно
+  // в 0.4с было слишком коротким — один отдельный spike имел вес 1/24=4%,
+  // что давало случайные «ложные тревоги». 60 sample = 1с истории при 60Гц,
+  // p99 ≈ 99-й перцентиль реальный, а не просто max последней секунды.
+  const SNAP_GAP_WINDOW = 60;
   // Ring buffer вместо push/shift массива: push/shift на hot-path 60 Гц
   // давал O(n) сдвиг 24 элементов и GC-давление (slice + sort каждый snap).
   // Float32Array + circular indices — 60 раз/сек одна аллокация под sort'ом
@@ -1662,6 +1670,16 @@ const Game = (function(){
     };
   }
   let _lastSnapRecvT = 0;
+  // Server-clock дельта между двумя последовательными снапшотами для
+  // адаптации буфера (Critic C3). Растёт монотонно, не зависит от GC клиента.
+  let _lastSnapSrvT  = 0;
+  // Post-extrap hysteresis (Critic C4): wall-clock дедлайн, до которого
+  // EMA-спуск renderDelay подавлен. Ставится при extrap-событии в step().
+  let _extrapHoldUntil = 0;
+  // Predict-collision дебаунс (Critic M4): true пока локальная p1↔ball
+  // overlap-проверка активна; сброс на разрыв контакта. Чтобы на каждое
+  // касание тригерить ровно один Fx.hit, а не 60 за секунду.
+  let _p1PredHitArmed = false;
   // Счётчики для debug-overlay: видимость, что реконсиляция/экстраполяция
   // реально срабатывают под нагрузкой. _lastP1Drift — мгновенный drift на
   // последнем снапшоте, _bigSnapCount — hard-snap'ы (катастрофический
@@ -2121,6 +2139,7 @@ const Game = (function(){
       ball.touches.left = 0; ball.touches.right = 0;
       ball.prevX = core.x;  ball.prevY = core.y;  ball.prevAngle = 0;
       ball.renderX = core.x; ball.renderY = core.y; ball.renderAngle = 0;
+      ball._visInit = false;
     }
     trailHead = 0; trailCount = 0;
     hitFlash = 0;
@@ -2156,6 +2175,13 @@ const Game = (function(){
     _snapTotalCount = 0; _stepsLastFrame = 0;
     _frameTimeHead = 0; _frameTimeCount = 0;
     _lastSnapRecvT = 0;
+    _lastSnapSrvT  = 0;
+    _extrapHoldUntil = 0;
+    _lastRenderMs = 0;
+    _p1PredHitArmed = false;
+    if(p1) p1._visInit = false;
+    if(p2) p2._visInit = false;
+    if(ball) ball._visInit = false;
     // Block B NetDiag: счётчики обнуляем на каждом матче. Pings будут
     // перезапущены отдельно из start(); RTT-EMA копится с нуля.
     _lastSnapSeq = 0; _lostSnapCount = 0; _seenSnapCount = 0;
@@ -2379,7 +2405,8 @@ const Game = (function(){
           // Hermite даст overshoot через препятствие (реальный риск по ревью).
           // Для p2.y включаем только когда оба снапшота в воздухе (!onGround) —
           // иначе отскок от земли между A и B даёт тот же overshoot.
-          if(typeof window !== "undefined" && window.DV_HERMITE_INTERP){
+          // Apr 2026: дефолт ON. Для отката — `window.DV_HERMITE_INTERP = false`.
+          if(typeof window === "undefined" || window.DV_HERMITE_INTERP !== false){
             const vax = flip ? -aOpp.vx : aOpp.vx;
             const vbx = flip ? -bOpp.vx : bOpp.vx;
             const vay = aOpp.vy;
@@ -2418,11 +2445,24 @@ const Game = (function(){
             _extrapCount++;
             // Block F: feedback loop. Underflow = «буфер был слишком мал на
             // момент `targetT - snapA.recvT`». Поднимаем renderDelay так,
-            // чтобы при том же gap'е следующий тик не ушёл в extrap. +40мс
-            // safety margin (≈2 снапа). Cap MAX. Это компенсирует случаи,
-            // когда p99-адаптация ещё не почуяла спайк (window=24, 0.4с).
-            const want = Math.min(RENDER_DELAY_MAX, dtA + 0.040);
-            if(want > renderDelay) renderDelay = want;
+            // чтобы при том же gap'е следующий тик не ушёл в extrap. +80мс
+            // safety margin (≈5 снапов при 60Гц). Cap MAX.
+            //
+            // Apr 2026 (Critic C4): rewind snapA.recvT на ту же дельту, что
+            // подняли renderDelay. Без rewind'а на следующем кадре targetT
+            // сместится назад, и интерполяция начнётся от той же логической
+            // позиции, что сейчас — иначе визуально p2/ball «замрут» на
+            // 80мс пока realtime targetT догонит. С rewind: alpha сохраняется,
+            // визуал продолжается плавно, буфер копит снапы для следующего
+            // спайка. Также взводим _extrapHoldUntil — adaptation EMA не
+            // опустит renderDelay 5 секунд после события (hysteresis).
+            const want = Math.min(RENDER_DELAY_MAX, dtA + 0.080);
+            if(want > renderDelay){
+              const delta = want - renderDelay;
+              renderDelay = want;
+              snapA.recvT += delta;
+            }
+            _extrapHoldUntil = Clock.now() / 1000 + 5.0;
           }
           _ballHiddenTeleport = false;
           const vx2 = flip ? -aOpp.vx : aOpp.vx;
@@ -2440,6 +2480,27 @@ const Game = (function(){
           if(ball.x < ball.r) ball.x = ball.r;
           if(ball.x > WORLD_W - ball.r) ball.x = WORLD_W - ball.r;
           if(ball.y + ball.r > GROUND_Y) ball.y = GROUND_Y - ball.r;
+        }
+      }
+      // Predict-collision visual (Critic M4, Apr 2026): на RTT 250мс client-
+      // side prediction p1 убегает на ~78px от сервера. Когда мой слайм
+      // визуально касается мяча, серверная коллизия на ~125мс позже даёт
+      // другую траекторию → hard-snap. Локальный feedback (squash + Fx.hit
+      // + sfx) триггерится сразу при detected overlap, чтобы удар «ощущался»
+      // мгновенно. Authoritative ball.vx прилетит снапшотом и перепишет
+      // реальную траекторию — мы не мутируем ball здесь, только UI-feedback.
+      // Armed-flag дебаунсит повторный тригер пока мяч не разъехался.
+      if(p1 && ball && !roundOver && !state.matchOver){
+        const pdx = ball.x - p1.x, pdy = ball.y - p1.y;
+        const prr = (p1.r + ball.r);
+        if(pdx*pdx + pdy*pdy < prr*prr){
+          if(!_p1PredHitArmed){
+            _p1PredHitArmed = true;
+            try { Fx.hit(1, ball.x, ball.y, false); } catch(_){}
+            squash.p1 = Math.max(squash.p1, 0.14);
+          }
+        } else {
+          _p1PredHitArmed = false;
         }
       }
       return;
@@ -2626,6 +2687,12 @@ const Game = (function(){
     const tailIdx = (_snapHead + _snapCount) % SNAP_Q_MAX;
     const slot = _snapSlots[tailIdx];
     slot.recvT = now;
+    // Server-clock интерполяция (Critic C3, Apr 2026): срвT — серверная
+    // отметка времени снапа в секундах, монотонно растёт у авторитета,
+    // не зависит от клиентского GC/rAF/scheduler-jitter. Используется
+    // для адаптации (gap-метрика). recvT остаётся для targetT-сравнения
+    // в render-loop (он работает в локальном времени).
+    slot.srvT  = (typeof s.srvTickMs === "number") ? (s.srvTickMs / 1000) : now;
     slot.s     = s;
     _snapCount++;
     _snapTotalCount++;
@@ -2641,49 +2708,69 @@ const Game = (function(){
       if(s.seq > _lastSnapSeq) _lastSnapSeq = s.seq;
       _seenSnapCount++;
     }
-    // Stage 8 адаптация: p99 (было p95) интер-арривал гэпов за SNAP_GAP_WINDOW
-    // снапшотов. p95 игнорирует хвост распределения — на Hathora TLS-edge
-    // именно эти «редкие но болезненные» 100-200 мс спайки давали extrap/
-    // hard-snap. p99 × 1.10 целит чуть выше 99-го перцентиля, покрывая 1/100
-    // худших гэпов без over-buffering на чистой сети.
+    // Stage 8/Apr2026 адаптация: p99 (было p95) интер-арривал гэпов за
+    // SNAP_GAP_WINDOW снапшотов. p95 игнорирует хвост распределения — на
+    // Hathora TLS-edge именно эти «редкие но болезненные» 100-200 мс спайки
+    // давали extrap/hard-snap.
+    //
+    // Apr 2026 (Critic C1+C3): два изменения. Во-первых, gap считается по
+    // server-clock дельте (slot.srvT - prev.srvT), а не по локальному
+    // recvT-дельта — это убирает client-GC и rAF-scheduler шум из метрики.
+    // Во-вторых, множитель target поднят с 1.10 до 2.0: при p99=20мс на
+    // чистой server-clock метрике 1.10× давал target=22мс < floor=100мс,
+    // адаптация была мёртвой; 2.0× даёт target=40мс — всё ещё ниже floor
+    // в норме, но на spike (p99=80мс) target=160мс корректно сдвигает
+    // буфер выше floor'а до прихода extrap-события.
+    //
     // Не даём колебаниям переехать вниз (EMA-сглаживание на убывании), иначе
     // один быстрый снап утащил бы renderDelay ниже уровня jitter и дал бы
     // hitch через кадр, когда прилетит обычный «запаздыватель».
-    if(_lastSnapRecvT > 0){
-      const gap = now - _lastSnapRecvT;
-      _snapDiagPush(gap);
-      _snapGapsPush(gap);
-      if(_snapGapCount >= 8){
-        // Копируем живой префикс в scratch-буфер и сортируем in-place через
-        // insertion sort. Для n≤24 (SNAP_GAP_WINDOW) O(n²) ≤ ~576 сравнений —
-        // в разы дешевле, чем Array.prototype.sort с per-call closure-компаратором
-        // и subarray-view (тот путь аллоцировал Function+TypedArray view 60 раз/сек).
-        const n = _snapGapCount;
-        for(let i = 0; i < n; i++) _snapGapScratch[i] = _snapGapBuf[i];
-        for(let i = 1; i < n; i++){
-          const v = _snapGapScratch[i];
-          let j = i - 1;
-          while(j >= 0 && _snapGapScratch[j] > v){
-            _snapGapScratch[j + 1] = _snapGapScratch[j];
-            j--;
+    if(_lastSnapSrvT > 0){
+      const gap = slot.srvT - _lastSnapSrvT;
+      // Защита от прыжков при reconnect/match-restart, когда srvT может
+      // обнуляться. Отрицательный или подозрительно большой gap игнорируем
+      // как outlier (>2 секунды между снапами = разрыв связи, сам он не
+      // показатель «настоящего» jitter).
+      if(gap > 0 && gap < 2.0){
+        _snapDiagPush(gap);
+        _snapGapsPush(gap);
+        if(_snapGapCount >= 8){
+          // Копируем живой префикс в scratch-буфер и сортируем in-place через
+          // insertion sort. O(n²) ≤ n=60 → ~1800 сравнений — в разы дешевле,
+          // чем Array.prototype.sort с per-call closure-компаратором.
+          const n = _snapGapCount;
+          for(let i = 0; i < n; i++) _snapGapScratch[i] = _snapGapBuf[i];
+          for(let i = 1; i < n; i++){
+            const v = _snapGapScratch[i];
+            let j = i - 1;
+            while(j >= 0 && _snapGapScratch[j] > v){
+              _snapGapScratch[j + 1] = _snapGapScratch[j];
+              j--;
+            }
+            _snapGapScratch[j + 1] = v;
           }
-          _snapGapScratch[j + 1] = v;
+          const p99 = _snapGapScratch[Math.min(n - 1, Math.floor(n * 0.99))];
+          let target = Math.max(RENDER_DELAY_MIN, Math.min(RENDER_DELAY_MAX, p99 * 2.0));
+          // Post-extrap hysteresis (Critic C4, Apr 2026): после underflow
+          // renderDelay был поднят в step()-loop'е. _extrapHoldUntil — wall-
+          // clock дедлайн, до которого мы НЕ опускаем renderDelay через EMA,
+          // даже если target упал. Защита от пинг-понга adapt-down → underflow
+          // → adapt-up каждые пару секунд.
+          if(now < _extrapHoldUntil && target < renderDelay){
+            target = renderDelay;
+          }
+          // Block F (Apr 2026): спуск замедлен 0.94/0.06 → 0.985/0.015.
+          // half-life ≈ 46 sample × 16мс = 740мс — buffer держится «поднятым»
+          // дольше между periodическими RTT-спайками. Поднимаемся мгновенно
+          // (target > renderDelay → немедленный прыжок), спуск через EMA.
+          renderDelay = target > renderDelay
+            ? target
+            : renderDelay * 0.985 + target * 0.015;
         }
-        const p99 = _snapGapScratch[Math.min(n - 1, Math.floor(n * 0.99))];
-        const target = Math.max(RENDER_DELAY_MIN, Math.min(RENDER_DELAY_MAX, p99 * 1.10));
-        // Block F (Apr 2026): спуск замедлен 0.94/0.06 → 0.985/0.015. Старый
-        // half-life ≈ 11 sample × 16мс = 180мс — между периодическими RTT-
-        // спайками (~1 раз в 1-2с) buffer успевал схлопнуться обратно до
-        // floor, и следующий спайк опять давал underflow. Новый half-life
-        // ≈ 46 sample × 16мс = 740мс — buffer держится "поднятым" дольше.
-        // Поднимаемся мгновенно (target > renderDelay → немедленный прыжок),
-        // спуск через EMA. Этого достаточно при стабильном MIN floor.
-        renderDelay = target > renderDelay
-          ? target
-          : renderDelay * 0.985 + target * 0.015;
       }
     }
     _lastSnapRecvT = now;
+    _lastSnapSrvT  = slot.srvT;
   }
 
   function consumeSnapshot(s){
@@ -2939,6 +3026,21 @@ const Game = (function(){
   }
 
   /* ------------- Render ------------- */
+  // Visual smoothing layer (Critic M3, Apr 2026): для p2/ball в мультиплеере
+  // EMA-сглаживание поверх логических позиций. Hard-snap'ы (>120px catchup
+  // от authority при TCP-HoL spike'е) визуально размазываются на ~150мс
+  // вместо мгновенного телепорта. Логика остаётся authoritative — visX/visY
+  // дрейфуют к ней. Hard-escape >200px = respawn после очка → мгновенный
+  // snap (не размазываем легитимный teleport на пол-экрана).
+  //
+  // p1 НЕ сглаживается — это сам игрок, любая задержка ломает feel.
+  // EMA-catchup в consumeSnapshot уже мягко тащит p1-prediction к auth.
+  const TAU_BALL_S = 0.080;   // half-life ~ 55мс. На MAX_BSPD=1300 px/s
+                              //   за 80мс мяч пролетит 104 px ≈ 3 диаметра —
+                              //   gameplay timing сохраняется (не «слепое
+                              //   смещение» через всё поле).
+  const TAU_P2_S   = 0.120;   // p2 медленнее, может позволить себе плавнее.
+  let _lastRenderMs = 0;
   function render(alpha){
     if(!p1) return;
     // Лерп prev→curr по alpha. Все draw-функции читают .renderX/.renderY
@@ -2949,12 +3051,55 @@ const Game = (function(){
     // создавал 60 closure/сек в hot path, плюс 5 invocation'ов на render.
     p1.renderX = p1.prevX + (p1.x - p1.prevX) * a;
     p1.renderY = p1.prevY + (p1.y - p1.prevY) * a;
-    p2.renderX = p2.prevX + (p2.x - p2.prevX) * a;
-    p2.renderY = p2.prevY + (p2.y - p2.prevY) * a;
+    // Subtick lerp для p2/ball — целевая «logical» позиция, к которой
+    // EMA-смягчает visX/visY.
+    const p2LogX = p2.prevX + (p2.x - p2.prevX) * a;
+    const p2LogY = p2.prevY + (p2.y - p2.prevY) * a;
+    let bLogX = 0, bLogY = 0, bLogA = 0;
     if(ball){
-      ball.renderX = ball.prevX + (ball.x - ball.prevX) * a;
-      ball.renderY = ball.prevY + (ball.y - ball.prevY) * a;
-      ball.renderAngle = ball.prevAngle + (ball.angle - ball.prevAngle) * a;
+      bLogX = ball.prevX + (ball.x - ball.prevX) * a;
+      bLogY = ball.prevY + (ball.y - ball.prevY) * a;
+      bLogA = ball.prevAngle + (ball.angle - ball.prevAngle) * a;
+    }
+    // Smoothing активен только в multiplayer (guest или server-auth host).
+    // В bot и legacy host-only — p2 управляется локально, нет network-jitter
+    // источника hard-snap'ов, smoothing добавил бы бесполезный лаг.
+    const smooth = (state.mode === "guest") || (state.netMode === "auth");
+    if(smooth){
+      const renderNow = performance.now();
+      // dt clamp: после tab-switch / suspend renderDt мог быть 1с+,
+      // EMA подтянулся бы за один кадр (no smoothing). Ограничиваем 50мс.
+      const dt = Math.min(0.05, _lastRenderMs ? (renderNow - _lastRenderMs) / 1000 : 0);
+      _lastRenderMs = renderNow;
+      if(!p2._visInit){ p2.visX = p2LogX; p2.visY = p2LogY; p2._visInit = true; }
+      const aP2 = 1 - Math.exp(-dt / TAU_P2_S);
+      p2.visX += (p2LogX - p2.visX) * aP2;
+      p2.visY += (p2LogY - p2.visY) * aP2;
+      // Hard-escape для respawn (большой телепорт): не размазываем.
+      if(Math.abs(p2LogX - p2.visX) > 200) p2.visX = p2LogX;
+      if(Math.abs(p2LogY - p2.visY) > 200) p2.visY = p2LogY;
+      p2.renderX = p2.visX;
+      p2.renderY = p2.visY;
+      if(ball){
+        if(!ball._visInit){ ball.visX = bLogX; ball.visY = bLogY; ball._visInit = true; }
+        const aB = 1 - Math.exp(-dt / TAU_BALL_S);
+        ball.visX += (bLogX - ball.visX) * aB;
+        ball.visY += (bLogY - ball.visY) * aB;
+        if(Math.abs(bLogX - ball.visX) > 200) ball.visX = bLogX;
+        if(Math.abs(bLogY - ball.visY) > 200) ball.visY = bLogY;
+        ball.renderX = ball.visX;
+        ball.renderY = ball.visY;
+        ball.renderAngle = bLogA;
+      }
+    } else {
+      _lastRenderMs = 0;
+      p2.renderX = p2LogX;
+      p2.renderY = p2LogY;
+      if(ball){
+        ball.renderX = bLogX;
+        ball.renderY = bLogY;
+        ball.renderAngle = bLogA;
+      }
     }
     const cw = canvas.width, ch = canvas.height;
     ctx.fillStyle = "#1e1f22";
